@@ -3,8 +3,6 @@ package io.github.hibernateddl.executor
 import io.github.hibernateddl.core.*
 import java.sql.Connection
 
-final case class MigrationRequest(id: String, previous: SchemaSnapshot, target: SchemaSnapshot)
-
 final case class ExecutionOptions(
     lockTimeoutMillis: Int = 5000,
     statementTimeoutMillis: Int = 30000,
@@ -14,7 +12,8 @@ final case class ExecutionOptions(
 enum MigrationStatus:
   case Applied, AlreadyApplied
 
-final case class MigrationResult(id: String, revision: Long, status: MigrationStatus, statementCount: Int)
+/** Revision 0 is the empty model of a database without history. */
+final case class MigrationResult(revision: Long, status: MigrationStatus, statementCount: Int)
 
 /** Unknown means the server must stop and reconcile history before retrying. */
 enum FailureState:
@@ -26,25 +25,28 @@ final class MigrationException(
     cause: Throwable = null
 ) extends RuntimeException(message, cause)
 
+/** One applied migration. Revisions count up from 1 without gaps; the first entry's previous
+  * fingerprint is that of the empty model. `model` is the applied target in
+  * [[SchemaModelJson]] form, which the next server start diffs against.
+  */
 final case class HistoryEntry(
-    id: String,
-    checksum: String,
-    fromRevision: Long,
-    toRevision: Long,
+    revision: Long,
     previousFingerprint: String,
-    targetFingerprint: String
+    targetFingerprint: String,
+    model: String,
+    statements: Vector[String]
 )
 
 /** Connection-taking methods run inside one executor-owned transaction.
-  * validate and render run before a connection is acquired. Implementations must
-  * support transactional DDL and never commit or close the supplied connection.
+  * validate and render run before a connection is acquired or while planning under
+  * the lock. Implementations must support transactional DDL and never commit or close
+  * the supplied connection.
   */
 trait TransactionalMigrationBackend extends SchemaDialect:
-  def name: String
-  def validate(request: MigrationRequest): Vector[String]
+  def validate(model: SchemaModel): Vector[String]
   def acquireLock(connection: Connection, options: ExecutionOptions): Unit
   def initializeHistory(connection: Connection): Unit
-  def findHistory(connection: Connection, id: String): Option[HistoryEntry]
-  def latestHistory(connection: Connection): Option[HistoryEntry]
+  /** Every history entry, ordered by revision. */
+  def readHistory(connection: Connection): Vector[HistoryEntry]
   def lockAndValidate(connection: Connection, expected: SchemaModel): Vector[String]
   def recordHistory(connection: Connection, entry: HistoryEntry): Unit
