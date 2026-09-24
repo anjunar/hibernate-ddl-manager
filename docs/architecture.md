@@ -1,33 +1,32 @@
-# Architektur
+# Architecture
 
-Das Framework leitet das gewünschte Datenbankschema aus den Hibernate-Metadaten ab und
-migriert die Datenbank beim Serverstart selbst, bevor Hibernate die SessionFactory aufbaut.
-Umbenennungen erkennt es über stabile IDs, die direkt in den Entities stehen.
+The framework derives the desired database schema from the Hibernate metadata and migrates
+the database itself at server startup, before Hibernate builds the SessionFactory. It
+detects renames through stable IDs written directly in the entities.
 
-## Ablauf beim Serverstart
+## Server startup flow
 
 ```mermaid
 flowchart TD
-    H[Hibernate Boot Metadata] --> R[HibernateSchemaSource: liest Tabellen, Spalten, Primärschlüssel und @SchemaId]
-    R --> D[Zielmodell]
+    H[Hibernate boot metadata] --> R[HibernateSchemaSource: reads tables, columns, primary keys and @SchemaId]
+    R --> D[Target model]
     D --> EX[JdbcMigrationExecutor]
-    EX --> LOCK[Advisory-Lock]
-    LOCK --> HIST[History lesen und prüfen: zuletzt angewendetes Modell]
-    HIST --> DIFF[DiffEngine: Vergleich über IDs]
+    EX --> LOCK[Advisory lock]
+    LOCK --> HIST[Read and verify history: model applied last]
+    HIST --> DIFF[DiffEngine: comparison by ID]
     DIFF --> SQL[PostgreSqlDialect: DDL]
-    SQL --> PRE[Tabellen sperren, Datenbank gegen Vorgänger prüfen]
-    PRE --> DDL[DDL ausführen]
-    DDL --> POST[Datenbank gegen Ziel prüfen]
-    POST --> REC[Ziel als neue Revision speichern und committen]
-    REC --> SF[SessionFactory bauen, Server bereit]
+    SQL --> PRE[Lock tables, check database against previous model]
+    PRE --> DDL[Execute DDL]
+    DDL --> POST[Check database against target]
+    POST --> REC[Store target as new revision and commit]
+    REC --> SF[Build SessionFactory, server ready]
 ```
 
-Alles zwischen Lock und Commit läuft in einer Transaktion auf einer Verbindung. Jeder
-Fehler bricht den Serverstart ab; Hibernate baut die SessionFactory nur nach einer
-erfolgreichen Migration. `hibernate.hbm2ddl.auto` darf für die verwalteten Tabellen nicht
-`update` sein.
+Everything between lock and commit runs in one transaction on one connection. Any error
+aborts the server startup; Hibernate builds the SessionFactory only after a successful
+migration. `hibernate.hbm2ddl.auto` must not be `update` for the managed tables.
 
-## Stabile Identität mit `@SchemaId`
+## Stable identity with `@SchemaId`
 
 ```scala
 @Entity
@@ -39,101 +38,101 @@ class Customer:
   @SchemaId("3e4f5a6b") @Embedded var billing: Address = uninitialized
 ```
 
-- Eine ID besteht aus acht kleinen Hex-Ziffern. Sie wird einmal zufällig erzeugt und danach
-  nie geändert, nie aus einem Namen berechnet und nie wiederverwendet. Weil sie nichts
-  bedeutet, kommt niemand auf die Idee, sie beim Umbenennen mitzuändern.
-- Entity-IDs sind über alle Entities eindeutig, Property-IDs innerhalb ihrer Entity. Felder
-  einer `@MappedSuperclass` werden deshalb einmal annotiert und gelten in jeder Tabelle.
-- Daraus entstehen die IDs des Modells: Tabelle `7f3a9c21`, Spalte `7f3a9c21/f34e45b6`,
-  eingebettete Spalte `7f3a9c21/3e4f5a6b/5a6b7c8d`. Zwei Verwendungen derselben
-  Embeddable-Klasse bekommen so getrennte IDs.
-- Der Primärschlüssel verweist auf Spalten-IDs und bleibt bei Umbenennungen erhalten.
-- Fehlt eine ID oder hat sie das falsche Format, meldet der Adapter einen Fehler mit
-  frisch erzeugtem Vorschlag, z. B. `add e.g. @SchemaId("9c1d07aa")`.
+- An ID consists of eight lowercase hex digits. It is generated randomly once and then
+  never changed, never derived from a name and never reused. Because it means nothing,
+  nobody is tempted to change it along with a rename.
+- Entity IDs are unique across all entities, property IDs within their entity. Fields of a
+  `@MappedSuperclass` are therefore annotated once and apply in every table.
+- The model's IDs are built from them: table `7f3a9c21`, column `7f3a9c21/f34e45b6`,
+  embedded column `7f3a9c21/3e4f5a6b/5a6b7c8d`. Two uses of the same embeddable class thus
+  get separate IDs.
+- The primary key refers to column IDs and survives renames.
+- If an ID is missing or has the wrong format, the adapter reports an error with a freshly
+  generated suggestion, e.g. `add e.g. @SchemaId("9c1d07aa")`.
 
-Ohne IDs wären „`middleName` gelöscht, `nickName` neu“ und „`middleName` umbenannt“ im Code
-nicht unterscheidbar. Die ID trägt genau diese Information. Das `EntitySchema` des
-json-mappers ist daran nicht beteiligt.
+Without IDs, "`middleName` dropped, `nickName` added" and "`middleName` renamed" would be
+indistinguishable in the code. The ID carries exactly this information. The json-mapper's
+`EntitySchema` plays no part in it.
 
-Physische Namen liest der Adapter nach Hibernates Naming-Strategien. Unquotierte Namen
-faltet er wie der konfigurierte Dialekt (PostgreSQL: Kleinbuchstaben); Tabellen ohne
-eigenes Schema erhalten `hibernate.default_schema`. Das Modell enthält danach exakte Namen,
-die der Renderer immer quotiert.
+The adapter reads physical names after Hibernate's naming strategies. It folds unquoted
+names the way the configured dialect does (PostgreSQL: lower case); tables without their own
+schema get `hibernate.default_schema`. The model then contains exact names, which the
+renderer always quotes.
 
-## History und Vorgängermodell
+## History and previous model
 
-Der Server übergibt nur das Zielmodell: `migrate(dataSource, target)`. Das Vorgängermodell
-liest der Executor aus `__hibernate_ddl.schema_history`. Jede Migration schreibt dort eine
-Zeile:
+The server passes only the target model: `migrate(dataSource, target)`. The executor reads
+the previous model from `__hibernate_ddl.schema_history`. Every migration writes one row
+there:
 
-| Spalte | Inhalt |
+| Column | Contents |
 | --- | --- |
-| `revision` | 1, 2, 3, … ohne Lücken; vergibt der Executor |
-| `previous_fingerprint`, `target_fingerprint` | SHA-256 des Vorgänger- und Zielmodells |
-| `model` | Zielmodell als JSON (`jsonb`), Format-Version 1 |
-| `statements` | ausgeführte DDL |
-| `applied_at` | Zeitpunkt |
+| `revision` | 1, 2, 3, … without gaps; assigned by the executor |
+| `previous_fingerprint`, `target_fingerprint` | SHA-256 of the previous and the target model |
+| `model` | Target model as JSON (`jsonb`), format version 1 |
+| `statements` | Executed DDL |
+| `applied_at` | Time of application |
 
-- Ohne History ist der Vorgänger das leere Modell (Revision 0). Der erste Start legt alle
-  Tabellen an.
-- Weil die IDs über alle Versionen stabil sind, plant ein Server, der Releases übersprungen
-  hat, alle Änderungen auf einmal gegen das zuletzt gespeicherte Modell.
-- Gleicht das Ziel dem gespeicherten Modell (Reihenfolge egal), prüft der Executor nur die
-  Datenbank und schreibt nichts.
-- Ein älterer Server nach einer neueren Migration würde zurückbenennen. Deshalb blockiert ein
-  Zielmodell, das einer früheren Revision gleicht, ebenso den Start wie ein Rename zurück auf
-  einen Namen, den dieselbe ID in einer früheren Revision hatte. Fehlende Tabellen und Spalten
-  eines älteren Modells sind ohnehin nicht erlaubte Löschungen.
-- Vor jeder Planung prüft der Executor die ganze Kette: lückenlose Revisionen, jeder
-  Vorgänger-Fingerprint gleich dem Ziel-Fingerprint der Zeile davor, jedes gespeicherte Modell
-  lesbar und passend zu seinem Fingerprint. Eine veränderte History blockiert den Start.
-- Das JSON-Format ist versioniert und wird streng gelesen: eine andere Format-Version,
-  unbekannte Felder oder Typen sind Fehler. Eine History-Tabelle mit anderen Spalten stammt
-  von einer anderen Version und wird abgelehnt, nie verändert.
+- Without history the previous model is the empty model (revision 0). The first start
+  creates all tables.
+- Because the IDs are stable across all versions, a server that skipped releases plans all
+  changes at once against the model stored last.
+- If the target equals the stored model (order does not matter), the executor only checks
+  the database and writes nothing.
+- An older server after a newer migration would rename things back. Therefore a target
+  model equal to an earlier revision blocks the startup, and so does a rename back to a name
+  the same ID had in an earlier revision. Tables and columns missing from an older model are
+  drops, which are not allowed anyway.
+- Before any planning the executor checks the whole chain: revisions without gaps, every
+  previous fingerprint equal to the target fingerprint of the row before, every stored
+  model readable and matching its fingerprint. A modified history blocks the startup.
+- The JSON format is versioned and read strictly: another format version, unknown fields
+  or unknown types are errors. A history table with other columns comes from another
+  version and is refused, never altered.
 
-## Module
+## Modules
 
-| Modul | Inhalt |
+| Module | Contents |
 | --- | --- |
-| `schema-core` | Modell, Validierung, `DiffEngine`, Operationen; ohne Abhängigkeit zu Hibernate oder JDBC-Treibern |
-| `schema-hibernate` | `@SchemaId` und `HibernateSchemaSource` (Boot Metadata → Modell), fixiert auf Hibernate 7.4.10 |
-| `schema-executor` | Transaktion, Planung gegen das gespeicherte Modell, Fingerprints, JSON-Format und Prüfung der History, Fehlerzustände |
-| `schema-postgresql` | SQL-Renderer, Katalogprüfung, Sperren und History für PostgreSQL 14+ |
-| `schema-cli` | Demo ohne Datenbankverbindung |
+| `schema-core` | Model, validation, `DiffEngine`, operations; no dependency on Hibernate or JDBC drivers |
+| `schema-hibernate` | `@SchemaId` and `HibernateSchemaSource` (boot metadata → model), pinned to Hibernate 7.4.10 |
+| `schema-executor` | Transaction, planning against the stored model, fingerprints, JSON format and history verification, failure states |
+| `schema-postgresql` | SQL renderer, catalog checks, locking and history for PostgreSQL 14+ |
+| `schema-cli` | Demo without a database connection |
 
-## Heutiger Umfang
+## Current scope
 
-Alles außerhalb dieses Umfangs wird abgelehnt, nie stillschweigend ignoriert.
+Everything outside this scope is rejected, never silently ignored.
 
-| Bereich | Unterstützt | Gemeldet und abgelehnt |
+| Area | Supported | Reported and rejected |
 | --- | --- | --- |
-| Modell | Tabellen, Spalten `varchar(n)`, `integer`, `bigint`, `boolean`, `text`, Nullability, Primärschlüssel | alle anderen Typen und Objekte |
-| Adapter | Entities ohne Vererbung und Secondary Tables, einfache Properties, Embeddables | Assoziationen/Fremdschlüssel, Collection- und Join-Tabellen, Unique-Keys, Indizes, Checks, Defaults, Identity-Spalten, Sequenzen, Spalten ohne ID-Herkunft |
-| Diff | neue Tabellen, neue nullable Spalten, Tabellen- und Spalten-Renames | Löschungen, Typ-/Nullability-/Primärschlüssel-Änderungen, Schema-Wechsel, Rename-Kollisionen und -Tausch |
-| History | gespeichertes Modell je Revision, übersprungene Releases | Zielmodell einer früheren Revision, Rename zurück auf einen früheren Namen, veränderte History, Tabellen ohne History (keine Übernahme bestehender Datenbanken) |
-| PostgreSQL | gewöhnliche permanente Tabellen mit genau diesen Spalten und nicht-deferrable Primärschlüssel | weitere Constraints und Indizes, Trigger, Rules, RLS, Vererbung, Partitionen, eigene Collations |
+| Model | Tables, columns `varchar(n)`, `integer`, `bigint`, `boolean`, `text`, nullability, primary keys | All other types and objects |
+| Adapter | Entities without inheritance or secondary tables, simple properties, embeddables | Associations/foreign keys, collection and join tables, unique keys, indexes, checks, defaults, identity columns, sequences, columns without an ID origin |
+| Diff | New tables, new nullable columns, table and column renames | Drops, type/nullability/primary key changes, schema moves, rename collisions and swaps |
+| History | Stored model per revision, skipped releases | Target model of an earlier revision, rename back to an earlier name, modified history, tables without history (no adoption of existing databases) |
+| PostgreSQL | Ordinary permanent tables with exactly these columns and a non-deferrable primary key | Other constraints and indexes, triggers, rules, RLS, inheritance, partitions, custom collations |
 
-Tabellen, die nur in der Datenbank existieren, bleiben unberührt.
+Tables that exist only in the database are left untouched.
 
-## Offene Punkte
+## Open points
 
-1. **Modellabdeckung für reale Entities.** Eine typische Entity mit `UUID`-ID,
-   `LocalDateTime`-Zeitstempeln, `@ManyToOne` und Unique-Constraint ist noch nicht
-   abbildbar. Reihenfolge: Typen `uuid` und `timestamp`, dann Fremdschlüssel, dann
-   Unique-Constraints. Neue Typen brauchen auch einen Namen im JSON-Format der History.
-2. **Bestehende Datenbanken übernehmen.** Ohne History ist der Vorgänger das leere Modell;
-   Tabellen, die schon existieren (etwa aus `hbm2ddl`), lassen `CREATE TABLE` scheitern.
-   Vorschlag: Stimmt die Datenbank ohne History bereits mit dem Zielmodell überein, trägt der
-   Executor es ohne DDL als Revision 1 ein.
-3. **Server-Integration.** Einstiegspunkt ist die Stelle zwischen
-   `MetadataBuilder.build()` und `getSessionFactoryBuilder.build()`. Der Executor braucht
-   eine DataSource ohne JTA-Einbindung. `hibernate.hbm2ddl.auto=validate` eignet sich als
-   unabhängige Gegenprüfung nach der Migration.
-4. **Löschungen und gewollte Rückbenennungen** blockieren heute den Start. Sie brauchen
-   später eine ausdrückliche Freigabe.
-5. **Ausgemusterte IDs** lassen sich aus den gespeicherten Modellen der History ablesen,
-   sobald Löschungen möglich sind. Dann kann eine aus der Git-Historie kopierte ID abgelehnt
-   werden, statt versehentlich wiederverwendet zu werden.
+1. **Model coverage for real entities.** A typical entity with a `UUID` ID,
+   `LocalDateTime` timestamps, `@ManyToOne` and a unique constraint cannot be mapped yet.
+   Order: types `uuid` and `timestamp`, then foreign keys, then unique constraints. New
+   types also need a name in the history's JSON format.
+2. **Adopting existing databases.** Without history the previous model is the empty model;
+   tables that already exist (for example from `hbm2ddl`) make `CREATE TABLE` fail.
+   Proposal: if a database without history already matches the target model, the executor
+   records it as revision 1 without DDL.
+3. **Server integration.** The entry point is between `MetadataBuilder.build()` and
+   `getSessionFactoryBuilder.build()`. The executor needs a DataSource without JTA
+   enlistment. `hibernate.hbm2ddl.auto=validate` works as an independent cross-check after
+   the migration.
+4. **Drops and intentional renames back** block the startup today. They will need explicit
+   approval later.
+5. **Retired IDs** can be read from the stored models in the history once drops are
+   possible. An ID copied from the Git history can then be rejected instead of being reused
+   by accident.
 
-Später denkbar: Datenmigrationen und Backfills, mehrphasige Deployments (expand/contract),
-weitere Dialekte und ein Export nach Flyway oder Liquibase als alternative Betriebsart.
+Possible later: data migrations and backfills, multi-phase deployments (expand/contract),
+further dialects and an export to Flyway or Liquibase as an alternative mode of operation.
