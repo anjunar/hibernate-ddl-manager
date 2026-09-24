@@ -3,35 +3,52 @@ package io.github.hibernateddl.postgresql
 import io.github.hibernateddl.core.*
 import io.github.hibernateddl.executor.*
 import io.zonky.test.db.postgres.embedded.EmbeddedPostgres
+import org.postgresql.ds.PGSimpleDataSource
 import java.nio.file.Files
 import java.util.UUID
 import java.util.concurrent.{Callable, CountDownLatch, Executors, TimeUnit}
 import javax.sql.DataSource
 import scala.util.Using
 
-/** Runs against a temporary real PostgreSQL cluster; never uses a configured database. */
+/** Runs against real PostgreSQL: the server named by the JDBC URL in HIBERNATE_DDL_TEST_POSTGRES,
+  * for example in the cloud, or otherwise a temporary embedded cluster. Every test uses its own
+  * temporary database, so an existing server keeps its other databases untouched.
+  */
 class PostgreSqlExecutorSuite extends munit.FunSuite:
-  private var postgres: EmbeddedPostgres = null
+  private var embedded: EmbeddedPostgres = null
+  private var database: Option[String] => DataSource = null
   private val executor = new JdbcMigrationExecutor(PostgreSqlMigrationBackend)
 
   override def beforeAll(): Unit =
-    val target = java.nio.file.Path.of("target").toAbsolutePath
-    Files.createDirectories(target)
-    postgres = EmbeddedPostgres.builder()
-      .setDataDirectory(Files.createTempDirectory(target, "executor-pg-"))
-      .setServerConfig("listen_addresses", "127.0.0.1")
-      .setServerConfig("synchronous_commit", "on")
-      .setPort(0)
-      .start()
+    database = sys.env.get("HIBERNATE_DDL_TEST_POSTGRES") match
+      case Some(url) => name =>
+        val dataSource = new PGSimpleDataSource()
+        dataSource.setUrl(url)
+        name.foreach(dataSource.setDatabaseName)
+        dataSource
+      case None =>
+        val target = java.nio.file.Path.of("target").toAbsolutePath
+        Files.createDirectories(target)
+        embedded =
+          try EmbeddedPostgres.builder()
+            .setDataDirectory(Files.createTempDirectory(target, "executor-pg-"))
+            .setServerConfig("listen_addresses", "127.0.0.1")
+            .setServerConfig("synchronous_commit", "on")
+            .setPort(0)
+            .start()
+          catch case error: Exception => throw new IllegalStateException(
+            "Embedded PostgreSQL did not start (it refuses to run as root). " +
+              "Set HIBERNATE_DDL_TEST_POSTGRES to the JDBC URL of an existing server instead.", error)
+        name => name.fold(embedded.getPostgresDatabase)(embedded.getDatabase("postgres", _))
 
   override def afterAll(): Unit =
-    if postgres != null then postgres.close()
+    if embedded != null then embedded.close()
 
   private def withDatabase[A](body: DataSource => A): A =
     val name = "executor_" + UUID.randomUUID().toString.replace("-", "")
-    execute(postgres.getPostgresDatabase, s"CREATE DATABASE $name")
-    try body(postgres.getDatabase("postgres", name))
-    finally execute(postgres.getPostgresDatabase, s"DROP DATABASE $name WITH (FORCE)")
+    execute(database(None), s"CREATE DATABASE $name")
+    try body(database(Some(name)))
+    finally execute(database(None), s"DROP DATABASE $name WITH (FORCE)")
 
   private def execute(ds: DataSource, sql: String): Unit =
     Using.resource(ds.getConnection) { connection =>
