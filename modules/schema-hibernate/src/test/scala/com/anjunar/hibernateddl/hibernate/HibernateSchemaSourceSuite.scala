@@ -70,6 +70,17 @@ class HibernateSchemaSourceSuite extends munit.FunSuite:
     assertEquals(SchemaValidation.validate(model), Vector.empty)
   }
 
+  test("unique columns, unique constraints, natural IDs and one-to-one join columns become unique keys") {
+    val model = read(classOf[Account], classOf[LegacyCustomer]).toOption.get
+    val account = model.tables.find(_.id == SchemaId("6d7e8f90")).get
+    def key(properties: String*) = UniqueKeyModel(properties.toVector.map(p => SchemaId(s"6d7e8f90/$p")))
+    assertEquals(account.uniqueKeys.toSet, Set(
+      key("1a2b3c4d"), key("2b3c4d5e", "3c4d5e6f"), key("4d5e6f70"), key("5e6f7081")
+    ))
+    assertEquals(account.foreignKeys.map(_.referencedTable), Vector(SchemaId("7f3a9c21")))
+    assertEquals(SchemaValidation.validate(model), Vector.empty)
+  }
+
   test("renaming a referenced entity keeps the foreign key, so the diff plans only the rename") {
     val before = read(classOf[Invoice], classOf[LegacyCustomer]).toOption.get
     val after = before.copy(tables = before.tables.map { table =>
@@ -98,7 +109,7 @@ class HibernateSchemaSourceSuite extends munit.FunSuite:
     assert(diagnostics.exists(_.contains("Unsupported.id has SQL type 'numeric(38,2)'")), diagnostics)
     assert(diagnostics.exists(_.contains("of entity Unsupported has ON DELETE CASCADE; unsupported")), diagnostics)
     assert(diagnostics.exists(_.contains("collection and join tables are unsupported")), diagnostics)
-    assert(diagnostics.exists(_.contains("unique")), diagnostics)
+    assert(diagnostics.exists(_.contains("Entity Unsupported has indexes; unsupported")), diagnostics)
     assert(errors(classOf[Generated]).exists(_.startsWith("Sequence")))
   }
 

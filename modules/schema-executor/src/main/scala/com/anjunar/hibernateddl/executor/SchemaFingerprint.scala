@@ -6,9 +6,9 @@ import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 
 /** Canonical SHA-256 identity of a complete schema model.
-  * Table, column and foreign key ordering is irrelevant; stable IDs and all physical metadata
-  * matter. Foreign keys are appended after all tables and only when there are any, so models
-  * without them keep the fingerprints that existing histories store.
+  * Table, column and key ordering is irrelevant; stable IDs and all physical metadata matter.
+  * Foreign keys and then unique keys are appended after all tables, each section only when
+  * there are any, so models without them keep the fingerprints that existing histories store.
   */
 object SchemaFingerprint:
   def of(model: SchemaModel): String =
@@ -56,6 +56,14 @@ object SchemaFingerprint:
         ids(out, key.columns)
         string(out, key.referencedTable.value)
         ids(out, key.referencedColumns)
+      }
+    val uniqueKeys = tables.flatMap(table => table.uniqueKeys.sortBy(_.columns.map(_.value)).map(table.id -> _))
+    if uniqueKeys.nonEmpty then
+      string(out, "unique-keys")
+      out.writeInt(uniqueKeys.size)
+      uniqueKeys.foreach { (tableId, key) =>
+        string(out, tableId.value)
+        ids(out, key.columns)
       }
     out.flush()
     MessageDigest.getInstance("SHA-256").digest(bytes.toByteArray)

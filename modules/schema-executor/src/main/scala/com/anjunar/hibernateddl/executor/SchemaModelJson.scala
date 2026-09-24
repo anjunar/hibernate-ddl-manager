@@ -8,10 +8,10 @@ import scala.util.control.NoStackTrace
   * start plans against the model applied last. Writing escapes every non-ASCII character, so
   * the text survives any transport unchanged. Reading is strict: an unknown format version, a
   * missing or unknown field and an unknown type are errors, never skipped. Format 2 added
-  * foreign keys; format 1, written before, is still read.
+  * foreign keys and format 3 unique keys; the earlier formats are still read.
   */
 object SchemaModelJson:
-  val FormatVersion = 2
+  val FormatVersion = 3
   private val VarcharType = """varchar\((\d+)\)""".r
   private val TimestampType = """timestamp\((\d+)\)""".r
   private val TimestampWithTimeZoneType = """timestamp\((\d+)\) with time zone""".r
@@ -40,7 +40,8 @@ object SchemaModelJson:
       s"""{"id":${string(table.id.value)},"catalog":${optional(table.name.catalog)},""" +
         s""""schema":${optional(table.name.schema)},"name":${string(table.name.name.value)},""" +
         s""""columns":${list(columns)},"primaryKey":${ids(table.primaryKey)},""" +
-        s""""foreignKeys":${list(table.foreignKeys.map(foreignKey))}}"""
+        s""""foreignKeys":${list(table.foreignKeys.map(foreignKey))},""" +
+        s""""uniqueKeys":${list(table.uniqueKeys.map(key => s"""{"columns":${ids(key.columns)}}"""))}}"""
     }
     s"""{"format":$FormatVersion,"tables":${list(tables)}}"""
 
@@ -84,7 +85,8 @@ object SchemaModelJson:
 
   private def readTable(json: Json, format: Int): TableModel =
     val common = Set("id", "catalog", "schema", "name", "columns", "primaryKey")
-    val table = fields(json, "Table", if format >= 2 then common + "foreignKeys" else common)
+    val table = fields(json, "Table",
+      common ++ Option.when(format >= 2)("foreignKeys") ++ Option.when(format >= 3)("uniqueKeys"))
     val id = string(table("id"), "Table id")
     def label(field: String) = s"Table '$id' $field"
     TableModel(
@@ -96,7 +98,11 @@ object SchemaModelJson:
       ),
       array(table("columns"), label("columns")).map(readColumn(_, id)),
       ids(table("primaryKey"), label("primary key")),
-      table.get("foreignKeys").fold(Vector.empty)(keys => array(keys, label("foreign keys")).map(readForeignKey(_, id)))
+      table.get("foreignKeys").fold(Vector.empty)(keys => array(keys, label("foreign keys")).map(readForeignKey(_, id))),
+      table.get("uniqueKeys").fold(Vector.empty)(keys => array(keys, label("unique keys")).map { key =>
+        val label = s"Unique key in table '$id'"
+        UniqueKeyModel(ids(fields(key, label, Set("columns"))("columns"), s"$label columns"))
+      })
     )
 
   private def readForeignKey(json: Json, tableId: String): ForeignKeyModel =

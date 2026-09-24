@@ -141,6 +141,23 @@ class PostgreSqlDialectSuite extends munit.FunSuite:
     assert(PostgreSqlDialect.render(Vector(CreateTable(table))).swap.toOption.get.exists(_.contains("separate operations")))
   }
 
+  test("unique keys render inside CREATE TABLE and as ADD UNIQUE") {
+    val id = ColumnModel(SchemaId("id"), SqlIdentifier("id"), SqlType.BigInt, nullable = false)
+    val code = ColumnModel(SchemaId("code"), SqlIdentifier("code"), SqlType.Text)
+    val table = TableModel(tableId, name("orders", Some("public")), Vector(id, code), Vector(id.id),
+      uniqueKeys = Vector(UniqueKeyModel(Vector(code.id)), UniqueKeyModel(Vector(code.id, id.id))))
+    assertEquals(
+      PostgreSqlDialect.render(Vector(CreateTable(table), AddUniqueKey(tableId, name("orders", Some("public")), Vector(SqlIdentifier("id"))))),
+      Right(Vector(
+        "CREATE TABLE \"public\".\"orders\" (\"id\" bigint NOT NULL, \"code\" text, PRIMARY KEY (\"id\"), " +
+          "UNIQUE (\"code\"), UNIQUE (\"code\", \"id\"));",
+        "ALTER TABLE \"public\".\"orders\" ADD UNIQUE (\"id\");"
+      ))
+    )
+    assert(PostgreSqlDialect.render(Vector(AddUniqueKey(tableId, name("orders"), Vector.empty))).isLeft)
+    assert(PostgreSqlDialect.render(Vector(CreateTable(table.copy(uniqueKeys = Vector(UniqueKeyModel(Vector(SchemaId("x")))))))).isLeft)
+  }
+
   test("an empty plan renders to an empty statement vector") {
     assertEquals(PostgreSqlDialect.render(Vector.empty), Right(Vector.empty))
   }

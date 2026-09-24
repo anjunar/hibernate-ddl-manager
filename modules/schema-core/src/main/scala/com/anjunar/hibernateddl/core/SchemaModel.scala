@@ -39,13 +39,18 @@ final case class ForeignKeyModel(
 ):
   def display: String = columns.map(_.value).mkString("(", ", ", ")")
 
+/** A unique constraint over column IDs in key order; the column list is its identity. */
+final case class UniqueKeyModel(columns: Vector[SchemaId]):
+  def display: String = columns.map(_.value).mkString("(", ", ", ")")
+
 /** The primary key lists column IDs in key order, so column renames keep it intact. */
 final case class TableModel(
     id: SchemaId,
     name: QualifiedName,
     columns: Vector[ColumnModel],
     primaryKey: Vector[SchemaId] = Vector.empty,
-    foreignKeys: Vector[ForeignKeyModel] = Vector.empty
+    foreignKeys: Vector[ForeignKeyModel] = Vector.empty,
+    uniqueKeys: Vector[UniqueKeyModel] = Vector.empty
 )
 
 final case class SchemaModel(tables: Vector[TableModel])
@@ -93,6 +98,18 @@ object SchemaValidation:
           errors += s"Table '${table.id.value}' has more than one foreign key on ${keys.head.display}"
       }
       table.foreignKeys.foreach(key => errors ++= validateForeignKey(model, table, key))
+      table.uniqueKeys.groupBy(_.columns).foreach { (_, keys) =>
+        if keys.size > 1 then
+          errors += s"Table '${table.id.value}' has more than one unique key on ${keys.head.display}"
+      }
+      table.uniqueKeys.foreach { key =>
+        val label = s"Unique key ${key.display} of table '${table.id.value}'"
+        if key.columns.isEmpty then errors += s"$label has no columns"
+        if key.columns.distinct.size != key.columns.size then errors += s"$label lists a column more than once"
+        key.columns.filterNot(columns.contains).foreach { id =>
+          errors += s"$label references unknown column '${id.value}'"
+        }
+      }
     }
     errors.result().distinct.sorted
 

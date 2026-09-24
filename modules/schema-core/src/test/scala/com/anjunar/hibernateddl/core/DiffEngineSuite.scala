@@ -188,6 +188,26 @@ class DiffEngineSuite extends munit.FunSuite:
     assert(errors(DiffEngine.diff(before, changed)).exists(_.contains("Changing foreign key (customer-category)")))
   }
 
+  test("unique keys are created with a new table or added to an existing one; dropping them is refused") {
+    val code = column("customer-code", "code")
+    val email = column("customer-email", "email")
+    val unique = customer.copy(columns = customer.columns ++ Vector(code, email),
+      uniqueKeys = Vector(UniqueKeyModel(Vector(email.id)), UniqueKeyModel(Vector(code.id, customer.columns.head.id))))
+    val tag = table("tag", "tag", column("tag-name", "name")).copy(uniqueKeys = Vector(UniqueKeyModel(Vector(SchemaId("tag-name")))))
+    assertEquals(DiffEngine.diff(initial, SchemaModel(Vector(unique, tag))), Right(Vector(
+      SchemaOperation.AddColumn(customer.id, customer.name, code),
+      SchemaOperation.AddColumn(customer.id, customer.name, email),
+      SchemaOperation.AddUniqueKey(customer.id, customer.name, Vector(SqlIdentifier("code"), SqlIdentifier("name"))),
+      SchemaOperation.AddUniqueKey(customer.id, customer.name, Vector(SqlIdentifier("email"))),
+      SchemaOperation.CreateTable(tag)
+    )))
+    val before = SchemaModel(Vector(unique))
+    val renamed = SchemaModel(Vector(unique.copy(columns = unique.columns.map(c => c.copy(name = SqlIdentifier(c.name.value + "_new"))))))
+    assert(DiffEngine.diff(before, renamed).toOption.get.forall(_.isInstanceOf[SchemaOperation.RenameColumn]))
+    val dropped = SchemaModel(Vector(unique.copy(uniqueKeys = unique.uniqueKeys.take(1))))
+    assert(errors(DiffEngine.diff(before, dropped)).exists(_.contains("Dropping unique key (customer-code, customer-name)")))
+  }
+
   test("renames expose their locking risk") {
     val renamed = customer.name.copy(name = SqlIdentifier("renamed"))
     assertEquals(SchemaOperation.RenameTable(customer.id, customer.name, renamed).risk, RiskLevel.Locking)
