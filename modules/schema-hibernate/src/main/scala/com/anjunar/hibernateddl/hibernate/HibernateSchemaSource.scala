@@ -135,7 +135,6 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
         def columnId(o: Owned) = SchemaId((entityId.getOrElse(Unknown) +: o.path).mkString("/"))
 
         Vector(
-          Option.when(!table.getIndexes.isEmpty)("indexes"),
           Option.when(!table.getChecks.isEmpty)("check constraints")
         ).flatten.foreach(feature => errors += s"Entity $label has $feature; unsupported")
 
@@ -161,9 +160,30 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
         }
         entityId.map { id =>
           Mapped(label, table, TableModel(SchemaId(id), qualifiedName(table), columnModels, primaryKey,
-            uniqueKeys = uniqueKeyModels),
+            uniqueKeys = uniqueKeyModels, indexes = indexes(table, label, byColumn.view.mapValues(columnId).toMap)),
             byColumn.view.mapValues(columnId).toMap)
         }
+
+    /** @Index becomes a plain index; @Index(unique = true) is a unique key in Hibernate's model. */
+    private def indexes(table: Table, entity: String, columnIds: Map[Column, SchemaId]): Vector[IndexModel] =
+      table.getIndexes.asScala.values.toVector.flatMap { index =>
+        val label = s"Index ${index.getName} of entity $entity"
+        val selectables = index.getSelectables.asScala.toVector
+        val columns = selectables.collect { case column: Column => column }
+        val orders = index.getSelectableOrderMap.asScala
+        val directions = columns.map(column => Option(orders.getOrElse(column, null)).fold("")(_.trim.toLowerCase(Locale.ROOT)))
+        val problems = Vector(
+          Option(index.getOptions).filterNot(_.isBlank).map(options => s"has options '$options'"),
+          Option.when(columns.size != selectables.size)("indexes an expression"),
+          Option.when(index.isUnique)("is a unique index"),
+          directions.find(direction => !Set("", "asc", "desc").contains(direction)).map(order => s"orders a column '$order'")
+        ).flatten
+        problems.foreach(problem => errors += s"$label $problem; unsupported")
+        val ids = columns.flatMap(columnIds.get)
+        Option.when(problems.isEmpty && ids.size == columns.size) {
+          IndexModel(ids.zip(directions).map((id, direction) => IndexColumn(id, direction == "desc")))
+        }
+      }
 
     private def columns(property: Property, owner: Class[?], path: Vector[String], ownerLabel: String): Vector[Owned] =
       val label = s"$ownerLabel.${property.getName}"

@@ -1,7 +1,8 @@
 package com.anjunar.hibernateddl.core
 
-/** Plans creation, nullable additions, new unique and foreign keys and explicit-ID renames;
-  * all other changes fail closed. Foreign keys are added last, after every table exists.
+/** Plans creation, nullable additions, new unique keys, indexes and foreign keys and
+  * explicit-ID renames; all other changes fail closed. Foreign keys are added last, after
+  * every table exists.
   */
 object DiffEngine:
   def diff(
@@ -86,6 +87,11 @@ object DiffEngine:
       (oldUniqueKeys -- newTable.uniqueKeys).foreach { key =>
         errors += s"Dropping unique key ${key.display} from table '${id.value}' is unsupported; manual migration required"
       }
+      val oldIndexes = oldTable.indexes.toSet
+      operations ++= createIndexes(newTable, newTable.indexes.filterNot(oldIndexes.contains))
+      (oldIndexes -- newTable.indexes).foreach { index =>
+        errors += s"Dropping index ${index.display} from table '${id.value}' is unsupported; manual migration required"
+      }
 
       val oldKeys = oldTable.foreignKeys.map(key => key.columns -> key).toMap
       newTable.foreignKeys.foreach { key =>
@@ -106,7 +112,8 @@ object DiffEngine:
         case Some(occupant) =>
           errors += s"Creating table '${id.value}' uses the previous name of table '${occupant.id.value}'; manual migration required"
         case None =>
-          operations += SchemaOperation.CreateTable(table.copy(foreignKeys = Vector.empty))
+          operations += SchemaOperation.CreateTable(table.copy(foreignKeys = Vector.empty, indexes = Vector.empty))
+          operations ++= createIndexes(table, table.indexes)
           table.foreignKeys.foreach(key => addedKeys += table -> key)
     }
 
@@ -119,6 +126,14 @@ object DiffEngine:
 
     val diagnostics = errors.result().distinct.sorted
     if diagnostics.nonEmpty then Left(diagnostics) else Right(operations.result())
+
+  private def createIndexes(table: TableModel, indexes: Vector[IndexModel]): Vector[SchemaOperation] =
+    val byColumnsAndDirection = Ordering.Implicits.seqOrdering[Vector, (String, Boolean)]
+    indexes.sortBy(_.columns.map(c => c.column.value -> c.descending))(using byColumnsAndDirection).map { index =>
+      SchemaOperation.CreateIndex(table.id, table.name, index.columns.map { column =>
+        SchemaOperation.IndexedColumn(table.columns.find(_.id == column.column).get.name, column.descending)
+      })
+    }
 
   private def locations(model: SchemaModel): Map[SchemaId, String] =
     model.tables.flatMap { table =>

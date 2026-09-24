@@ -87,9 +87,23 @@ class Account:
   @SchemaId("4d5e6f70") @NaturalId var handle: String = uninitialized
   @SchemaId("5e6f7081") @OneToOne var owner: LegacyCustomer = uninitialized
 
+/** Plain indexes, one of them descending and composite; the unique one is a unique key. */
+@Entity
+@SchemaId("7e8f90a1")
+@Table(indexes = Array(
+  new Index(columnList = "placedat"),
+  new Index(columnList = "status, placedat desc"),
+  new Index(columnList = "number", unique = true)
+))
+class Shipment:
+  @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+  @SchemaId("1b2c3d4e") var placedAt: java.time.Instant = uninitialized
+  @SchemaId("2c3d4e5f") var status: String = uninitialized
+  @SchemaId("3d4e5f60") var number: String = uninitialized
+
 @Entity
 @SchemaId("bbbbbbbb")
-@Table(indexes = Array(new Index(columnList = "code")))
+@Table(indexes = Array(new Index(columnList = "code", options = "WHERE code IS NOT NULL")))
 class Unsupported:
   @Id @SchemaId("0a1b2c3d") var id: java.math.BigDecimal = uninitialized
   @SchemaId("1a1b2c3d") @ManyToOne @OnDelete(action = OnDeleteAction.CASCADE) var customer: LegacyCustomer = uninitialized

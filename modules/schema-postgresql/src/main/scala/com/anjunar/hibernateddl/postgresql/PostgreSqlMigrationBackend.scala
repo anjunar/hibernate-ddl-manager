@@ -9,15 +9,15 @@ import scala.util.Using
 /** Transactional migration for PostgreSQL 14 and newer.
   *
   * The initial execution envelope is deliberately narrow: explicitly qualified,
-  * permanent ordinary tables containing only the modeled native types,
-  * nullability, a non-deferrable primary key, plain unique constraints and plain
-  * foreign keys (no actions, MATCH SIMPLE, not deferrable). Defaults, identities, generated columns, custom
-  * collations, inheritance, partitions, other indexes and constraints, triggers,
-  * rules and RLS require a richer schema model before execution is supported.
-  * Unmanaged tables outside the supplied model are allowed, but must not reference
-  * a modeled table. Every modeled table is exclusively
-  * locked before catalog inspection; callers must retain this transaction until
-  * the migration and its history entry have both committed.
+  * permanent ordinary tables containing only the modeled native types, nullability,
+  * a non-deferrable primary key, plain unique constraints, plain B-tree indexes and
+  * plain foreign keys (no actions, MATCH SIMPLE, not deferrable). Defaults, identities,
+  * generated columns, custom collations, inheritance, partitions, other constraints,
+  * other indexes, triggers, rules and RLS require a richer schema model before
+  * execution is supported. Unmanaged tables outside the supplied model are allowed,
+  * but must not reference a modeled table. Every modeled table is exclusively locked
+  * before catalog inspection; callers must retain this transaction until the
+  * migration and its history entry have both committed.
   *
   * The history table stores every applied model as jsonb, together with the executed
   * statements. A history table with another column layout was created by another version
@@ -159,11 +159,6 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
         |                 AND NOT (k.contype = 'n' AND k.convalidated)
         |                 AND NOT (k.contype = 'p' AND NOT k.condeferrable)
         |              ) AS has_constraints,
-        |       EXISTS (SELECT 1 FROM pg_catalog.pg_index i
-        |               WHERE i.indrelid = c.oid AND NOT i.indisprimary
-        |                 AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint u
-        |                                 WHERE u.conindid = i.indexrelid AND u.contype = 'u')
-        |              ) AS has_indexes,
         |       EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t
         |               WHERE t.tgrelid = c.oid AND NOT t.tgisinternal) AS has_triggers,
         |       EXISTS (SELECT 1 FROM pg_catalog.pg_rewrite r
@@ -185,7 +180,6 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
         Option.when(row.getString("relpersistence") != "p")("non-permanent storage"),
         Option.when(row.getLong("reloftype") != 0)("typed table"),
         Option.when(row.getBoolean("has_constraints"))("unmodeled constraints"),
-        Option.when(row.getBoolean("has_indexes"))("indexes"),
         Option.when(row.getBoolean("has_triggers"))("triggers"),
         Option.when(row.getBoolean("has_rules"))("rules"),
         Option.when(row.getBoolean("relrowsecurity") || row.getBoolean("relforcerowsecurity") ||
@@ -226,6 +220,7 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
           def show(key: Vector[String]) = if key.isEmpty then "none" else key.map(quoted).mkString("(", ", ", ")")
           errors += s"Database drift: primary key of $display is ${show(actualKey)}; expected ${show(expectedKey)}."
         errors ++= compareUniqueKeys(connection, oid, display, expected)
+        errors ++= compareIndexes(connection, oid, display, expected)
         errors ++= compareForeignKeys(connection, oid, display, expected, model)
         errors.result()
 
@@ -261,6 +256,71 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
       s"Database drift: unique key ${show(key)} is missing from $display."
     } ++ (actualKeys.map(_._2) diff expectedKeys).map { key =>
       s"Database drift: unexpected unique key ${show(key)} in $display."
+    }
+
+  /** Plain indexes match by their ordered columns and directions, never by name. Indexes of
+    * the primary key and of unique constraints are checked with those. Every other index must
+    * be a valid, non-unique B-tree over plain columns with default operator classes,
+    * collations and NULLS ordering.
+    */
+  private def compareIndexes(connection: Connection, oid: Long, display: String, expected: TableModel): Vector[String] =
+    def show(columns: Vector[(String, Boolean)]) =
+      columns.map((name, descending) => quoted(name) + (if descending then " DESC" else "")).mkString("(", ", ", ")")
+    val expectedIndexes = expected.indexes.map(_.columns.map { column =>
+      expected.columns.find(_.id == column.column).get.name.value -> column.descending
+    })
+    val actualIndexes = query(connection,
+      """SELECT ic.relname AS index_name, i.indisunique, i.indisvalid AND i.indisready AS usable,
+        |       i.indpred IS NOT NULL AS partial, i.indexprs IS NOT NULL AS expressions,
+        |       i.indnatts <> i.indnkeyatts AS has_include, am.amname,
+        |       ARRAY(SELECT CAST(a.attname AS pg_catalog.text)
+        |             FROM pg_catalog.unnest(CAST(i.indkey AS pg_catalog.int2[])) WITH ORDINALITY AS k(attnum, position)
+        |             JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+        |             ORDER BY k.position) AS columns,
+        |       ARRAY(SELECT CAST(o.option AS pg_catalog.int4)
+        |             FROM pg_catalog.unnest(CAST(i.indoption AS pg_catalog.int2[])) WITH ORDINALITY AS o(option, position)
+        |             ORDER BY o.position) AS options,
+        |       EXISTS (SELECT 1 FROM pg_catalog.unnest(CAST(i.indclass AS pg_catalog.oid[])) AS c(opclass)
+        |               JOIN pg_catalog.pg_opclass opc ON opc.oid = c.opclass
+        |               WHERE NOT opc.opcdefault) AS custom_opclass,
+        |       EXISTS (SELECT 1 FROM ROWS FROM (pg_catalog.unnest(CAST(i.indkey AS pg_catalog.int2[])),
+        |                                        pg_catalog.unnest(CAST(i.indcollation AS pg_catalog.oid[])))
+        |                             AS k(attnum, collation_oid)
+        |               JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+        |               WHERE k.collation_oid <> a.attcollation) AS custom_collation
+        |FROM pg_catalog.pg_index i
+        |JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
+        |JOIN pg_catalog.pg_am am ON am.oid = ic.relam
+        |WHERE i.indrelid = CAST(? AS pg_catalog.oid) AND NOT i.indisprimary
+        |  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint k
+        |                  WHERE k.conindid = i.indexrelid AND k.contype = 'u')
+        |ORDER BY ic.relname""".stripMargin
+    )(_.setLong(1, oid)) { row =>
+      val options = {
+        val array = row.getArray("options")
+        try array.getArray.asInstanceOf[Array[Integer]].toVector.map(_.intValue)
+        finally array.free()
+      }
+      // indoption bit 1 is DESC, bit 2 NULLS FIRST; the defaults are 0 (ASC) and 3 (DESC).
+      val features = Vector(
+        Option.when(row.getBoolean("indisunique"))("uniqueness without a unique constraint"),
+        Option.when(!row.getBoolean("usable"))("invalid state"),
+        Option.when(row.getBoolean("partial"))("partial predicate"),
+        Option.when(row.getBoolean("expressions"))("expressions"),
+        Option.when(row.getBoolean("has_include"))("INCLUDE columns"),
+        Option.when(row.getString("amname") != "btree")(s"access method ${row.getString("amname")}"),
+        Option.when(row.getBoolean("custom_opclass"))("operator class"),
+        Option.when(row.getBoolean("custom_collation"))("collation"),
+        Option.when(options.exists(option => option != 0 && option != 3))("NULLS ordering")
+      ).flatten
+      (row.getString("index_name"), strings(row, "columns").zip(options.map(option => (option & 1) == 1)), features)
+    }
+    actualIndexes.flatMap { (name, _, features) =>
+      features.map(feature => s"Index ${quoted(name)} of $display has unsupported $feature.")
+    } ++ (expectedIndexes diff actualIndexes.map(_._2)).map { index =>
+      s"Database drift: index ${show(index)} is missing from $display."
+    } ++ (actualIndexes.map(_._2) diff expectedIndexes).map { index =>
+      s"Database drift: unexpected index ${show(index)} in $display."
     }
 
   /** Foreign keys match by columns and referenced columns, never by constraint name. Keys
