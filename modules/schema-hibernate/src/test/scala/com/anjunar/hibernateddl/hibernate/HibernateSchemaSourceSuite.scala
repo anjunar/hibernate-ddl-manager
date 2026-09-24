@@ -81,6 +81,16 @@ class HibernateSchemaSourceSuite extends munit.FunSuite:
     assertEquals(SchemaValidation.validate(model), Vector.empty)
   }
 
+  test("@Index becomes a plain index with column directions; a unique @Index becomes a unique key") {
+    val shipment = read(classOf[Shipment]).toOption.get.tables.head
+    def id(property: String) = SchemaId(s"7e8f90a1/$property")
+    assertEquals(shipment.indexes.toSet, Set(
+      IndexModel(Vector(IndexColumn(id("1b2c3d4e")))),
+      IndexModel(Vector(IndexColumn(id("2c3d4e5f")), IndexColumn(id("1b2c3d4e"), descending = true)))
+    ))
+    assertEquals(shipment.uniqueKeys, Vector(UniqueKeyModel(Vector(id("3d4e5f60")))))
+  }
+
   test("renaming a referenced entity keeps the foreign key, so the diff plans only the rename") {
     val before = read(classOf[Invoice], classOf[LegacyCustomer]).toOption.get
     val after = before.copy(tables = before.tables.map { table =>
@@ -109,7 +119,7 @@ class HibernateSchemaSourceSuite extends munit.FunSuite:
     assert(diagnostics.exists(_.contains("Unsupported.id has SQL type 'numeric(38,2)'")), diagnostics)
     assert(diagnostics.exists(_.contains("of entity Unsupported has ON DELETE CASCADE; unsupported")), diagnostics)
     assert(diagnostics.exists(_.contains("collection and join tables are unsupported")), diagnostics)
-    assert(diagnostics.exists(_.contains("Entity Unsupported has indexes; unsupported")), diagnostics)
+    assert(diagnostics.exists(_.contains("of entity Unsupported has options 'WHERE code IS NOT NULL'; unsupported")), diagnostics)
     assert(errors(classOf[Generated]).exists(_.startsWith("Sequence")))
   }
 

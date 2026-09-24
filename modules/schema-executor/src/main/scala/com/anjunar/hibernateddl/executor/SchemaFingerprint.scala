@@ -7,8 +7,9 @@ import java.security.MessageDigest
 
 /** Canonical SHA-256 identity of a complete schema model.
   * Table, column and key ordering is irrelevant; stable IDs and all physical metadata matter.
-  * Foreign keys and then unique keys are appended after all tables, each section only when
-  * there are any, so models without them keep the fingerprints that existing histories store.
+  * Foreign keys, unique keys and indexes are appended after all tables in that order, each
+  * section only when there are any, so models without them keep the fingerprints that
+  * existing histories store.
   */
 object SchemaFingerprint:
   def of(model: SchemaModel): String =
@@ -64,6 +65,21 @@ object SchemaFingerprint:
       uniqueKeys.foreach { (tableId, key) =>
         string(out, tableId.value)
         ids(out, key.columns)
+      }
+    val byColumnsAndDirection = Ordering.Implicits.seqOrdering[Vector, (String, Boolean)]
+    val indexes = tables.flatMap { table =>
+      table.indexes.sortBy(_.columns.map(c => c.column.value -> c.descending))(using byColumnsAndDirection).map(table.id -> _)
+    }
+    if indexes.nonEmpty then
+      string(out, "indexes")
+      out.writeInt(indexes.size)
+      indexes.foreach { (tableId, index) =>
+        string(out, tableId.value)
+        out.writeInt(index.columns.size)
+        index.columns.foreach { column =>
+          string(out, column.column.value)
+          out.writeBoolean(column.descending)
+        }
       }
     out.flush()
     MessageDigest.getInstance("SHA-256").digest(bytes.toByteArray)
