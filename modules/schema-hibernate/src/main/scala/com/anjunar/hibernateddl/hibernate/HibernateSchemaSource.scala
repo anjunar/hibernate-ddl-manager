@@ -6,7 +6,8 @@ import org.hibernate.boot.Metadata
 import org.hibernate.boot.model.naming.Identifier
 import org.hibernate.cfg.MappingSettings
 import org.hibernate.engine.config.spi.{ConfigurationService, StandardConverters}
-import org.hibernate.mapping.{Collection as CollectionMapping, Column, Component, PersistentClass, Property, Table, ToOne}
+import org.hibernate.annotations.OnDeleteAction
+import org.hibernate.mapping.{Collection as CollectionMapping, Column, Component, PersistentClass, Property, Table}
 
 import java.lang.reflect.AnnotatedElement
 import java.util.HexFormat
@@ -18,6 +19,8 @@ import scala.jdk.CollectionConverters.*
   *
   * Identities come from `@SchemaId` values of eight lowercase hex digits: a table uses its
   * entity's ID, a column `entity/property` and an embedded column `entity/embedded/property`.
+  * An association's join column is a column like any other; its foreign key references the
+  * other entity's table and primary key by ID.
   * Physical names are taken after Hibernate's naming strategies and folded the way the
   * configured dialect folds unquoted identifiers. Tables without a schema use
   * `hibernate.default_schema`. Mappings the core model cannot represent are reported
@@ -41,6 +44,8 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
   def newId(): String = HexFormat.of().toHexDigits(ThreadLocalRandom.current().nextInt())
 
   private final case class Owned(column: Column, path: Vector[String], label: String)
+
+  private final case class Mapped(label: String, table: Table, model: TableModel, columnIds: Map[Column, SchemaId])
 
   private final class Reader(metadata: Metadata):
     val errors = Vector.newBuilder[String]
@@ -71,14 +76,35 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
       database.getAuxiliaryDatabaseObjects.asScala.foreach { auxiliary =>
         errors += s"Auxiliary database object ${auxiliary.getExportIdentifier} is unsupported"
       }
-      val tables = entities.flatMap(readEntity)
-      tables.groupBy(_._2.id).foreach { (id, owners) =>
+      val mapped = entities.flatMap(readEntity)
+      mapped.groupBy(_.model.id).foreach { (id, owners) =>
         if owners.size > 1 then
-          errors += s"Entities ${owners.map(_._1).sorted.mkString(", ")} share @SchemaId(\"${id.value}\")"
+          errors += s"Entities ${owners.map(_.label).sorted.mkString(", ")} share @SchemaId(\"${id.value}\")"
       }
-      SchemaModel(tables.map(_._2))
+      val byTable = mapped.map(entity => entity.table -> entity).toMap
+      SchemaModel(mapped.map(entity => entity.model.copy(foreignKeys = foreignKeys(entity, byTable, entityTables))))
 
-    private def readEntity(entity: PersistentClass): Option[(String, TableModel)] =
+    /** Foreign keys of associations, referencing the primary key of another mapped entity. */
+    private def foreignKeys(entity: Mapped, byTable: Map[Table, Mapped], entityTables: Set[Table]): Vector[ForeignKeyModel] =
+      entity.table.getForeignKeyCollection.asScala.toVector.filter(_.isCreationEnabled).flatMap { key =>
+        val columns = key.getColumns.asScala.toVector
+        val label = s"Foreign key ${columns.map(_.getName).mkString("(", ", ", ")")} of entity ${entity.label}"
+        val referenced = byTable.get(key.getReferencedTable)
+        val problems = Vector(
+          Option.when(!key.isReferenceToPrimaryKey)("references columns other than the primary key"),
+          Option(key.getOnDeleteAction).filter(_ != OnDeleteAction.NO_ACTION).map(action => s"has ON DELETE $action"),
+          Option.when(referenced.isEmpty && !entityTables.contains(key.getReferencedTable))(
+            s"references table ${key.getReferencedTable.getName}, which belongs to no entity")
+        ).flatten
+        problems.foreach(problem => errors += s"$label $problem; unsupported")
+        // An unreadable referenced entity or a column without an ID origin is reported on its own.
+        val ids = columns.flatMap(entity.columnIds.get)
+        referenced.filter(_ => problems.isEmpty && ids.size == columns.size).map { target =>
+          ForeignKeyModel(ids, target.model.id, target.model.primaryKey)
+        }
+      }
+
+    private def readEntity(entity: PersistentClass): Option[Mapped] =
       val label = Option(entity.getJpaEntityName).getOrElse(entity.getEntityName)
       val table = entity.getTable
       if entity.getSuperclass != null || entity.hasSubclasses then
@@ -111,7 +137,6 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
         Vector(
           Option.when(!table.getUniqueKeys.isEmpty)("unique constraints"),
           Option.when(!table.getIndexes.isEmpty)("indexes"),
-          Option.when(!table.getForeignKeyCollection.isEmpty)("foreign keys"),
           Option.when(!table.getChecks.isEmpty)("check constraints")
         ).flatten.foreach(feature => errors += s"Entity $label has $feature; unsupported")
 
@@ -124,7 +149,10 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
         }
         val primaryKey = Option(table.getPrimaryKey).toVector
           .flatMap(_.getColumns.asScala).flatMap(byColumn.get).map(columnId)
-        entityId.map(id => label -> TableModel(SchemaId(id), qualifiedName(table), columnModels, primaryKey))
+        entityId.map { id =>
+          Mapped(label, table, TableModel(SchemaId(id), qualifiedName(table), columnModels, primaryKey),
+            byColumn.view.mapValues(columnId).toMap)
+        }
 
     private def columns(property: Property, owner: Class[?], path: Vector[String], ownerLabel: String): Vector[Owned] =
       val label = s"$ownerLabel.${property.getName}"
@@ -139,7 +167,6 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
           val id = stableId(members(owner, property.getName), label).getOrElse(Unknown)
           component.getProperties.asScala.toVector.flatMap(columns(_, component.getComponentClass, path :+ id, label))
         case value =>
-          if value.isInstanceOf[ToOne] then errors += s"$label is an association; foreign keys are unsupported"
           if selected.size > 1 then errors += s"$label maps to ${selected.size} columns; multi-column values are unsupported"
           val id = stableId(members(owner, property.getName), label).getOrElse(Unknown)
           selected.map(Owned(_, path :+ id, label))
