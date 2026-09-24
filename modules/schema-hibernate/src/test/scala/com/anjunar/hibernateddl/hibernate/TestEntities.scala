@@ -124,6 +124,39 @@ class OddChecks:
   @SchemaId("1b2c3d4e") @Enumerated(EnumType.STRING) var quote: Quote = uninitialized
   @SchemaId("2c3d4e5f") @Column(check = Array(new CheckConstraint(constraint = "amount >= 0"))) var amount: Integer = uninitialized
 
+@Embeddable
+class Line:
+  @SchemaId("6a7b8c9d") var text: String = uninitialized
+  @SchemaId("7b8c9d0e") var amount: java.lang.Integer = uninitialized
+
+/** The inverse side of a many-to-many owns no table and needs no @SchemaId. */
+@Entity
+@SchemaId("b2c3d4e5")
+class Label:
+  @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+  @ManyToMany(mappedBy = "labels") var articles: java.util.Set[Article] = new java.util.HashSet[Article]()
+
+/** Collections in their own tables: basic values, embeddables, enums and a many-to-many. */
+@Entity
+@SchemaId("c3d4e5f6")
+class Article:
+  @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+  @SchemaId("1b2c3d4e") @ElementCollection @CollectionTable(name = "article_keyword")
+  var keywords: java.util.Set[String] = new java.util.HashSet[String]()
+  @SchemaId("2c3d4e5f") @ElementCollection var lines: java.util.List[Line] = new java.util.ArrayList[Line]()
+  @SchemaId("3d4e5f60") @ManyToMany var labels: java.util.Set[Label] = new java.util.HashSet[Label]()
+  @SchemaId("4e5f6071") @ElementCollection @Enumerated(EnumType.STRING)
+  var statuses: java.util.Set[Status] = new java.util.HashSet[Status]()
+
+/** Two collections that Hibernate's default naming puts into the same join table, and an ordered list. */
+@Entity
+@SchemaId("d4e5f607")
+class Crowded:
+  @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+  @SchemaId("1b2c3d4e") @ManyToMany var favorites: java.util.Set[Label] = new java.util.HashSet[Label]()
+  @SchemaId("2c3d4e5f") @OneToMany var pinned: java.util.Set[Label] = new java.util.HashSet[Label]()
+  @SchemaId("3d4e5f60") @ElementCollection @OrderColumn var ranking: java.util.List[String] = new java.util.ArrayList[String]()
+
 /** Further basic types as Hibernate maps them on PostgreSQL. */
 @Entity
 @SchemaId("8f90a1b2")
@@ -146,7 +179,7 @@ class Unsupported:
   @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
   @SchemaId("4a1b2c3d") @Lob var document: String = uninitialized
   @SchemaId("1a1b2c3d") @ManyToOne @OnDelete(action = OnDeleteAction.CASCADE) var customer: LegacyCustomer = uninitialized
-  @SchemaId("2a1b2c3d") @ElementCollection var tags: java.util.Set[String] = new java.util.HashSet[String]()
+  @SchemaId("2a1b2c3d") @ElementCollection var tags: java.util.Map[String, String] = new java.util.HashMap[String, String]()
   @SchemaId("3a1b2c3d") var code: String = uninitialized
 
 @Entity
