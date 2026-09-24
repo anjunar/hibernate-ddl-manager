@@ -71,121 +71,107 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
     name = users.name.copy(name = SqlIdentifier("accounts")),
     columns = Vector(login.copy(name = SqlIdentifier("login_name")))
   )
-  private val request = MigrationRequest("001-user-login", SchemaSnapshot(1, 0, SchemaModel(Vector(users))),
-    SchemaSnapshot(1, 1, SchemaModel(Vector(renamed))))
+  private val initial = SchemaModel(Vector(users))
+  private val target = SchemaModel(Vector(renamed))
 
-  private def fixture(ds: DataSource): Unit =
-    execute(ds, "CREATE TABLE public.users (username varchar(100) NOT NULL)")
-    execute(ds, "INSERT INTO public.users VALUES ('patrick')")
+  /** The first server start creates the users table; the fixture then adds a row. */
+  private def fixture(ds: DataSource, model: SchemaModel = initial): Unit =
+    assertEquals(executor.migrate(ds, model), MigrationResult(1, MigrationStatus.Applied, model.tables.size))
+    execute(ds, "INSERT INTO public.users(username) VALUES ('patrick')")
 
   private def noHistory(ds: DataSource): Unit =
     assertEquals(scalar(ds, "SELECT to_regclass('__hibernate_ddl.schema_history') IS NULL"), "t")
 
-  test("server migration commits table and column renames with data and history, then is idempotent") {
+  private def revisions(ds: DataSource): String =
+    scalar(ds, "SELECT count(*) FROM __hibernate_ddl.schema_history")
+
+  test("the first start creates tables and stores the applied model; restarting changes nothing") {
     withDatabase { ds =>
       fixture(ds)
-      val result = executor.migrate(ds, request)
-      assertEquals(result.status, MigrationStatus.Applied)
-      assertEquals(result.statementCount, 2)
-      assertEquals(scalar(ds, "SELECT login_name FROM public.accounts"), "patrick")
-      assertEquals(scalar(ds, "SELECT to_revision FROM __hibernate_ddl.schema_history"), "1")
-      assertEquals(executor.migrate(ds, request).status, MigrationStatus.AlreadyApplied)
-      assertEquals(scalar(ds, "SELECT count(*) FROM __hibernate_ddl.schema_history"), "1")
+      assertEquals(scalar(ds, "SELECT username FROM public.users"), "patrick")
+      assertEquals(executor.migrate(ds, initial), MigrationResult(1, MigrationStatus.AlreadyApplied, 0))
+      assertEquals(revisions(ds), "1")
+      assertEquals(scalar(ds, "SELECT model #>> '{tables,0,columns,0,name}' FROM __hibernate_ddl.schema_history"), "username")
+      assertEquals(scalar(ds, "SELECT statements[1] FROM __hibernate_ddl.schema_history"),
+        "CREATE TABLE \"public\".\"users\" (\"username\" varchar(100) NOT NULL);")
     }
   }
 
-  test("first server start creates a table and records the initial revision") {
+  test("a later start renames table and column against the stored model and keeps data and history") {
     withDatabase { ds =>
-      val initial = MigrationRequest("001-create-users", SchemaSnapshot(1, 0, SchemaModel(Vector.empty)),
-        SchemaSnapshot(1, 1, SchemaModel(Vector(users))))
-      val result = executor.migrate(ds, initial)
-      assertEquals(result.status, MigrationStatus.Applied)
-      assertEquals(result.statementCount, 1)
-      execute(ds, "INSERT INTO public.users(username) VALUES ('created')")
-      assertEquals(scalar(ds, "SELECT username FROM public.users"), "created")
-      assertEquals(executor.migrate(ds, initial).status, MigrationStatus.AlreadyApplied)
-      assertEquals(scalar(ds, "SELECT count(*) FROM __hibernate_ddl.schema_history"), "1")
+      fixture(ds)
+      assertEquals(executor.migrate(ds, target), MigrationResult(2, MigrationStatus.Applied, 2))
+      assertEquals(scalar(ds, "SELECT login_name FROM public.accounts"), "patrick")
+      assertEquals(scalar(ds, "SELECT string_agg(revision::text, ',' ORDER BY revision) FROM __hibernate_ddl.schema_history"), "1,2")
+      assertEquals(executor.migrate(ds, target).status, MigrationStatus.AlreadyApplied)
+      assertEquals(revisions(ds), "2")
     }
   }
 
-  test("server adds a nullable column to a populated table without losing data") {
+  test("a server that skipped releases applies every change at once and keeps the data") {
     withDatabase { ds =>
       fixture(ds)
       val biography = ColumnModel(SchemaId("USER_BIO"), SqlIdentifier("biography"), SqlType.Text)
-      val expanded = MigrationRequest("001-add-bio", request.previous,
-        SchemaSnapshot(1, 1, SchemaModel(Vector(users.copy(columns = users.columns :+ biography)))))
-      assertEquals(executor.migrate(ds, expanded).statementCount, 1)
-      assertEquals(scalar(ds, "SELECT username FROM public.users WHERE biography IS NULL"), "patrick")
-      assertEquals(scalar(ds, "SELECT to_revision FROM __hibernate_ddl.schema_history"), "1")
+      val latest = SchemaModel(Vector(renamed.copy(columns = Vector(login.copy(name = SqlIdentifier("handle")), biography))))
+      assertEquals(executor.migrate(ds, latest), MigrationResult(2, MigrationStatus.Applied, 3))
+      assertEquals(scalar(ds, "SELECT handle FROM public.accounts WHERE biography IS NULL"), "patrick")
     }
   }
 
-  test("adding a non-null column to existing rows is rejected before a database connection") {
+  test("an older server cannot start after a newer migration and leaves the schema untouched") {
+    withDatabase { ds =>
+      fixture(ds)
+      executor.migrate(ds, target)
+      val error = intercept[MigrationException](executor.migrate(ds, initial))
+      assertEquals(error.state, FailureState.RolledBack)
+      assert(error.getMessage.contains("older schema"), error.getMessage)
+      assertEquals(scalar(ds, "SELECT login_name FROM public.accounts"), "patrick")
+      assertEquals(revisions(ds), "2")
+    }
+  }
+
+  test("adding a non-null column to existing rows is refused before DDL") {
     withDatabase { ds =>
       fixture(ds)
       val required = ColumnModel(SchemaId("USER_BIO"), SqlIdentifier("biography"), SqlType.Text, false)
-      val unsafe = MigrationRequest("001-required-bio", request.previous,
-        SchemaSnapshot(1, 1, SchemaModel(Vector(users.copy(columns = users.columns :+ required)))))
-      assertEquals(intercept[MigrationException](executor.migrate(ds, unsafe)).state, FailureState.NotStarted)
+      val unsafe = SchemaModel(Vector(users.copy(columns = users.columns :+ required)))
+      assert(intercept[MigrationException](executor.migrate(ds, unsafe)).getMessage.contains("backfill"))
       assertEquals(scalar(ds, "SELECT username FROM public.users"), "patrick")
+      assertEquals(revisions(ds), "1")
+    }
+  }
+
+  test("tables that already exist without history are not adopted") {
+    withDatabase { ds =>
+      execute(ds, "CREATE TABLE public.users (username varchar(100) NOT NULL)")
+      assertEquals(intercept[MigrationException](executor.migrate(ds, initial)).state, FailureState.RolledBack)
       noHistory(ds)
     }
   }
 
-  test("baseline drift aborts before rename and rolls back new history objects") {
+  test("database drift aborts before the rename and rolls back") {
     withDatabase { ds =>
       fixture(ds)
       execute(ds, "ALTER TABLE public.users ADD COLUMN unexpected text")
-      val error = intercept[MigrationException](executor.migrate(ds, request))
+      val error = intercept[MigrationException](executor.migrate(ds, target))
       assertEquals(error.state, FailureState.RolledBack)
+      assert(error.getMessage.contains("Previous schema does not match database"), error.getMessage)
       assertEquals(scalar(ds, "SELECT username FROM public.users"), "patrick")
-      noHistory(ds)
+      assertEquals(revisions(ds), "1")
     }
   }
 
   test("a later DDL failure rolls back earlier DDL and history atomically") {
     withDatabase { ds =>
-      fixture(ds)
-      execute(ds, "CREATE TABLE public.z_other (value text)")
-      execute(ds, "CREATE SEQUENCE public.occupied")
       val other = TableModel(SchemaId("Z_OTHER"), QualifiedName(SqlIdentifier("z_other"), Some(SqlIdentifier("public"))),
         Vector(ColumnModel(SchemaId("Z_VALUE"), SqlIdentifier("value"), SqlType.Text)))
-      val failure = request.copy(
-        previous = request.previous.copy(model = SchemaModel(Vector(users, other))),
-        target = request.target.copy(model = SchemaModel(Vector(renamed, other.copy(name = other.name.copy(name = SqlIdentifier("occupied"))))))
-      )
-      val error = intercept[MigrationException](executor.migrate(ds, failure))
-      assertEquals(error.state, FailureState.RolledBack)
+      fixture(ds, SchemaModel(Vector(users, other)))
+      execute(ds, "CREATE SEQUENCE public.occupied")
+      val failure = SchemaModel(Vector(renamed, other.copy(name = other.name.copy(name = SqlIdentifier("occupied")))))
+      assertEquals(intercept[MigrationException](executor.migrate(ds, failure)).state, FailureState.RolledBack)
       assertEquals(scalar(ds, "SELECT username FROM public.users"), "patrick")
       assertEquals(scalar(ds, "SELECT to_regclass('public.accounts') IS NULL"), "t")
-      noHistory(ds)
-    }
-  }
-
-  test("reusing a migration ID with changed content is rejected") {
-    withDatabase { ds =>
-      fixture(ds)
-      executor.migrate(ds, request)
-      val changed = request.copy(target = request.target.copy(model = SchemaModel(Vector(
-        renamed.copy(name = renamed.name.copy(name = SqlIdentifier("changed")))
-      ))))
-      intercept[MigrationException](executor.migrate(ds, changed))
-      assertEquals(scalar(ds, "SELECT login_name FROM public.accounts"), "patrick")
-      assertEquals(scalar(ds, "SELECT count(*) FROM __hibernate_ddl.schema_history"), "1")
-    }
-  }
-
-  test("successive revisions work and an older server cannot start against a newer schema") {
-    withDatabase { ds =>
-      fixture(ds)
-      executor.migrate(ds, request)
-      val next = MigrationRequest("002-user-login", request.target, SchemaSnapshot(1, 2, SchemaModel(Vector(
-        renamed.copy(columns = Vector(login.copy(name = SqlIdentifier("handle")))))
-      )))
-      assertEquals(executor.migrate(ds, next).status, MigrationStatus.Applied)
-      intercept[MigrationException](executor.migrate(ds, request))
-      assertEquals(scalar(ds, "SELECT handle FROM public.accounts"), "patrick")
-      assertEquals(scalar(ds, "SELECT count(*) FROM __hibernate_ddl.schema_history"), "2")
+      assertEquals(revisions(ds), "1")
     }
   }
 
@@ -198,12 +184,12 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
         val runs = Vector.fill(2)(pool.submit(new Callable[MigrationResult]:
           def call(): MigrationResult =
             start.await()
-            executor.migrate(ds, request)
+            executor.migrate(ds, target)
         ))
         start.countDown()
         val statuses = runs.map(_.get(15, TimeUnit.SECONDS).status).toSet
         assertEquals(statuses, Set(MigrationStatus.Applied, MigrationStatus.AlreadyApplied))
-        assertEquals(scalar(ds, "SELECT count(*) FROM __hibernate_ddl.schema_history"), "1")
+        assertEquals(revisions(ds), "2")
       finally
         pool.shutdownNow()
         pool.awaitTermination(5, TimeUnit.SECONDS)
@@ -219,22 +205,21 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
           PostgreSqlMigrationBackend.acquireLock(blocker, ExecutionOptions())
           val impatient = new JdbcMigrationExecutor(PostgreSqlMigrationBackend,
             ExecutionOptions(lockTimeoutMillis = 100, statementTimeoutMillis = 2000))
-          assertEquals(intercept[MigrationException](impatient.migrate(ds, request)).state, FailureState.RolledBack)
+          assertEquals(intercept[MigrationException](impatient.migrate(ds, target)).state, FailureState.RolledBack)
         finally blocker.rollback()
       }
       assertEquals(scalar(ds, "SELECT username FROM public.users"), "patrick")
-      noHistory(ds)
-      assertEquals(executor.migrate(ds, request).status, MigrationStatus.Applied)
+      assertEquals(revisions(ds), "1")
+      assertEquals(executor.migrate(ds, target).status, MigrationStatus.Applied)
     }
   }
 
-  test("already-applied migrations still reject database drift") {
+  test("an unchanged model still rejects database drift") {
     withDatabase { ds =>
       fixture(ds)
-      executor.migrate(ds, request)
-      execute(ds, "ALTER TABLE public.accounts ALTER COLUMN login_name DROP NOT NULL")
-      intercept[MigrationException](executor.migrate(ds, request))
-      assertEquals(scalar(ds, "SELECT count(*) FROM __hibernate_ddl.schema_history"), "1")
+      execute(ds, "ALTER TABLE public.users ALTER COLUMN username DROP NOT NULL")
+      intercept[MigrationException](executor.migrate(ds, initial))
+      assertEquals(revisions(ds), "1")
     }
   }
 
@@ -247,9 +232,9 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
       withDatabase { ds =>
         fixture(ds)
         execute(ds, unsupported)
-        intercept[MigrationException](executor.migrate(ds, request))
+        intercept[MigrationException](executor.migrate(ds, target))
         assertEquals(scalar(ds, "SELECT username FROM public.users"), "patrick")
-        noHistory(ds)
+        assertEquals(revisions(ds), "1")
       }
     }
   }
@@ -259,46 +244,51 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
       val id = ColumnModel(SchemaId("ACCOUNT_ID"), SqlIdentifier("id"), SqlType.BigInt, false)
       val accounts = TableModel(SchemaId("ACCOUNT"), QualifiedName(SqlIdentifier("accounts"), Some(SqlIdentifier("public"))),
         Vector(id, login), Vector(id.id))
-      val create = MigrationRequest("001-accounts", SchemaSnapshot(1, 0, SchemaModel(Vector.empty)),
-        SchemaSnapshot(1, 1, SchemaModel(Vector(accounts))))
-      assertEquals(executor.migrate(ds, create).status, MigrationStatus.Applied)
+      assertEquals(executor.migrate(ds, SchemaModel(Vector(accounts))).status, MigrationStatus.Applied)
       execute(ds, "INSERT INTO public.accounts VALUES (1, 'patrick')")
-      val renamed = accounts.copy(columns = Vector(id.copy(name = SqlIdentifier("account_id")), login))
-      val rename = MigrationRequest("002-account-id", create.target, SchemaSnapshot(1, 2, SchemaModel(Vector(renamed))))
-      assertEquals(executor.migrate(ds, rename).status, MigrationStatus.Applied)
+      val renamedKey = accounts.copy(columns = Vector(id.copy(name = SqlIdentifier("account_id")), login))
+      assertEquals(executor.migrate(ds, SchemaModel(Vector(renamedKey))).status, MigrationStatus.Applied)
       assertEquals(scalar(ds, "SELECT username FROM public.accounts WHERE account_id = 1"), "patrick")
       intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.accounts VALUES (1, 'duplicate')"))
-    }
-  }
-
-  test("a modeled primary key missing from the database is drift") {
-    withDatabase { ds =>
-      fixture(ds)
-      val keyed = users.copy(primaryKey = Vector(login.id))
-      val keyedRequest = MigrationRequest("001-keyed", SchemaSnapshot(1, 0, SchemaModel(Vector(keyed))),
-        SchemaSnapshot(1, 1, SchemaModel(Vector(keyed.copy(name = keyed.name.copy(name = SqlIdentifier("accounts")))))))
-      val error = intercept[MigrationException](executor.migrate(ds, keyedRequest))
-      assert(error.getMessage.contains("primary key"))
-      assertEquals(scalar(ds, "SELECT username FROM public.users"), "patrick")
-      noHistory(ds)
+      execute(ds, "ALTER TABLE public.accounts DROP CONSTRAINT accounts_pkey")
+      val error = intercept[MigrationException](executor.migrate(ds, SchemaModel(Vector(renamedKey))))
+      assert(error.getMessage.contains("primary key"), error.getMessage)
     }
   }
 
   test("all supported native types can be verified and unchanged columns survive migration") {
     withDatabase { ds =>
-      fixture(ds)
-      execute(ds, "ALTER TABLE public.users ADD n integer, ADD big bigint, ADD active boolean, ADD description text")
       val extras = Vector(
         ColumnModel(SchemaId("N"), SqlIdentifier("n"), SqlType.Integer),
         ColumnModel(SchemaId("BIG"), SqlIdentifier("big"), SqlType.BigInt),
         ColumnModel(SchemaId("ACTIVE"), SqlIdentifier("active"), SqlType.Boolean),
-        ColumnModel(SchemaId("DESCRIPTION"), SqlIdentifier("description"), SqlType.Text)
+        ColumnModel(SchemaId("DESCRIPTION"), SqlIdentifier("description"), SqlType.Text),
+        // Quotes and non-ASCII characters must survive the jsonb round trip of the stored model.
+        ColumnModel(SchemaId("NOTE"), SqlIdentifier("Notiz \"ä\" 🙂"), SqlType.Varchar(20))
       )
-      val expanded = request.copy(
-        previous = request.previous.copy(model = SchemaModel(Vector(users.copy(columns = users.columns ++ extras)))),
-        target = request.target.copy(model = SchemaModel(Vector(renamed.copy(columns = renamed.columns ++ extras))))
-      )
+      fixture(ds, SchemaModel(Vector(users.copy(columns = users.columns ++ extras))))
+      val expanded = SchemaModel(Vector(renamed.copy(columns = renamed.columns ++ extras)))
       assertEquals(executor.migrate(ds, expanded).status, MigrationStatus.Applied)
       assertEquals(scalar(ds, "SELECT login_name FROM public.accounts"), "patrick")
+    }
+  }
+
+  test("a tampered stored model blocks the start") {
+    withDatabase { ds =>
+      fixture(ds)
+      execute(ds, "UPDATE __hibernate_ddl.schema_history SET model = jsonb_set(model, '{tables,0,name}', '\"people\"')")
+      val error = intercept[MigrationException](executor.migrate(ds, initial))
+      assert(error.getMessage.contains("does not match its fingerprint"), error.getMessage)
+      assertEquals(revisions(ds), "1")
+    }
+  }
+
+  test("a history table created by another version is refused, not altered") {
+    withDatabase { ds =>
+      execute(ds, "CREATE SCHEMA __hibernate_ddl")
+      execute(ds, "CREATE TABLE __hibernate_ddl.schema_history (migration_id varchar(200) PRIMARY KEY, to_revision bigint)")
+      val error = intercept[MigrationException](executor.migrate(ds, initial))
+      assert(error.getMessage.contains("another version"), error.getMessage)
+      assertEquals(scalar(ds, "SELECT to_regclass('public.users') IS NULL"), "t")
     }
   }
