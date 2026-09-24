@@ -264,7 +264,7 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
         ColumnModel(SchemaId("ACTIVE"), SqlIdentifier("active"), SqlType.Boolean),
         ColumnModel(SchemaId("DESCRIPTION"), SqlIdentifier("description"), SqlType.Text),
         // Quotes and non-ASCII characters must survive the jsonb round trip of the stored model.
-        ColumnModel(SchemaId("NOTE"), SqlIdentifier("Notiz \"ä\" 🙂"), SqlType.Varchar(20))
+        ColumnModel(SchemaId("NOTE"), SqlIdentifier("Note \"ä\" 🙂"), SqlType.Varchar(20))
       )
       fixture(ds, SchemaModel(Vector(users.copy(columns = users.columns ++ extras))))
       val expanded = SchemaModel(Vector(renamed.copy(columns = renamed.columns ++ extras)))
