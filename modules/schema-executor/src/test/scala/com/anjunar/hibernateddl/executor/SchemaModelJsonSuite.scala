@@ -66,6 +66,21 @@ class SchemaModelJsonSuite extends munit.FunSuite:
     assertEquals(SchemaModelJson.decode(json), Right(SchemaModel(Vector(linked))))
   }
 
+  test("every column type has a JSON name and round-trips") {
+    val types = Vector(SqlType.Varchar(80), SqlType.Char(1), SqlType.Numeric(38, 2), SqlType.Timestamp(6),
+      SqlType.TimestampWithTimeZone(3), SqlType.Time(0), SqlType.Integer, SqlType.BigInt, SqlType.Boolean, SqlType.Text,
+      SqlType.Uuid, SqlType.SmallInt, SqlType.Real, SqlType.DoublePrecision, SqlType.Date, SqlType.Binary)
+    val typed = customer.copy(columns = id +: types.zipWithIndex.map { (dataType, index) =>
+      ColumnModel(SchemaId(s"7f3a9c21/c$index"), SqlIdentifier(s"c$index"), dataType)
+    })
+    val json = SchemaModelJson.encode(SchemaModel(Vector(typed)))
+    Vector("char(1)", "numeric(38,2)", "time(0)", "smallint", "real", "double precision", "date", "binary").foreach { name =>
+      assert(json.contains(s"\"type\":\"$name\""), s"$name in $json")
+    }
+    assertEquals(SchemaModelJson.decode(json), Right(SchemaModel(Vector(typed))))
+    assert(failure(json.replace("numeric(38,2)", "numeric(38)")).contains("unknown type 'numeric(38)'"))
+  }
+
   test("unique keys round-trip in key order") {
     val keyed = customer.copy(uniqueKeys = Vector(
       UniqueKeyModel(Vector(SchemaId("7f3a9c21/f34e45b6"))),

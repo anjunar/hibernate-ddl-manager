@@ -33,6 +33,11 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
   private val VarcharType = """(?:varchar|character varying)\((\d+)\)""".r
   private val TimestampType = """timestamp\((\d+)\)(?: without time zone)?""".r
   private val TimestampWithTimeZoneType = """(?:timestamp\((\d+)\) with time zone|timestamptz\((\d+)\))""".r
+  private val TimeType = """time\((\d+)\)(?: without time zone)?""".r
+  private val CharType = """(?:char|character)\((\d+)\)""".r
+  private val NumericType = """(?:numeric|decimal)\((\d+)(?:,\s*(\d+))?\)""".r
+  // PostgreSQL maps float(1) to float(24) to real and float(25) to float(53) to double precision.
+  private val FloatType = """float\((\d+)\)""".r
 
   override def read(metadata: Metadata): Either[Vector[String], SchemaModel] =
     val reader = new Reader(metadata)
@@ -217,6 +222,19 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
         case "boolean" | "bool" => Some(SqlType.Boolean)
         case "text" => Some(SqlType.Text)
         case "uuid" => Some(SqlType.Uuid)
+        case "smallint" | "int2" => Some(SqlType.SmallInt)
+        case "real" | "float4" => Some(SqlType.Real)
+        case "double precision" | "float8" | "float" => Some(SqlType.DoublePrecision)
+        case "date" => Some(SqlType.Date)
+        case "bytea" => Some(SqlType.Binary)
+        case FloatType(digits) => digits.toIntOption.collect {
+          case bits if bits >= 1 && bits <= 24 => SqlType.Real
+          case bits if bits >= 25 && bits <= 53 => SqlType.DoublePrecision
+        }
+        case CharType(length) => length.toIntOption.map(SqlType.Char(_))
+        case NumericType(precision, scale) =>
+          for p <- precision.toIntOption; s <- Option(scale).getOrElse("0").toIntOption yield SqlType.Numeric(p, s)
+        case TimeType(precision) => precision.toIntOption.map(SqlType.Time(_))
         case VarcharType(length) => length.toIntOption.map(SqlType.Varchar(_))
         case TimestampType(precision) => precision.toIntOption.map(SqlType.Timestamp(_))
         case TimestampWithTimeZoneType(long, short) =>

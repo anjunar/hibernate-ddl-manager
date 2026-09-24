@@ -43,6 +43,21 @@ object SchemaFingerprint:
           case SqlType.Boolean => string(out, "boolean")
           case SqlType.Text => string(out, "text")
           case SqlType.Uuid => string(out, "uuid")
+          case SqlType.Char(length) =>
+            string(out, "char")
+            out.writeInt(length)
+          case SqlType.Numeric(precision, scale) =>
+            string(out, "numeric")
+            out.writeInt(precision)
+            out.writeInt(scale)
+          case SqlType.Time(precision) =>
+            string(out, "time")
+            out.writeInt(precision)
+          case SqlType.SmallInt => string(out, "smallint")
+          case SqlType.Real => string(out, "real")
+          case SqlType.DoublePrecision => string(out, "double precision")
+          case SqlType.Date => string(out, "date")
+          case SqlType.Binary => string(out, "binary")
         out.writeBoolean(column.nullable)
       }
       ids(out, table.primaryKey)
