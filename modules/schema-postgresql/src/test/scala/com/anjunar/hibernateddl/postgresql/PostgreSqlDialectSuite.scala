@@ -187,6 +187,23 @@ class PostgreSqlDialectSuite extends munit.FunSuite:
       }
   }
 
+  test("column checks render with a name derived from the column ID and the check") {
+    val values = ColumnCheck.AllowedValues(Vector("NEW", "it's"))
+    val status = ColumnModel(SchemaId("status"), SqlIdentifier("status"), SqlType.Varchar(10), check = Some(values))
+    val valuesName = PostgreSqlDialect.checkName(status.id, values).value
+    assert(valuesName.matches("ck_[0-9a-f]{24}"), valuesName)
+    assertEquals(PostgreSqlDialect.render(Vector(AddColumn(tableId, name("t"), status))), Right(Vector(
+      s"ALTER TABLE \"t\" ADD COLUMN \"status\" varchar(10) CONSTRAINT \"$valuesName\" CHECK (\"status\" IN ('NEW', 'it''s'));")))
+    val range = ColumnCheck.Range(0, 2)
+    val change = ChangeCheck(tableId, name("t"), status.id, SqlIdentifier("state"), Some(values), Some(range))
+    val rangeName = PostgreSqlDialect.checkName(status.id, range).value
+    assertEquals(PostgreSqlDialect.render(Vector(change)), Right(Vector(
+      s"ALTER TABLE \"t\" DROP CONSTRAINT \"$valuesName\", ADD CONSTRAINT \"$rangeName\" CHECK (\"state\" BETWEEN 0 AND 2);")))
+    assertNotEquals(rangeName, valuesName)
+    assertNotEquals(PostgreSqlDialect.checkName(SchemaId("other"), values).value, valuesName)
+    assert(PostgreSqlDialect.render(Vector(change.copy(to = Some(ColumnCheck.AllowedValues(Vector("a\u0000b")))))).isLeft)
+  }
+
   test("an empty plan renders to an empty statement vector") {
     assertEquals(PostgreSqlDialect.render(Vector.empty), Right(Vector.empty))
   }

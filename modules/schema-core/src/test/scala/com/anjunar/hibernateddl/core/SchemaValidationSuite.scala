@@ -109,6 +109,20 @@ class SchemaValidationSuite extends munit.FunSuite:
     }
   }
 
+  test("allowed values need a string column and fit its length; ranges need an integer column and fit its type") {
+    def errors(dataType: SqlType, check: ColumnCheck) = SchemaValidation.validate(SchemaModel(Vector(
+      table.copy(columns = table.columns.map(_.copy(dataType = dataType, check = Some(check)))))))
+    assertEquals(errors(SqlType.Varchar(5), ColumnCheck.AllowedValues(Vector("DRAFT", "SENT"))), Vector.empty)
+    assertEquals(errors(SqlType.SmallInt, ColumnCheck.Range(0, 2)), Vector.empty)
+    assert(errors(SqlType.Varchar(4), ColumnCheck.AllowedValues(Vector("DRAFT"))).exists(_.contains("longer than 4")))
+    assert(errors(SqlType.Text, ColumnCheck.AllowedValues(Vector.empty)).exists(_.contains("allows no value")))
+    assert(errors(SqlType.Text, ColumnCheck.AllowedValues(Vector("A", "A"))).exists(_.contains("more than once")))
+    assert(errors(SqlType.Integer, ColumnCheck.AllowedValues(Vector("A"))).exists(_.contains("not a string type")))
+    assert(errors(SqlType.Text, ColumnCheck.Range(0, 1)).exists(_.contains("not an integer type")))
+    assert(errors(SqlType.SmallInt, ColumnCheck.Range(2, 1)).exists(_.contains("empty range")))
+    assert(errors(SqlType.SmallInt, ColumnCheck.Range(0, 40000)).exists(_.contains("exceeds the column type's range")))
+  }
+
   test("TIMESTAMP precisions must not be negative") {
     def errors(dataType: SqlType) =
       SchemaValidation.validate(SchemaModel(Vector(table.copy(columns = table.columns.map(_.copy(dataType = dataType))))))
