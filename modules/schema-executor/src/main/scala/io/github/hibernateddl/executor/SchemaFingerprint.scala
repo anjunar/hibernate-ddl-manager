@@ -29,10 +29,17 @@ object SchemaFingerprint:
           case SqlType.Varchar(length) =>
             string(out, "varchar")
             out.writeInt(length)
+          case SqlType.Timestamp(precision) =>
+            string(out, "timestamp")
+            out.writeInt(precision)
+          case SqlType.TimestampWithTimeZone(precision) =>
+            string(out, "timestamptz")
+            out.writeInt(precision)
           case SqlType.Integer => string(out, "integer")
           case SqlType.BigInt => string(out, "bigint")
           case SqlType.Boolean => string(out, "boolean")
           case SqlType.Text => string(out, "text")
+          case SqlType.Uuid => string(out, "uuid")
         out.writeBoolean(column.nullable)
       }
       out.writeInt(table.primaryKey.size)

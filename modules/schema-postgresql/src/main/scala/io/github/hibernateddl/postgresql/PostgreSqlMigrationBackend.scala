@@ -131,13 +131,9 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
       tables.flatMap(table => inspectTable(connection, table)).distinct.sorted
 
   private def validateModel(model: SchemaModel): Vector[String] =
-    val identifiers = model.tables.flatMap { table =>
-      Vector[SchemaOperation](SchemaOperation.RenameTable(table.id, table.name, table.name)) ++
-        table.columns.map { column =>
-          SchemaOperation.RenameColumn(table.id, table.name, column.id, column.name, column.name)
-        }
+    val dialectErrors = model.tables.flatMap { table =>
+      PostgreSqlDialect.validateTable(table).map(message => s"Table '${table.id.value}': $message")
     }
-    val identifierErrors = PostgreSqlDialect.render(identifiers).left.toOption.toVector.flatten
     // The history stores models as jsonb, which cannot hold NUL.
     val idErrors = model.tables.flatMap(table => table.id +: table.columns.map(_.id))
       .filter(_.value.contains('\u0000')).map(id => s"Stable ID '${id.value.replace('\u0000', '?')}' must not contain NUL.")
@@ -151,7 +147,7 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
         )
       ).flatten
     }
-    (SchemaValidation.validate(model) ++ identifierErrors ++ idErrors ++ namespaceErrors).distinct.sorted
+    (SchemaValidation.validate(model) ++ dialectErrors ++ idErrors ++ namespaceErrors).distinct.sorted
 
   private def inspectTable(connection: Connection, expected: TableModel): Vector[String] =
     val display = qualified(expected.name)
@@ -259,7 +255,11 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
         case "int8" if typmod == -1 => Some(SqlType.BigInt)
         case "bool" if typmod == -1 => Some(SqlType.Boolean)
         case "text" if typmod == -1 => Some(SqlType.Text)
+        case "uuid" if typmod == -1 => Some(SqlType.Uuid)
         case "varchar" if typmod > 4 => Some(SqlType.Varchar(typmod - 4))
+        // Without an explicit precision typmod is -1, which the model never creates.
+        case "timestamp" if typmod >= 0 => Some(SqlType.Timestamp(typmod))
+        case "timestamptz" if typmod >= 0 => Some(SqlType.TimestampWithTimeZone(typmod))
         case _ => None
       val features = Vector(
         Option.when(row.getBoolean("atthasdef"))("default or generation expression"),

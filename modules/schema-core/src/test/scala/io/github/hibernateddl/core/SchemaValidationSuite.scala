@@ -53,3 +53,12 @@ class SchemaValidationSuite extends munit.FunSuite:
     }
     assertEquals(SchemaValidation.validate(SchemaModel(Vector(table))), Vector.empty)
   }
+
+  test("TIMESTAMP precisions must not be negative") {
+    def errors(dataType: SqlType) =
+      SchemaValidation.validate(SchemaModel(Vector(table.copy(columns = table.columns.map(_.copy(dataType = dataType))))))
+    assert(errors(SqlType.Timestamp(-1)).exists(_.contains("invalid TIMESTAMP precision -1")))
+    assert(errors(SqlType.TimestampWithTimeZone(-1)).exists(_.contains("invalid TIMESTAMP precision -1")))
+    assertEquals(errors(SqlType.Timestamp(0)), Vector.empty)
+    assertEquals(errors(SqlType.TimestampWithTimeZone(6)), Vector.empty)
+  }

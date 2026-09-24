@@ -106,8 +106,8 @@ Everything outside this scope is rejected, never silently ignored.
 
 | Area | Supported | Reported and rejected |
 | --- | --- | --- |
-| Model | Tables, columns `varchar(n)`, `integer`, `bigint`, `boolean`, `text`, nullability, primary keys | All other types and objects |
-| Adapter | Entities without inheritance or secondary tables, simple properties, embeddables | Associations/foreign keys, collection and join tables, unique keys, indexes, checks, defaults, identity columns, sequences, columns without an ID origin |
+| Model | Tables, columns `varchar(n)`, `integer`, `bigint`, `boolean`, `text`, `uuid`, `timestamp(p)`, `timestamp(p) with time zone`, nullability, primary keys | All other types and objects |
+| Adapter | Entities without inheritance or secondary tables, simple properties, embeddables, generated `UUID` keys, `LocalDateTime`, `Instant`, `OffsetDateTime` and `@Column(secondPrecision)` | Associations/foreign keys, collection and join tables, unique keys, indexes, checks, defaults, identity columns, sequences, columns without an ID origin |
 | Diff | New tables, new nullable columns, table and column renames | Drops, type/nullability/primary key changes, schema moves, rename collisions and swaps |
 | History | Stored model per revision, skipped releases | Target model of an earlier revision, rename back to an earlier name, modified history, tables without history (no adoption of existing databases) |
 | PostgreSQL | Ordinary permanent tables with exactly these columns and a non-deferrable primary key | Other constraints and indexes, triggers, rules, RLS, inheritance, partitions, custom collations |
@@ -116,10 +116,10 @@ Tables that exist only in the database are left untouched.
 
 ## Open points
 
-1. **Model coverage for real entities.** A typical entity with a `UUID` ID,
-   `LocalDateTime` timestamps, `@ManyToOne` and a unique constraint cannot be mapped yet.
-   Order: types `uuid` and `timestamp`, then foreign keys, then unique constraints. New
-   types also need a name in the history's JSON format.
+1. **Model coverage for real entities.** `UUID` keys and timestamps work; `@ManyToOne` and
+   unique constraints do not yet. Order: foreign keys, then unique constraints, then further
+   types such as `date` and `numeric(p,s)`. New types also need a name in the history's JSON
+   format.
 2. **Adopting existing databases.** Without history the previous model is the empty model;
    tables that already exist (for example from `hbm2ddl`) make `CREATE TABLE` fail.
    Proposal: if a database without history already matches the target model, the executor

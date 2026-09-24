@@ -14,9 +14,12 @@ final case class QualifiedName(
     catalog: Option[SqlIdentifier] = None
 )
 
+/** Timestamp precisions count fractional-second digits. */
 enum SqlType:
   case Varchar(length: Int)
-  case Integer, BigInt, Boolean, Text
+  case Timestamp(precision: Int)
+  case TimestampWithTimeZone(precision: Int)
+  case Integer, BigInt, Boolean, Text, Uuid
 
 final case class ColumnModel(
     id: SchemaId,
@@ -56,6 +59,10 @@ object SchemaValidation:
         column.dataType match
           case SqlType.Varchar(length) if length <= 0 =>
             errors += s"Column '${column.id.value}' has invalid VARCHAR length $length; expected a positive length"
+          case SqlType.Timestamp(precision) if precision < 0 =>
+            errors += s"Column '${column.id.value}' has invalid TIMESTAMP precision $precision; expected zero or more"
+          case SqlType.TimestampWithTimeZone(precision) if precision < 0 =>
+            errors += s"Column '${column.id.value}' has invalid TIMESTAMP precision $precision; expected zero or more"
           case _ => ()
       }
       val columns = table.columns.map(c => c.id -> c).toMap
