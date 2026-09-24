@@ -112,8 +112,8 @@ Everything outside this scope is rejected, never silently ignored.
 
 | Area | Supported | Reported and rejected |
 | --- | --- | --- |
-| Model | Tables, columns `varchar(n)`, `integer`, `bigint`, `boolean`, `text`, `uuid`, `timestamp(p)`, `timestamp(p) with time zone`, nullability, primary keys, unique keys, plain indexes with column directions, foreign keys to a primary key | All other types and objects |
-| Adapter | Entities without inheritance or secondary tables, simple properties, embeddables, generated `UUID` keys, `LocalDateTime`, `Instant`, `OffsetDateTime` and `@Column(secondPrecision)`, `@ManyToOne` with or without a constraint, `@OneToOne`, `@Column(unique)`, `@UniqueConstraint`, `@NaturalId`, `@Index` with `asc`/`desc` | `ON DELETE` actions, associations to non-primary-key or multi-column keys, ordered unique keys, index options and expressions, collection and join tables, checks, defaults, identity columns, sequences, columns without an ID origin |
+| Model | Tables, columns `varchar(n)`, `char(n)`, `text`, `smallint`, `integer`, `bigint`, `numeric(p,s)`, `real`, `double precision`, `boolean`, `uuid`, `date`, `time(p)`, `timestamp(p)`, `timestamp(p) with time zone`, binary data (`bytea`), nullability, primary keys, unique keys, plain indexes with column directions, foreign keys to a primary key | All other types and objects |
+| Adapter | Entities without inheritance or secondary tables, simple properties, embeddables, generated `UUID` keys, `LocalDate`, `LocalTime`, `LocalDateTime`, `Instant`, `OffsetDateTime` and `@Column(secondPrecision)`, `BigDecimal` and `BigInteger` with `@Column(precision, scale)`, `Short`, `Byte`, `Float`, `Double`, `Character`, `byte[]`, `Duration` (as `numeric`), `@ManyToOne` with or without a constraint, `@OneToOne`, `@Column(unique)`, `@UniqueConstraint`, `@NaturalId`, `@Index` with `asc`/`desc` | Enums (Hibernate adds a CHECK constraint), `@Lob` (PostgreSQL large objects), `ON DELETE` actions, associations to non-primary-key or multi-column keys, ordered unique keys, index options and expressions, collection and join tables, checks, defaults, identity columns, sequences, columns without an ID origin |
 | Diff | New tables, new nullable columns, new unique keys and indexes, new foreign keys (added after all tables, so cycles work), table and column renames | Drops (including keys and indexes), type/nullability/primary key/foreign key changes, schema moves, rename collisions and swaps |
 | History | Stored model per revision, skipped releases | Target model of an earlier revision, rename back to an earlier name, modified history, tables without history (no adoption of existing databases) |
 | PostgreSQL | Ordinary permanent tables with exactly these columns, a non-deferrable primary key, plain unique constraints, plain B-tree indexes and plain foreign keys, matched by structure | Other constraints, unique, partial, expression, covering or non-B-tree indexes, custom operator classes, collations or `NULLS` ordering, deferrable, `INCLUDE` or `NULLS NOT DISTINCT` unique keys, foreign keys with actions, `MATCH FULL` or deferrable checking, foreign keys from unmodeled tables, triggers, rules, RLS, inheritance, partitions, custom collations |
@@ -122,11 +122,11 @@ Tables that exist only in the database are left untouched.
 
 ## Open points
 
-1. **Model coverage for real entities.** `UUID` keys, timestamps, `@ManyToOne`,
-   `@OneToOne`, unique constraints and indexes work. Next: further types such as `date` and
-   `numeric(p,s)`, then collection tables. New types also need a name in the history's JSON
-   format. Foreign key columns get no index automatically; declare one with `@Index` where
-   deletes on the referenced table must be fast.
+1. **Model coverage for real entities.** The common basic types, `UUID` keys,
+   `@ManyToOne`, `@OneToOne`, unique constraints and indexes work. Next: enums, which need
+   CHECK constraints in the model, then collection tables. New types also need a name in the
+   history's JSON format. Foreign key columns get no index automatically; declare one with
+   `@Index` where deletes on the referenced table must be fast.
 2. **Adopting existing databases.** Without history the previous model is the empty model;
    tables that already exist (for example from `hbm2ddl`) make `CREATE TABLE` fail.
    Proposal: if a database without history already matches the target model, the executor

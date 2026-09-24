@@ -23,8 +23,9 @@ An ID consists of eight random hex digits, is assigned once and never changed. T
 [architecture](docs/architecture.md) describes the design, the rules and the open points.
 
 Status: prototype for PostgreSQL 14+, not yet a production-ready migration tool. Entities
-with `UUID` keys, timestamps, `@ManyToOne` and `@OneToOne` associations (foreign keys),
-unique constraints and indexes can be mapped; collections cannot yet.
+with the common basic types, `UUID` keys, `@ManyToOne` and `@OneToOne` associations
+(foreign keys), unique constraints and indexes can be mapped; enums, `@Lob` and collections
+cannot yet.
 
 ## Getting started
 

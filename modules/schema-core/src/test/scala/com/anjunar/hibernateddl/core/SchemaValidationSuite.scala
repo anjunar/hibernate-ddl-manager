@@ -95,6 +95,20 @@ class SchemaValidationSuite extends munit.FunSuite:
     assert(errors(ascending, ascending).exists(_.contains("more than one index on (column)")))
   }
 
+  test("CHAR lengths, NUMERIC precision and scale and TIME precisions must be in range") {
+    def errors(dataType: SqlType) =
+      SchemaValidation.validate(SchemaModel(Vector(table.copy(columns = table.columns.map(_.copy(dataType = dataType))))))
+    assert(errors(SqlType.Char(0)).exists(_.contains("invalid CHAR length 0")))
+    assert(errors(SqlType.Numeric(0, 0)).exists(_.contains("invalid NUMERIC(0, 0)")))
+    assert(errors(SqlType.Numeric(5, 6)).exists(_.contains("invalid NUMERIC(5, 6)")))
+    assert(errors(SqlType.Numeric(5, -1)).exists(_.contains("invalid NUMERIC(5, -1)")))
+    assert(errors(SqlType.Time(-1)).exists(_.contains("invalid TIME precision -1")))
+    Vector(SqlType.Char(1), SqlType.Numeric(38, 2), SqlType.Numeric(10, 10), SqlType.Time(0), SqlType.SmallInt,
+      SqlType.Real, SqlType.DoublePrecision, SqlType.Date, SqlType.Binary).foreach { valid =>
+      assertEquals(errors(valid), Vector.empty)
+    }
+  }
+
   test("TIMESTAMP precisions must not be negative") {
     def errors(dataType: SqlType) =
       SchemaValidation.validate(SchemaModel(Vector(table.copy(columns = table.columns.map(_.copy(dataType = dataType))))))
