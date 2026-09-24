@@ -26,11 +26,19 @@ enum SqlType:
   case Time(precision: Int)
   case Integer, BigInt, Boolean, Text, Uuid, SmallInt, Real, DoublePrecision, Date, Binary
 
+/** A CHECK constraint on one column, as Hibernate generates for enums: the allowed values of
+  * a string column, or an inclusive range of an integer column. NULL always passes.
+  */
+enum ColumnCheck:
+  case AllowedValues(values: Vector[String])
+  case Range(min: Long, max: Long)
+
 final case class ColumnModel(
     id: SchemaId,
     name: SqlIdentifier,
     dataType: SqlType,
-    nullable: Boolean = true
+    nullable: Boolean = true,
+    check: Option[ColumnCheck] = None
 )
 
 /** A foreign key references the primary key of a table in the same model. Columns and
@@ -88,6 +96,7 @@ object SchemaValidation:
           errors += s"Duplicate physical column name '${name.value}' in table '${table.id.value}'"
       }
       table.columns.foreach { column =>
+        column.check.foreach(check => errors ++= validateCheck(column, check))
         column.dataType match
           case SqlType.Varchar(length) if length <= 0 =>
             errors += s"Column '${column.id.value}' has invalid VARCHAR length $length; expected a positive length"
@@ -136,6 +145,32 @@ object SchemaValidation:
       }
     }
     errors.result().distinct.sorted
+
+  private def validateCheck(column: ColumnModel, check: ColumnCheck): Vector[String] =
+    val label = s"Check of column '${column.id.value}'"
+    check match
+      case ColumnCheck.AllowedValues(values) =>
+        val maximum = column.dataType match
+          case SqlType.Varchar(length) => Some(Some(length))
+          case SqlType.Char(length) => Some(Some(length))
+          case SqlType.Text => Some(None)
+          case _ => None
+        Option.when(maximum.isEmpty)(s"$label allows values, but the column type ${column.dataType} is not a string type").toVector ++
+          Option.when(values.isEmpty)(s"$label allows no value") ++
+          Option.when(values.distinct.size != values.size)(s"$label lists a value more than once") ++
+          maximum.flatten.toVector.flatMap { length =>
+            values.filter(_.length > length).map(value => s"$label allows '$value', which is longer than $length characters")
+          }
+      case ColumnCheck.Range(min, max) =>
+        val bounds = column.dataType match
+          case SqlType.SmallInt => Some((Short.MinValue.toLong, Short.MaxValue.toLong))
+          case SqlType.Integer => Some((Int.MinValue.toLong, Int.MaxValue.toLong))
+          case SqlType.BigInt => Some((Long.MinValue, Long.MaxValue))
+          case _ => None
+        Option.when(bounds.isEmpty)(s"$label is a range, but the column type ${column.dataType} is not an integer type").toVector ++
+          Option.when(min > max)(s"$label has the empty range $min to $max") ++
+          bounds.filter((low, high) => min < low || max > high).map((low, high) =>
+            s"$label range $min to $max exceeds the column type's range $low to $high")
 
   private def validateColumnList(label: String, ids: Vector[SchemaId], known: Set[SchemaId]): Vector[String] =
     Option.when(ids.isEmpty)(s"$label has no columns").toVector ++

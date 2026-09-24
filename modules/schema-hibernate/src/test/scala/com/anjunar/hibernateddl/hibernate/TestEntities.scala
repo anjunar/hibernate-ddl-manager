@@ -101,6 +101,29 @@ class Shipment:
   @SchemaId("2c3d4e5f") var status: String = uninitialized
   @SchemaId("3d4e5f60") var number: String = uninitialized
 
+enum Status extends java.lang.Enum[Status]:
+  case Draft, Sent, Paid
+
+enum Quote extends java.lang.Enum[Quote]:
+  case Plain, `it's`
+
+/** Enums by name and by ordinal; Hibernate guards both with a CHECK constraint. */
+@Entity
+@SchemaId("90a1b2c3")
+class Letter:
+  @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+  @SchemaId("1b2c3d4e") @Enumerated(EnumType.STRING) var status: Status = uninitialized
+  @SchemaId("2c3d4e5f") @Enumerated(EnumType.ORDINAL) var priority: Status = uninitialized
+  @SchemaId("3d4e5f60") @Enumerated(EnumType.STRING) @Column(name = "\"Stage\"", length = 10) var stage: Status = uninitialized
+
+/** Checks the adapter cannot read: a quote in an enum value and a hand-written @Check. */
+@Entity
+@SchemaId("a1b2c3d4")
+class OddChecks:
+  @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+  @SchemaId("1b2c3d4e") @Enumerated(EnumType.STRING) var quote: Quote = uninitialized
+  @SchemaId("2c3d4e5f") @Column(check = Array(new CheckConstraint(constraint = "amount >= 0"))) var amount: Integer = uninitialized
+
 /** Further basic types as Hibernate maps them on PostgreSQL. */
 @Entity
 @SchemaId("8f90a1b2")

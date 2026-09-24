@@ -8,10 +8,11 @@ import scala.util.control.NoStackTrace
   * start plans against the model applied last. Writing escapes every non-ASCII character, so
   * the text survives any transport unchanged. Reading is strict: an unknown format version, a
   * missing or unknown field and an unknown type are errors, never skipped. Format 2 added
-  * foreign keys, format 3 unique keys and format 4 indexes; the earlier formats are still read.
+  * foreign keys, format 3 unique keys, format 4 indexes and format 5 column checks; the
+  * earlier formats are still read.
   */
 object SchemaModelJson:
-  val FormatVersion = 4
+  val FormatVersion = 5
   private val VarcharType = """varchar\((\d+)\)""".r
   private val TimestampType = """timestamp\((\d+)\)""".r
   private val TimestampWithTimeZoneType = """timestamp\((\d+)\) with time zone""".r
@@ -32,6 +33,9 @@ object SchemaModelJson:
     def optional(identifier: Option[SqlIdentifier]) = identifier.fold("null")(value => string(value.value))
     def list(values: Vector[String]) = values.mkString("[", ",", "]")
     def ids(values: Vector[SchemaId]) = list(values.map(id => string(id.value)))
+    def check(value: ColumnCheck) = value match
+      case ColumnCheck.AllowedValues(values) => s"""{"values":${list(values.map(string))}}"""
+      case ColumnCheck.Range(min, max) => s"""{"min":$min,"max":$max}"""
     def indexColumn(column: IndexColumn) =
       s"""{"id":${string(column.column.value)},"descending":${column.descending}}"""
     def foreignKey(key: ForeignKeyModel) =
@@ -40,7 +44,8 @@ object SchemaModelJson:
     val tables = model.tables.map { table =>
       val columns = table.columns.map { column =>
         s"""{"id":${string(column.id.value)},"name":${string(column.name.value)},""" +
-          s""""type":${string(typeName(column.dataType))},"nullable":${column.nullable}}"""
+          s""""type":${string(typeName(column.dataType))},"nullable":${column.nullable},""" +
+          s""""check":${column.check.fold("null")(check)}}"""
       }
       s"""{"id":${string(table.id.value)},"catalog":${optional(table.name.catalog)},""" +
         s""""schema":${optional(table.name.schema)},"name":${string(table.name.name.value)},""" +
@@ -111,7 +116,7 @@ object SchemaModelJson:
         optional(table("schema"), label("schema")).map(SqlIdentifier(_)),
         optional(table("catalog"), label("catalog")).map(SqlIdentifier(_))
       ),
-      array(table("columns"), label("columns")).map(readColumn(_, id)),
+      array(table("columns"), label("columns")).map(readColumn(_, id, format)),
       ids(table("primaryKey"), label("primary key")),
       table.get("foreignKeys").fold(Vector.empty)(keys => array(keys, label("foreign keys")).map(readForeignKey(_, id))),
       table.get("uniqueKeys").fold(Vector.empty)(keys => array(keys, label("unique keys")).map { key =>
@@ -143,8 +148,9 @@ object SchemaModelJson:
   private def ids(json: Json, label: String): Vector[SchemaId] =
     array(json, label).map(id => SchemaId(string(id, label)))
 
-  private def readColumn(json: Json, tableId: String): ColumnModel =
-    val column = fields(json, s"Column in table '$tableId'", Set("id", "name", "type", "nullable"))
+  private def readColumn(json: Json, tableId: String, format: Int): ColumnModel =
+    val column = fields(json, s"Column in table '$tableId'",
+      Set("id", "name", "type", "nullable") ++ Option.when(format >= 5)("check"))
     val id = string(column("id"), s"Column id in table '$tableId'")
     val dataType = string(column("type"), s"Column '$id' type") match
       case "integer" => SqlType.Integer
@@ -169,7 +175,18 @@ object SchemaModelJson:
     val nullable = column("nullable") match
       case Json.Bool(value) => value
       case _ => invalid(s"Column '$id' nullable must be true or false")
-    ColumnModel(SchemaId(id), SqlIdentifier(string(column("name"), s"Column '$id' name")), dataType, nullable)
+    val check = column.get("check").filter(_ != Json.Null).map { json =>
+      json match
+        case Json.Obj(values) if values.keySet == Set("values") =>
+          ColumnCheck.AllowedValues(array(values("values"), s"Column '$id' check values").map(string(_, s"Column '$id' check value")))
+        case Json.Obj(values) if values.keySet == Set("min", "max") =>
+          def bound(name: String) = values(name) match
+            case Json.Num(number) if number.isValidLong => number.toLong
+            case _ => invalid(s"Column '$id' check $name must be an integer in the 64-bit range")
+          ColumnCheck.Range(bound("min"), bound("max"))
+        case _ => invalid(s"Column '$id' check must have either values or min and max")
+    }
+    ColumnModel(SchemaId(id), SqlIdentifier(string(column("name"), s"Column '$id' name")), dataType, nullable, check)
 
   private def number(digits: String, label: String): Int =
     digits.toIntOption.getOrElse(invalid(s"$label $digits is out of range"))

@@ -228,7 +228,8 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
       "ALTER TABLE public.users ADD PRIMARY KEY (username)" -> "primary key",
       "ALTER TABLE public.users ALTER COLUMN username SET DEFAULT 'anonymous'" -> "unsupported default",
       "CREATE INDEX users_login_idx ON public.users(username)" -> "unexpected index (\"username\")",
-      "ALTER TABLE public.users ADD CHECK (username <> '')" -> "unsupported unmodeled constraints",
+      "ALTER TABLE public.users ADD CHECK (username <> '')" -> "unexpected check constraint",
+      "ALTER TABLE public.users ADD EXCLUDE (username WITH =)" -> "unsupported unmodeled constraints",
       "CREATE FUNCTION public.keep() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$; " +
         "CREATE TRIGGER users_keep BEFORE INSERT ON public.users FOR EACH ROW EXECUTE FUNCTION public.keep()" ->
         "unsupported triggers"
@@ -526,6 +527,62 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
         executor.migrate(ds, indexedUsers)
         execute(ds, change)
         val error = intercept[MigrationException](executor.migrate(ds, indexedUsers))
+        assert(error.getMessage.contains(message), s"$change: ${error.getMessage}")
+      }
+    }
+  }
+
+  private val status = ColumnModel(SchemaId("USER_STATUS"), SqlIdentifier("status"), SqlType.Varchar(10),
+    check = Some(ColumnCheck.AllowedValues(Vector("NEW", "ACTIVE"))))
+  private val level = ColumnModel(SchemaId("USER_LEVEL"), SqlIdentifier("level"), SqlType.SmallInt,
+    check = Some(ColumnCheck.Range(0, 2)))
+  private val checkedUsers = SchemaModel(Vector(users.copy(columns = users.columns ++ Vector(status, level))))
+  private def withChecks(statusCheck: Option[ColumnCheck], levelCheck: Option[ColumnCheck] = level.check) =
+    SchemaModel(Vector(users.copy(columns = users.columns ++ Vector(status.copy(check = statusCheck), level.copy(check = levelCheck)))))
+
+  test("column checks are created, enforced and verified on restart") {
+    withDatabase { ds =>
+      fixture(ds, checkedUsers)
+      execute(ds, "UPDATE public.users SET status = 'ACTIVE', level = 2")
+      intercept[java.sql.SQLException](execute(ds, "UPDATE public.users SET status = 'GONE'"))
+      intercept[java.sql.SQLException](execute(ds, "UPDATE public.users SET level = 3"))
+      assertEquals(executor.migrate(ds, checkedUsers), MigrationResult(1, MigrationStatus.AlreadyApplied, 0))
+    }
+  }
+
+  test("an extended enum widens the check; a narrowed one is refused by existing rows; renames keep checks") {
+    withDatabase { ds =>
+      fixture(ds, checkedUsers)
+      execute(ds, "UPDATE public.users SET status = 'ACTIVE'")
+      val extended = withChecks(Some(ColumnCheck.AllowedValues(Vector("NEW", "ACTIVE", "BLOCKED"))))
+      assertEquals(executor.migrate(ds, extended), MigrationResult(2, MigrationStatus.Applied, 1))
+      execute(ds, "UPDATE public.users SET status = 'BLOCKED'")
+      val narrowed = withChecks(Some(ColumnCheck.AllowedValues(Vector("NEW", "ACTIVE"))), Some(ColumnCheck.Range(0, 1)))
+      assertEquals(intercept[MigrationException](executor.migrate(ds, narrowed)).state, FailureState.RolledBack)
+      assertEquals(revisions(ds), "2")
+      val renamedChecked = SchemaModel(Vector(extended.tables.head.copy(columns = extended.tables.head.columns.map(c =>
+        if c.id == status.id then c.copy(name = SqlIdentifier("state")) else c))))
+      assertEquals(executor.migrate(ds, renamedChecked), MigrationResult(3, MigrationStatus.Applied, 1))
+      intercept[java.sql.SQLException](execute(ds, "UPDATE public.users SET state = 'GONE'"))
+      val unchecked = SchemaModel(Vector(renamedChecked.tables.head.copy(columns = renamedChecked.tables.head.columns.map(_.copy(check = None)))))
+      assertEquals(executor.migrate(ds, unchecked), MigrationResult(4, MigrationStatus.Applied, 2))
+      execute(ds, "UPDATE public.users SET state = 'GONE', level = 7")
+    }
+  }
+
+  test("missing, foreign and NOT VALID check constraints block the start") {
+    val statusName = PostgreSqlDialect.checkName(status.id, status.check.get).value
+    Vector(
+      s"ALTER TABLE public.users DROP CONSTRAINT $statusName" -> "is missing from",
+      s"ALTER TABLE public.users DROP CONSTRAINT $statusName, ADD CONSTRAINT $statusName CHECK (level > 0)" ->
+        "covers (\"level\"); expected (\"status\")",
+      s"ALTER TABLE public.users DROP CONSTRAINT $statusName, " +
+        s"ADD CONSTRAINT $statusName CHECK (status IN ('NEW', 'ACTIVE')) NOT VALID" -> "unsupported NOT VALID state"
+    ).foreach { (change, message) =>
+      withDatabase { ds =>
+        fixture(ds, checkedUsers)
+        execute(ds, change)
+        val error = intercept[MigrationException](executor.migrate(ds, checkedUsers))
         assert(error.getMessage.contains(message), s"$change: ${error.getMessage}")
       }
     }
