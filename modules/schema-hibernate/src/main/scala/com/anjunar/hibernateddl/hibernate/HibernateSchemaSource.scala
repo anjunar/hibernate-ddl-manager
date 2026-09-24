@@ -38,6 +38,12 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
   private val NumericType = """(?:numeric|decimal)\((\d+)(?:,\s*(\d+))?\)""".r
   // PostgreSQL maps float(1) to float(24) to real and float(25) to float(53) to double precision.
   private val FloatType = """float\((\d+)\)""".r
+  // The two CHECK forms Hibernate generates for enums. Hibernate does not escape quotes in the
+  // values, so a value containing one does not match and is reported instead of misread.
+  private val ColumnReference = """("(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_$]*)"""
+  private val AllowedValuesCheck = s"""(?is)\\s*$ColumnReference\\s+in\\s*\\(\\s*('[^']*'(?:\\s*,\\s*'[^']*')*)\\s*\\)\\s*""".r
+  private val RangeCheck = s"""(?is)\\s*$ColumnReference\\s+between\\s+(-?\\d+)\\s+and\\s+(-?\\d+)\\s*""".r
+  private val Literal = """'([^']*)'""".r
 
   override def read(metadata: Metadata): Either[Vector[String], SchemaModel] =
     val reader = new Reader(metadata)
@@ -212,8 +218,7 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
         Option.when(column.getDefaultValue != null)("a default value"),
         Option.when(column.getGeneratedAs != null)("a generation expression"),
         Option.when(column.isIdentity)("identity generation"),
-        Option.when(column.getCollation != null)("a custom collation"),
-        Option.when(column.hasCheckConstraint)("a check constraint")
+        Option.when(column.getCollation != null)("a custom collation")
       ).flatten.foreach(feature => errors += s"$label has $feature; unsupported")
       val sqlType = column.getSqlType(metadata)
       val dataType = sqlType.trim.toLowerCase(Locale.ROOT) match
@@ -241,7 +246,27 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
           Option(long).orElse(Option(short)).flatMap(_.toIntOption).map(SqlType.TimestampWithTimeZone(_))
         case _ => None
       if dataType.isEmpty then errors += s"$label has SQL type '$sqlType'; unsupported"
-      dataType.map(ColumnModel(id, physical(Identifier.toIdentifier(column.getName, column.isQuoted)), _, column.isNullable))
+      val check = columnCheck(column, label)
+      dataType.map(ColumnModel(id, physical(Identifier.toIdentifier(column.getName, column.isQuoted)), _, column.isNullable, check))
+
+    private def columnCheck(column: Column, label: String): Option[ColumnCheck] =
+      column.getCheckConstraints.asScala.toVector.map(_.getConstraint) match
+        case Vector() => None
+        case Vector(text) =>
+          def refersToColumn(reference: String) =
+            if reference.startsWith("\"") then reference.drop(1).dropRight(1).replace("\"\"", "\"") == column.getName
+            else !column.isQuoted && reference.equalsIgnoreCase(column.getName)
+          val check = text match
+            case AllowedValuesCheck(reference, values) if refersToColumn(reference) =>
+              Some(ColumnCheck.AllowedValues(Literal.findAllMatchIn(values).map(_.group(1)).toVector))
+            case RangeCheck(reference, min, max) if refersToColumn(reference) =>
+              for low <- min.toLongOption; high <- max.toLongOption yield ColumnCheck.Range(low, high)
+            case _ => None
+          if check.isEmpty then errors += s"$label has the check constraint '$text'; only enum checks are supported"
+          check
+        case texts =>
+          errors += s"$label has ${texts.size} check constraints; unsupported"
+          None
 
     private def qualifiedName(table: Table): QualifiedName =
       QualifiedName(

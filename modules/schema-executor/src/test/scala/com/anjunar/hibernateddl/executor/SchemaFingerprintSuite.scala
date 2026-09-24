@@ -71,6 +71,27 @@ class SchemaFingerprintSuite extends munit.FunSuite:
     assertEquals(SchemaFingerprint.of(model), "1f76c2babda21275093a280117c171471900dd4fb6ab259d7fc1b655119b951e")
   }
 
+  test("models with indexes but without column checks keep the fingerprints that earlier versions stored") {
+    val table = keyed.tables.head
+    val parent = ColumnModel(SchemaId("t/parent"), SqlIdentifier("parent"), SqlType.Uuid)
+    val model = SchemaModel(Vector(table.copy(columns = Vector(table.columns.head, parent),
+      foreignKeys = Vector(ForeignKeyModel(Vector(parent.id), table.id, table.primaryKey)),
+      uniqueKeys = Vector(UniqueKeyModel(Vector(parent.id))),
+      indexes = Vector(IndexModel(Vector(IndexColumn(parent.id, descending = true)))))))
+    assertEquals(SchemaFingerprint.of(model), "2e078d3ab32f3cd52cb02314f213bcce5e9d22aba3700cd4ff457cb1d883afb7")
+  }
+
+  test("column checks change the fingerprint") {
+    val table = keyed.tables.head
+    def withCheck(check: Option[ColumnCheck]) =
+      SchemaFingerprint.of(SchemaModel(Vector(table.copy(columns = table.columns.map(c =>
+        if c.id == SchemaId("t/name") then c.copy(check = check) else c)))))
+    val fingerprints = Vector(None, Some(ColumnCheck.AllowedValues(Vector("A"))), Some(ColumnCheck.AllowedValues(Vector("A", "B"))),
+      Some(ColumnCheck.AllowedValues(Vector("B", "A"))), Some(ColumnCheck.Range(0, 1)), Some(ColumnCheck.Range(0, 2))).map(withCheck)
+    assertEquals(fingerprints.head, SchemaFingerprint.of(keyed))
+    assertEquals(fingerprints.distinct.size, fingerprints.size)
+  }
+
   test("indexes and their directions change the fingerprint, but their order does not") {
     val table = keyed.tables.head
     val indexes = table.columns.drop(1).map(column => IndexModel(Vector(IndexColumn(column.id))))

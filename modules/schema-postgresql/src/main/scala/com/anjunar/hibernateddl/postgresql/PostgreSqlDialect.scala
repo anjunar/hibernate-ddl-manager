@@ -2,7 +2,9 @@ package com.anjunar.hibernateddl.postgresql
 
 import com.anjunar.hibernateddl.core.*
 
+import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 
 /** Pure PostgreSQL DDL rendering.
   *
@@ -33,6 +35,11 @@ object PostgreSqlDialect extends SchemaDialect:
             "The new table's foreign keys must be separate operations after all tables exist."
           ).toVector ++
           Option.when(table.indexes.nonEmpty)("The new table's indexes must be separate operations.").toVector
+      case SchemaOperation.ChangeCheck(_, table, _, column, from, to) =>
+        validateName(table, "table") ++
+          validateIdentifier(column, "checked column") ++
+          to.toVector.flatMap(validateCheck(_, "new")) ++
+          Option.when(from.isEmpty && to.isEmpty)("A check change needs a previous or a new check.").toVector
       case SchemaOperation.CreateIndex(_, table, columns) =>
         validateName(table, "table") ++
           columns.flatMap(column => validateIdentifier(column.name, "index column")) ++
@@ -81,7 +88,7 @@ object PostgreSqlDialect extends SchemaDialect:
       Option.when(table.indexes.exists(_.columns.isEmpty))(s"A $label index has no columns.").toVector
 
   private def validateColumn(column: ColumnModel, label: String): Vector[String] =
-    validateIdentifier(column.name, label) ++ (column.dataType match
+    validateIdentifier(column.name, label) ++ column.check.toVector.flatMap(validateCheck(_, label)) ++ (column.dataType match
       case SqlType.Varchar(length) if length <= 0 || length > MaxCharacterLength =>
         Vector(s"$label has VARCHAR length $length; PostgreSQL supports 1 to $MaxCharacterLength.")
       case SqlType.Char(length) if length <= 0 || length > MaxCharacterLength =>
@@ -96,6 +103,11 @@ object PostgreSqlDialect extends SchemaDialect:
         Vector(s"$label has TIMESTAMP precision $precision; PostgreSQL supports 0 to $MaxTimestampPrecision.")
       case _ => Vector.empty
     )
+
+  private def validateCheck(check: ColumnCheck, label: String): Vector[String] = check match
+    case ColumnCheck.AllowedValues(values) =>
+      Option.when(values.exists(_.contains('\u0000')))(s"The $label check allows a value containing NUL.").toVector
+    case ColumnCheck.Range(_, _) => Vector.empty
 
   private def validateName(name: QualifiedName, label: String): Vector[String] =
     validateIdentifier(name.name, label) ++
@@ -135,6 +147,10 @@ object PostgreSqlDialect extends SchemaDialect:
         s"CREATE TABLE ${qualified(table.name)} (${definitions.mkString(", ")});"
       case SchemaOperation.AddColumn(_, table, column) =>
         s"ALTER TABLE ${qualified(table)} ADD COLUMN ${renderColumn(column)};"
+      case SchemaOperation.ChangeCheck(_, table, columnId, column, from, to) =>
+        val changes = from.map(check => s"DROP CONSTRAINT ${quoted(checkName(columnId, check))}").toVector ++
+          to.map(check => "ADD " + renderCheck(columnId, column, check))
+        s"ALTER TABLE ${qualified(table)} ${changes.mkString(", ")};"
       case SchemaOperation.CreateIndex(_, table, columns) =>
         val keys = columns.map(column => quoted(column.name) + (if column.descending then " DESC" else ""))
         s"CREATE INDEX ON ${qualified(table)} (${keys.mkString(", ")});"
@@ -150,7 +166,30 @@ object PostgreSqlDialect extends SchemaDialect:
 
   private def renderColumn(column: ColumnModel): String =
     val nullable = if column.nullable then "" else " NOT NULL"
-    s"${quoted(column.name)} ${renderType(column.dataType)}$nullable"
+    val check = column.check.fold("")(value => " " + renderCheck(column.id, column.name, value))
+    s"${quoted(column.name)} ${renderType(column.dataType)}$nullable$check"
+
+  /** Check constraints are named after the column ID and the check, so a plan can replace a
+    * check without looking up its name, and column renames keep the name valid.
+    */
+  private[postgresql] def checkName(columnId: SchemaId, check: ColumnCheck): SqlIdentifier =
+    val canonical = check match
+      case ColumnCheck.AllowedValues(values) => "values" +: values
+      case ColumnCheck.Range(min, max) => Vector("range", min.toString, max.toString)
+    val digest = MessageDigest.getInstance("SHA-256")
+    (columnId.value +: canonical).foreach { part =>
+      val bytes = part.getBytes(StandardCharsets.UTF_8)
+      digest.update(ByteBuffer.allocate(4).putInt(bytes.length).array())
+      digest.update(bytes)
+    }
+    SqlIdentifier("ck_" + digest.digest().take(12).map(byte => f"${byte & 0xff}%02x").mkString)
+
+  private def renderCheck(columnId: SchemaId, column: SqlIdentifier, check: ColumnCheck): String =
+    val condition = check match
+      case ColumnCheck.AllowedValues(values) =>
+        s"${quoted(column)} IN (${values.map(value => "'" + value.replace("'", "''") + "'").mkString(", ")})"
+      case ColumnCheck.Range(min, max) => s"${quoted(column)} BETWEEN $min AND $max"
+    s"CONSTRAINT ${quoted(checkName(columnId, check))} CHECK ($condition)"
 
   private def renderType(dataType: SqlType): String = dataType match
     case SqlType.Varchar(length) => s"varchar($length)"

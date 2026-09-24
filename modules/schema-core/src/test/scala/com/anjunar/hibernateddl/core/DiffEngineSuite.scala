@@ -229,6 +229,23 @@ class DiffEngineSuite extends munit.FunSuite:
     assert(diagnostics.exists(_.contains("Dropping index (customer-name) from table 'customer'")), diagnostics)
   }
 
+  test("changed column checks are replaced, also together with a rename, and new columns carry theirs") {
+    val status = column("customer-status", "status").copy(check = Some(ColumnCheck.AllowedValues(Vector("NEW"))))
+    val before = SchemaModel(Vector(customer.copy(columns = customer.columns :+ status)))
+    val widened = status.copy(name = SqlIdentifier("state"), check = Some(ColumnCheck.AllowedValues(Vector("NEW", "OLD"))))
+    val level = column("customer-level", "level").copy(dataType = SqlType.SmallInt, check = Some(ColumnCheck.Range(0, 2)))
+    val after = SchemaModel(Vector(customer.copy(columns = customer.columns ++ Vector(widened, level))))
+    assertEquals(DiffEngine.diff(before, after), Right(Vector(
+      SchemaOperation.RenameColumn(customer.id, customer.name, status.id, SqlIdentifier("status"), SqlIdentifier("state")),
+      SchemaOperation.ChangeCheck(customer.id, customer.name, status.id, SqlIdentifier("state"), status.check, widened.check),
+      SchemaOperation.AddColumn(customer.id, customer.name, level)
+    )))
+    val unchecked = SchemaModel(Vector(customer.copy(columns = customer.columns :+ status.copy(check = None))))
+    assertEquals(DiffEngine.diff(before, unchecked), Right(Vector(
+      SchemaOperation.ChangeCheck(customer.id, customer.name, status.id, SqlIdentifier("status"), status.check, None)
+    )))
+  }
+
   test("renames expose their locking risk") {
     val renamed = customer.name.copy(name = SqlIdentifier("renamed"))
     assertEquals(SchemaOperation.RenameTable(customer.id, customer.name, renamed).risk, RiskLevel.Locking)

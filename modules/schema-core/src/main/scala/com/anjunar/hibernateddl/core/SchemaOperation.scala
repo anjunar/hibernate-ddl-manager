@@ -31,6 +31,19 @@ object SchemaOperation:
   ) extends SchemaOperation:
     val risk: RiskLevel = RiskLevel.Locking
 
+  /** Replaces a column's CHECK constraint; either side may be absent. Adding a check
+    * validates the existing rows.
+    */
+  final case class ChangeCheck(
+      tableId: SchemaId,
+      table: QualifiedName,
+      columnId: SchemaId,
+      column: SqlIdentifier,
+      from: Option[ColumnCheck],
+      to: Option[ColumnCheck]
+  ) extends SchemaOperation:
+    val risk: RiskLevel = RiskLevel.Locking
+
   final case class IndexedColumn(name: SqlIdentifier, descending: Boolean)
 
   final case class CreateIndex(
