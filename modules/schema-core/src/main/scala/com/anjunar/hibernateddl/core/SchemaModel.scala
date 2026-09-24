@@ -43,6 +43,15 @@ final case class ForeignKeyModel(
 final case class UniqueKeyModel(columns: Vector[SchemaId]):
   def display: String = columns.map(_.value).mkString("(", ", ", ")")
 
+final case class IndexColumn(column: SchemaId, descending: Boolean = false)
+
+/** A plain, non-unique B-tree index over columns in key order; the column list, including
+  * each column's direction, is its identity. Unique indexes are unique keys.
+  */
+final case class IndexModel(columns: Vector[IndexColumn]):
+  def display: String =
+    columns.map(c => if c.descending then s"${c.column.value} DESC" else c.column.value).mkString("(", ", ", ")")
+
 /** The primary key lists column IDs in key order, so column renames keep it intact. */
 final case class TableModel(
     id: SchemaId,
@@ -50,7 +59,8 @@ final case class TableModel(
     columns: Vector[ColumnModel],
     primaryKey: Vector[SchemaId] = Vector.empty,
     foreignKeys: Vector[ForeignKeyModel] = Vector.empty,
-    uniqueKeys: Vector[UniqueKeyModel] = Vector.empty
+    uniqueKeys: Vector[UniqueKeyModel] = Vector.empty,
+    indexes: Vector[IndexModel] = Vector.empty
 )
 
 final case class SchemaModel(tables: Vector[TableModel])
@@ -103,15 +113,23 @@ object SchemaValidation:
           errors += s"Table '${table.id.value}' has more than one unique key on ${keys.head.display}"
       }
       table.uniqueKeys.foreach { key =>
-        val label = s"Unique key ${key.display} of table '${table.id.value}'"
-        if key.columns.isEmpty then errors += s"$label has no columns"
-        if key.columns.distinct.size != key.columns.size then errors += s"$label lists a column more than once"
-        key.columns.filterNot(columns.contains).foreach { id =>
-          errors += s"$label references unknown column '${id.value}'"
-        }
+        errors ++= validateColumnList(s"Unique key ${key.display} of table '${table.id.value}'", key.columns, columns.keySet)
+      }
+      table.indexes.groupBy(_.columns).foreach { (_, indexes) =>
+        if indexes.size > 1 then
+          errors += s"Table '${table.id.value}' has more than one index on ${indexes.head.display}"
+      }
+      table.indexes.foreach { index =>
+        errors ++= validateColumnList(s"Index ${index.display} of table '${table.id.value}'", index.columns.map(_.column),
+          columns.keySet)
       }
     }
     errors.result().distinct.sorted
+
+  private def validateColumnList(label: String, ids: Vector[SchemaId], known: Set[SchemaId]): Vector[String] =
+    Option.when(ids.isEmpty)(s"$label has no columns").toVector ++
+      Option.when(ids.distinct.size != ids.size)(s"$label lists a column more than once") ++
+      ids.filterNot(known.contains).map(id => s"$label references unknown column '${id.value}'")
 
   private def validateForeignKey(model: SchemaModel, table: TableModel, key: ForeignKeyModel): Vector[String] =
     val label = s"Foreign key ${key.display} of table '${table.id.value}'"

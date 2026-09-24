@@ -29,7 +29,12 @@ object PostgreSqlDialect extends SchemaDialect:
         validateTable(table, "new table") ++
           Option.when(table.foreignKeys.nonEmpty)(
             "The new table's foreign keys must be separate operations after all tables exist."
-          ).toVector
+          ).toVector ++
+          Option.when(table.indexes.nonEmpty)("The new table's indexes must be separate operations.").toVector
+      case SchemaOperation.CreateIndex(_, table, columns) =>
+        validateName(table, "table") ++
+          columns.flatMap(column => validateIdentifier(column.name, "index column")) ++
+          Option.when(columns.isEmpty)("An index needs at least one column.").toVector
       case SchemaOperation.AddUniqueKey(_, table, columns) =>
         validateName(table, "table") ++
           columns.flatMap(validateIdentifier(_, "unique key column")) ++
@@ -67,7 +72,11 @@ object PostgreSqlDialect extends SchemaDialect:
       table.uniqueKeys.flatMap(_.columns).filterNot(id => table.columns.exists(_.id == id)).map { id =>
         s"A $label unique key references unknown column '${id.value}'."
       } ++
-      Option.when(table.uniqueKeys.exists(_.columns.isEmpty))(s"A $label unique key has no columns.").toVector
+      Option.when(table.uniqueKeys.exists(_.columns.isEmpty))(s"A $label unique key has no columns.").toVector ++
+      table.indexes.flatMap(_.columns.map(_.column)).filterNot(id => table.columns.exists(_.id == id)).map { id =>
+        s"A $label index references unknown column '${id.value}'."
+      } ++
+      Option.when(table.indexes.exists(_.columns.isEmpty))(s"A $label index has no columns.").toVector
 
   private def validateColumn(column: ColumnModel, label: String): Vector[String] =
     validateIdentifier(column.name, label) ++ (column.dataType match
@@ -117,6 +126,9 @@ object PostgreSqlDialect extends SchemaDialect:
         s"CREATE TABLE ${qualified(table.name)} (${definitions.mkString(", ")});"
       case SchemaOperation.AddColumn(_, table, column) =>
         s"ALTER TABLE ${qualified(table)} ADD COLUMN ${renderColumn(column)};"
+      case SchemaOperation.CreateIndex(_, table, columns) =>
+        val keys = columns.map(column => quoted(column.name) + (if column.descending then " DESC" else ""))
+        s"CREATE INDEX ON ${qualified(table)} (${keys.mkString(", ")});"
       case SchemaOperation.AddUniqueKey(_, table, columns) =>
         s"ALTER TABLE ${qualified(table)} ADD UNIQUE (${columns.map(quoted).mkString(", ")});"
       case SchemaOperation.AddForeignKey(_, table, columns, referencedTable, referencedColumns) =>

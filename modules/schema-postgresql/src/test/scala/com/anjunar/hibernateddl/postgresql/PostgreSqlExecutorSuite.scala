@@ -227,7 +227,7 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
     Vector(
       "ALTER TABLE public.users ADD PRIMARY KEY (username)" -> "primary key",
       "ALTER TABLE public.users ALTER COLUMN username SET DEFAULT 'anonymous'" -> "unsupported default",
-      "CREATE INDEX users_login_idx ON public.users(username)" -> "unsupported indexes",
+      "CREATE INDEX users_login_idx ON public.users(username)" -> "unexpected index (\"username\")",
       "ALTER TABLE public.users ADD CHECK (username <> '')" -> "unsupported unmodeled constraints",
       "CREATE FUNCTION public.keep() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$; " +
         "CREATE TRIGGER users_keep BEFORE INSERT ON public.users FOR EACH ROW EXECUTE FUNCTION public.keep()" ->
@@ -429,7 +429,7 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
       "ALTER TABLE public.users DROP CONSTRAINT users_username_key, ADD UNIQUE (username) INCLUDE (tenant)" ->
         "unsupported INCLUDE columns",
       "ALTER TABLE public.users DROP CONSTRAINT users_username_key; " +
-        "CREATE UNIQUE INDEX users_login ON public.users (username)" -> "unsupported indexes"
+        "CREATE UNIQUE INDEX users_login ON public.users (username)" -> "unsupported uniqueness without a unique constraint"
     ).foreach { (change, message) =>
       withDatabase { ds =>
         fixture(ds, uniqueUsers)
@@ -447,6 +447,60 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
       execute(ds, "ALTER TABLE public.users DROP CONSTRAINT users_username_key, ADD UNIQUE NULLS NOT DISTINCT (username)")
       val error = intercept[MigrationException](executor.migrate(ds, uniqueUsers))
       assert(error.getMessage.contains("unsupported NULLS NOT DISTINCT"), error.getMessage)
+    }
+  }
+
+  private val indexedUsers = SchemaModel(Vector(users.copy(columns = users.columns :+ tenant, indexes = Vector(
+    IndexModel(Vector(IndexColumn(login.id))),
+    IndexModel(Vector(IndexColumn(tenant.id), IndexColumn(login.id, descending = true)))
+  ))))
+
+  test("indexes are created after their table and verified on restart") {
+    withDatabase { ds =>
+      assertEquals(executor.migrate(ds, indexedUsers), MigrationResult(1, MigrationStatus.Applied, 3))
+      assertEquals(scalar(ds, "SELECT count(*) FROM pg_indexes WHERE schemaname = 'public' AND tablename = 'users'"), "2")
+      assertEquals(executor.migrate(ds, indexedUsers), MigrationResult(1, MigrationStatus.AlreadyApplied, 0))
+    }
+  }
+
+  test("an index added to a populated table keeps its rows, and renames keep indexes") {
+    withDatabase { ds =>
+      fixture(ds)
+      assertEquals(executor.migrate(ds, indexedUsers), MigrationResult(2, MigrationStatus.Applied, 3))
+      val renamedIndexed = SchemaModel(Vector(indexedUsers.tables.head.copy(name = renamed.name,
+        columns = Vector(login.copy(name = SqlIdentifier("login_name")), tenant.copy(name = SqlIdentifier("tenant_id"))))))
+      assertEquals(executor.migrate(ds, renamedIndexed), MigrationResult(3, MigrationStatus.Applied, 3))
+      assertEquals(scalar(ds, "SELECT login_name FROM public.accounts"), "patrick")
+      assertEquals(executor.migrate(ds, renamedIndexed).status, MigrationStatus.AlreadyApplied)
+    }
+  }
+
+  test("missing, extra, reordered and non-plain indexes block the start") {
+    Vector(
+      "DROP INDEX public.users_username_idx" -> "index (\"username\") is missing",
+      "CREATE INDEX ON public.users (tenant)" -> "unexpected index (\"tenant\")",
+      "DROP INDEX public.users_username_idx; CREATE INDEX ON public.users (username DESC)" ->
+        "unexpected index (\"username\" DESC)",
+      "DROP INDEX public.users_username_idx; CREATE INDEX ON public.users (username) WHERE tenant IS NULL" ->
+        "unsupported partial predicate",
+      "DROP INDEX public.users_username_idx; CREATE INDEX ON public.users (lower(username))" -> "unsupported expressions",
+      "DROP INDEX public.users_username_idx; CREATE INDEX ON public.users USING hash (username)" ->
+        "unsupported access method hash",
+      "DROP INDEX public.users_username_idx; CREATE INDEX ON public.users (username) INCLUDE (tenant)" ->
+        "unsupported INCLUDE columns",
+      "DROP INDEX public.users_username_idx; CREATE INDEX ON public.users (username varchar_pattern_ops)" ->
+        "unsupported operator class",
+      "DROP INDEX public.users_username_idx; CREATE INDEX ON public.users (username COLLATE \"C\")" ->
+        "unsupported collation",
+      "DROP INDEX public.users_username_idx; CREATE INDEX ON public.users (username NULLS FIRST)" ->
+        "unsupported NULLS ordering"
+    ).foreach { (change, message) =>
+      withDatabase { ds =>
+        executor.migrate(ds, indexedUsers)
+        execute(ds, change)
+        val error = intercept[MigrationException](executor.migrate(ds, indexedUsers))
+        assert(error.getMessage.contains(message), s"$change: ${error.getMessage}")
+      }
     }
   }
 

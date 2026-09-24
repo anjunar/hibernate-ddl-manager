@@ -26,12 +26,12 @@ class SchemaModelJsonSuite extends munit.FunSuite:
 
   test("encoding is compact, readable and round-trips every type") {
     val json = SchemaModelJson.encode(model)
-    assert(json.startsWith("""{"format":3,"tables":[{"id":"7f3a9c21","catalog":null,"schema":"public","name":"customer","""), json)
+    assert(json.startsWith("""{"format":4,"tables":[{"id":"7f3a9c21","catalog":null,"schema":"public","name":"customer","""), json)
     assert(json.contains(""""type":"varchar(80)","nullable":true"""), json)
     assert(json.contains(""""type":"timestamp(6)","nullable":false"""), json)
     assert(json.contains(""""type":"timestamp(3) with time zone","nullable":true"""), json)
     assert(json.contains(""""type":"uuid""""), json)
-    assert(json.endsWith(""""primaryKey":["7f3a9c21/0a1b2c3d"],"foreignKeys":[],"uniqueKeys":[]}]}"""), json)
+    assert(json.endsWith(""""primaryKey":["7f3a9c21/0a1b2c3d"],"foreignKeys":[],"uniqueKeys":[],"indexes":[]}]}"""), json)
     assertEquals(SchemaModelJson.decode(json), Right(model))
     assertEquals(SchemaModelJson.decode(SchemaModelJson.encode(SchemaModel(Vector.empty))), Right(SchemaModel(Vector.empty)))
   }
@@ -78,6 +78,31 @@ class SchemaModelJsonSuite extends munit.FunSuite:
     assert(failure(json.replace("{\"columns\":[\"7f3a9c21/f34e45b6\"]}", "{\"cols\":[]}")).contains("expected columns"))
   }
 
+  test("indexes round-trip with their column directions") {
+    val indexed = customer.copy(indexes = Vector(
+      IndexModel(Vector(IndexColumn(SchemaId("7f3a9c21/f34e45b6")))),
+      IndexModel(Vector(IndexColumn(SchemaId("7f3a9c21/5a6b7c8d"), descending = true), IndexColumn(SchemaId("7f3a9c21/f34e45b6"))))
+    ))
+    val json = SchemaModelJson.encode(SchemaModel(Vector(indexed)))
+    assert(json.contains(""""indexes":[{"columns":[{"id":"7f3a9c21/f34e45b6","descending":false}]},""" +
+      """{"columns":[{"id":"7f3a9c21/5a6b7c8d","descending":true},{"id":"7f3a9c21/f34e45b6","descending":false}]}]"""), json)
+    assertEquals(SchemaModelJson.decode(json), Right(SchemaModel(Vector(indexed))))
+    assert(failure(json.replace("\"descending\":true", "\"descending\":1")).contains("true or false"))
+  }
+
+  test("format 3, written before indexes existed, still decodes to the same model and fingerprint") {
+    val written = """{"format":3,"tables":[{"id":"t","catalog":null,"schema":"public","name":"t","columns":""" +
+      """[{"id":"t/id","name":"id","type":"uuid","nullable":false},{"id":"t/parent","name":"parent","type":"uuid",""" +
+      """"nullable":true}],"primaryKey":["t/id"],"foreignKeys":[{"columns":["t/parent"],"referencedTable":"t",""" +
+      """"referencedColumns":["t/id"]}],"uniqueKeys":[{"columns":["t/parent"]}]}]}"""
+    val model = SchemaModelJson.decode(written).toOption.get
+    assertEquals(model.tables.head.uniqueKeys.size, 1)
+    assertEquals(SchemaFingerprint.of(model), "1f76c2babda21275093a280117c171471900dd4fb6ab259d7fc1b655119b951e")
+    val withIndexes = written.replace("\"t/parent\"]}]}]}", "\"t/parent\"]}],\"indexes\":[]}]}")
+    assertNotEquals(withIndexes, written)
+    assert(failure(withIndexes).contains("indexes"))
+  }
+
   test("format 2, written before unique keys existed, still decodes to the same model and fingerprint") {
     val written = """{"format":2,"tables":[{"id":"t","catalog":null,"schema":"public","name":"t","columns":""" +
       """[{"id":"t/id","name":"id","type":"uuid","nullable":false},{"id":"t/parent","name":"parent","type":"uuid",""" +
@@ -104,8 +129,8 @@ class SchemaModelJsonSuite extends munit.FunSuite:
 
   test("other format versions, missing or unknown fields and unknown types are rejected") {
     val json = SchemaModelJson.encode(model)
-    assert(failure(json.replace("\"format\":3", "\"format\":4")).contains("format 4 is unsupported"))
-    assert(failure(json.replace("\"format\":3", "\"format\":0")).contains("format 0 is unsupported"))
+    assert(failure(json.replace("\"format\":4", "\"format\":5")).contains("format 5 is unsupported"))
+    assert(failure(json.replace("\"format\":4", "\"format\":0")).contains("format 0 is unsupported"))
     assert(failure(json.replace(",\"foreignKeys\":[]", "")).contains("expected catalog, columns, foreignKeys"))
     assert(failure(json.replace("\"foreignKeys\":[]", "\"foreignKeys\":[{\"columns\":[]}]")).contains("referencedTable"))
     assert(failure("""{"tables":[]}""").contains("format is missing"))

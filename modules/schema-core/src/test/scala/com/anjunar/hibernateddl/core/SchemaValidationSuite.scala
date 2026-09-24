@@ -83,6 +83,18 @@ class SchemaValidationSuite extends munit.FunSuite:
     assert(errors(UniqueKeyModel(Vector(column.id)), UniqueKeyModel(Vector(column.id))).exists(_.contains("more than one unique key")))
   }
 
+  test("indexes list existing columns once and are not declared twice") {
+    val column = table.columns.head
+    def errors(indexes: IndexModel*) = SchemaValidation.validate(SchemaModel(Vector(table.copy(indexes = indexes.toVector))))
+    val ascending = IndexModel(Vector(IndexColumn(column.id)))
+    assertEquals(errors(ascending, IndexModel(Vector(IndexColumn(column.id, descending = true)))), Vector.empty)
+    assert(errors(IndexModel(Vector.empty)).exists(_.contains("has no columns")))
+    assert(errors(IndexModel(Vector(IndexColumn(column.id), IndexColumn(column.id, descending = true))))
+      .exists(_.contains("more than once")))
+    assert(errors(IndexModel(Vector(IndexColumn(SchemaId("missing"))))).exists(_.contains("unknown column 'missing'")))
+    assert(errors(ascending, ascending).exists(_.contains("more than one index on (column)")))
+  }
+
   test("TIMESTAMP precisions must not be negative") {
     def errors(dataType: SqlType) =
       SchemaValidation.validate(SchemaModel(Vector(table.copy(columns = table.columns.map(_.copy(dataType = dataType))))))

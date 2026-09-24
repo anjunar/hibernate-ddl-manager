@@ -31,6 +31,15 @@ object SchemaOperation:
   ) extends SchemaOperation:
     val risk: RiskLevel = RiskLevel.Locking
 
+  final case class IndexedColumn(name: SqlIdentifier, descending: Boolean)
+
+  final case class CreateIndex(
+      tableId: SchemaId,
+      table: QualifiedName,
+      columns: Vector[IndexedColumn]
+  ) extends SchemaOperation:
+    val risk: RiskLevel = RiskLevel.Locking
+
   /** Runs after every table exists, so new tables may reference each other or themselves. */
   final case class AddForeignKey(
       tableId: SchemaId,

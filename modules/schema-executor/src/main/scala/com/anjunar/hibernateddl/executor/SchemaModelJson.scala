@@ -8,10 +8,10 @@ import scala.util.control.NoStackTrace
   * start plans against the model applied last. Writing escapes every non-ASCII character, so
   * the text survives any transport unchanged. Reading is strict: an unknown format version, a
   * missing or unknown field and an unknown type are errors, never skipped. Format 2 added
-  * foreign keys and format 3 unique keys; the earlier formats are still read.
+  * foreign keys, format 3 unique keys and format 4 indexes; the earlier formats are still read.
   */
 object SchemaModelJson:
-  val FormatVersion = 3
+  val FormatVersion = 4
   private val VarcharType = """varchar\((\d+)\)""".r
   private val TimestampType = """timestamp\((\d+)\)""".r
   private val TimestampWithTimeZoneType = """timestamp\((\d+)\) with time zone""".r
@@ -29,6 +29,8 @@ object SchemaModelJson:
     def optional(identifier: Option[SqlIdentifier]) = identifier.fold("null")(value => string(value.value))
     def list(values: Vector[String]) = values.mkString("[", ",", "]")
     def ids(values: Vector[SchemaId]) = list(values.map(id => string(id.value)))
+    def indexColumn(column: IndexColumn) =
+      s"""{"id":${string(column.column.value)},"descending":${column.descending}}"""
     def foreignKey(key: ForeignKeyModel) =
       s"""{"columns":${ids(key.columns)},"referencedTable":${string(key.referencedTable.value)},""" +
         s""""referencedColumns":${ids(key.referencedColumns)}}"""
@@ -41,7 +43,8 @@ object SchemaModelJson:
         s""""schema":${optional(table.name.schema)},"name":${string(table.name.name.value)},""" +
         s""""columns":${list(columns)},"primaryKey":${ids(table.primaryKey)},""" +
         s""""foreignKeys":${list(table.foreignKeys.map(foreignKey))},""" +
-        s""""uniqueKeys":${list(table.uniqueKeys.map(key => s"""{"columns":${ids(key.columns)}}"""))}}"""
+        s""""uniqueKeys":${list(table.uniqueKeys.map(key => s"""{"columns":${ids(key.columns)}}"""))},""" +
+        s""""indexes":${list(table.indexes.map(index => s"""{"columns":${list(index.columns.map(indexColumn))}}"""))}}"""
     }
     s"""{"format":$FormatVersion,"tables":${list(tables)}}"""
 
@@ -86,7 +89,8 @@ object SchemaModelJson:
   private def readTable(json: Json, format: Int): TableModel =
     val common = Set("id", "catalog", "schema", "name", "columns", "primaryKey")
     val table = fields(json, "Table",
-      common ++ Option.when(format >= 2)("foreignKeys") ++ Option.when(format >= 3)("uniqueKeys"))
+      common ++ Option.when(format >= 2)("foreignKeys") ++ Option.when(format >= 3)("uniqueKeys") ++
+        Option.when(format >= 4)("indexes"))
     val id = string(table("id"), "Table id")
     def label(field: String) = s"Table '$id' $field"
     TableModel(
@@ -102,8 +106,19 @@ object SchemaModelJson:
       table.get("uniqueKeys").fold(Vector.empty)(keys => array(keys, label("unique keys")).map { key =>
         val label = s"Unique key in table '$id'"
         UniqueKeyModel(ids(fields(key, label, Set("columns"))("columns"), s"$label columns"))
-      })
+      }),
+      table.get("indexes").fold(Vector.empty)(indexes => array(indexes, label("indexes")).map(readIndex(_, id)))
     )
+
+  private def readIndex(json: Json, tableId: String): IndexModel =
+    val label = s"Index in table '$tableId'"
+    IndexModel(array(fields(json, label, Set("columns"))("columns"), s"$label columns").map { column =>
+      val entry = fields(column, s"$label column", Set("id", "descending"))
+      val descending = entry("descending") match
+        case Json.Bool(value) => value
+        case _ => invalid(s"$label column descending must be true or false")
+      IndexColumn(SchemaId(string(entry("id"), s"$label column id")), descending)
+    })
 
   private def readForeignKey(json: Json, tableId: String): ForeignKeyModel =
     val key = fields(json, s"Foreign key in table '$tableId'", Set("columns", "referencedTable", "referencedColumns"))
