@@ -98,6 +98,7 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
           case _: SchemaOperation.AddColumn => "add column"
           case _: SchemaOperation.RenameTable => "rename table"
           case _: SchemaOperation.RenameColumn => "rename column"
+          case _: SchemaOperation.AddForeignKey => "add foreign key"
         })
       private def onConnection(actual: Connection, label: String): Unit =
         assert(actual eq connection)

@@ -6,7 +6,9 @@ import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 
 /** Canonical SHA-256 identity of a complete schema model.
-  * Table and column ordering is irrelevant; stable IDs and all physical metadata matter.
+  * Table, column and foreign key ordering is irrelevant; stable IDs and all physical metadata
+  * matter. Foreign keys are appended after all tables and only when there are any, so models
+  * without them keep the fingerprints that existing histories store.
   */
 object SchemaFingerprint:
   def of(model: SchemaModel): String =
@@ -42,12 +44,26 @@ object SchemaFingerprint:
           case SqlType.Uuid => string(out, "uuid")
         out.writeBoolean(column.nullable)
       }
-      out.writeInt(table.primaryKey.size)
-      table.primaryKey.foreach(id => string(out, id.value))
+      ids(out, table.primaryKey)
     }
+    given Ordering[Vector[String]] = Ordering.Implicits.seqOrdering[Vector, String]
+    val foreignKeys = tables.flatMap(table => table.foreignKeys.sortBy(_.columns.map(_.value)).map(table.id -> _))
+    if foreignKeys.nonEmpty then
+      string(out, "foreign-keys")
+      out.writeInt(foreignKeys.size)
+      foreignKeys.foreach { (tableId, key) =>
+        string(out, tableId.value)
+        ids(out, key.columns)
+        string(out, key.referencedTable.value)
+        ids(out, key.referencedColumns)
+      }
     out.flush()
     MessageDigest.getInstance("SHA-256").digest(bytes.toByteArray)
       .map(byte => f"${byte & 0xff}%02x").mkString
+
+  private def ids(out: DataOutputStream, values: Vector[SchemaId]): Unit =
+    out.writeInt(values.size)
+    values.foreach(id => string(out, id.value))
 
   private def optionalIdentifier(out: DataOutputStream, identifier: Option[SqlIdentifier]): Unit =
     out.writeBoolean(identifier.nonEmpty)

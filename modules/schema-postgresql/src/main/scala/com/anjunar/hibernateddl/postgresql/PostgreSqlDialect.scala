@@ -25,7 +25,19 @@ object PostgreSqlDialect extends SchemaDialect:
 
   private def validate(operation: SchemaOperation): Vector[String] =
     operation match
-      case SchemaOperation.CreateTable(table) => validateTable(table, "new table")
+      case SchemaOperation.CreateTable(table) =>
+        validateTable(table, "new table") ++
+          Option.when(table.foreignKeys.nonEmpty)(
+            "The new table's foreign keys must be separate operations after all tables exist."
+          ).toVector
+      case SchemaOperation.AddForeignKey(_, table, columns, referencedTable, referencedColumns) =>
+        validateName(table, "table") ++
+          validateName(referencedTable, "referenced table") ++
+          columns.flatMap(validateIdentifier(_, "foreign key column")) ++
+          referencedColumns.flatMap(validateIdentifier(_, "referenced column")) ++
+          Option.when(columns.isEmpty || columns.size != referencedColumns.size)(
+            "A foreign key needs at least one column and as many referenced columns."
+          ).toVector
       case SchemaOperation.AddColumn(_, table, column) =>
         validateName(table, "table") ++
           validateColumn(column, "new column") ++
@@ -93,6 +105,9 @@ object PostgreSqlDialect extends SchemaDialect:
         s"CREATE TABLE ${qualified(table.name)} (${definitions.mkString(", ")});"
       case SchemaOperation.AddColumn(_, table, column) =>
         s"ALTER TABLE ${qualified(table)} ADD COLUMN ${renderColumn(column)};"
+      case SchemaOperation.AddForeignKey(_, table, columns, referencedTable, referencedColumns) =>
+        s"ALTER TABLE ${qualified(table)} ADD FOREIGN KEY (${columns.map(quoted).mkString(", ")}) " +
+          s"REFERENCES ${qualified(referencedTable)} (${referencedColumns.map(quoted).mkString(", ")});"
       case SchemaOperation.RenameTable(_, from, to) =>
         s"ALTER TABLE ${qualified(from)} RENAME TO ${quoted(to.name)};"
       case SchemaOperation.RenameColumn(_, table, _, from, to) =>

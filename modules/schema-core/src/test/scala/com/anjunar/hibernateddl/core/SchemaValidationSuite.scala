@@ -54,6 +54,25 @@ class SchemaValidationSuite extends munit.FunSuite:
     assertEquals(SchemaValidation.validate(SchemaModel(Vector(table))), Vector.empty)
   }
 
+  test("foreign keys reference the primary key of a modeled table with matching column types") {
+    val id = ColumnModel(SchemaId("customer/id"), SqlIdentifier("id"), SqlType.BigInt, nullable = false)
+    val customer = TableModel(SchemaId("customer"), QualifiedName(SqlIdentifier("customer")), Vector(id), Vector(id.id))
+    val owner = ColumnModel(SchemaId("invoice/owner"), SqlIdentifier("owner_id"), SqlType.BigInt)
+    val key = ForeignKeyModel(Vector(owner.id), customer.id, customer.primaryKey)
+    val invoice = TableModel(SchemaId("invoice"), QualifiedName(SqlIdentifier("invoice")), Vector(owner), foreignKeys = Vector(key))
+    def errors(keys: ForeignKeyModel*) =
+      SchemaValidation.validate(SchemaModel(Vector(customer, invoice.copy(foreignKeys = keys.toVector))))
+    assertEquals(errors(key), Vector.empty)
+    assert(errors(key.copy(referencedTable = SchemaId("missing"))).exists(_.contains("references unknown table 'missing'")))
+    assert(errors(key.copy(columns = Vector(SchemaId("missing")))).exists(_.contains("references unknown column 'missing'")))
+    assert(errors(key.copy(columns = Vector.empty, referencedColumns = Vector.empty)).exists(_.contains("has no columns")))
+    assert(errors(key.copy(referencedColumns = Vector.empty)).exists(_.contains("must reference the primary key")))
+    assert(errors(key, key).exists(_.contains("more than one foreign key on (invoice/owner)")))
+    val mistyped = SchemaValidation.validate(SchemaModel(Vector(customer,
+      invoice.copy(columns = Vector(owner.copy(dataType = SqlType.Integer))))))
+    assert(mistyped.exists(_.contains("has type Integer but references type BigInt")), mistyped)
+  }
+
   test("TIMESTAMP precisions must not be negative") {
     def errors(dataType: SqlType) =
       SchemaValidation.validate(SchemaModel(Vector(table.copy(columns = table.columns.map(_.copy(dataType = dataType))))))
