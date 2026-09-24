@@ -15,6 +15,9 @@ object SchemaModelJson:
   private val VarcharType = """varchar\((\d+)\)""".r
   private val TimestampType = """timestamp\((\d+)\)""".r
   private val TimestampWithTimeZoneType = """timestamp\((\d+)\) with time zone""".r
+  private val CharType = """char\((\d+)\)""".r
+  private val NumericType = """numeric\((\d+),(\d+)\)""".r
+  private val TimeType = """time\((\d+)\)""".r
 
   def encode(model: SchemaModel): String =
     def string(value: String): String =
@@ -63,6 +66,14 @@ object SchemaModelJson:
     case SqlType.Boolean => "boolean"
     case SqlType.Text => "text"
     case SqlType.Uuid => "uuid"
+    case SqlType.Char(length) => s"char($length)"
+    case SqlType.Numeric(precision, scale) => s"numeric($precision,$scale)"
+    case SqlType.Time(precision) => s"time($precision)"
+    case SqlType.SmallInt => "smallint"
+    case SqlType.Real => "real"
+    case SqlType.DoublePrecision => "double precision"
+    case SqlType.Date => "date"
+    case SqlType.Binary => "binary"
 
   private enum Json:
     case Obj(fields: Map[String, Json])
@@ -141,6 +152,15 @@ object SchemaModelJson:
       case "boolean" => SqlType.Boolean
       case "text" => SqlType.Text
       case "uuid" => SqlType.Uuid
+      case "smallint" => SqlType.SmallInt
+      case "real" => SqlType.Real
+      case "double precision" => SqlType.DoublePrecision
+      case "date" => SqlType.Date
+      case "binary" => SqlType.Binary
+      case CharType(length) => SqlType.Char(number(length, s"Column '$id' CHAR length"))
+      case NumericType(precision, scale) =>
+        SqlType.Numeric(number(precision, s"Column '$id' NUMERIC precision"), number(scale, s"Column '$id' NUMERIC scale"))
+      case TimeType(precision) => SqlType.Time(number(precision, s"Column '$id' TIME precision"))
       case VarcharType(length) => SqlType.Varchar(number(length, s"Column '$id' VARCHAR length"))
       case TimestampType(precision) => SqlType.Timestamp(number(precision, s"Column '$id' TIMESTAMP precision"))
       case TimestampWithTimeZoneType(precision) =>

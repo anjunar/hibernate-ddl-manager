@@ -13,6 +13,8 @@ import java.nio.charset.StandardCharsets
 object PostgreSqlDialect extends SchemaDialect:
   private val MaxIdentifierBytes = 63
   private val MaxTimestampPrecision = 6
+  private val MaxNumericPrecision = 1000
+  private val MaxCharacterLength = 10485760
 
   override def render(
       operations: Vector[SchemaOperation]
@@ -80,7 +82,14 @@ object PostgreSqlDialect extends SchemaDialect:
 
   private def validateColumn(column: ColumnModel, label: String): Vector[String] =
     validateIdentifier(column.name, label) ++ (column.dataType match
-      case SqlType.Varchar(length) if length <= 0 => Vector(s"$label has invalid VARCHAR length $length.")
+      case SqlType.Varchar(length) if length <= 0 || length > MaxCharacterLength =>
+        Vector(s"$label has VARCHAR length $length; PostgreSQL supports 1 to $MaxCharacterLength.")
+      case SqlType.Char(length) if length <= 0 || length > MaxCharacterLength =>
+        Vector(s"$label has CHAR length $length; PostgreSQL supports 1 to $MaxCharacterLength.")
+      case SqlType.Numeric(precision, scale) if precision <= 0 || precision > MaxNumericPrecision || scale < 0 || scale > precision =>
+        Vector(s"$label has NUMERIC($precision, $scale); PostgreSQL supports precision 1 to $MaxNumericPrecision and scale 0 to precision here.")
+      case SqlType.Time(precision) if precision < 0 || precision > MaxTimestampPrecision =>
+        Vector(s"$label has TIME precision $precision; PostgreSQL supports 0 to $MaxTimestampPrecision.")
       case SqlType.Timestamp(precision) if precision < 0 || precision > MaxTimestampPrecision =>
         Vector(s"$label has TIMESTAMP precision $precision; PostgreSQL supports 0 to $MaxTimestampPrecision.")
       case SqlType.TimestampWithTimeZone(precision) if precision < 0 || precision > MaxTimestampPrecision =>
@@ -152,6 +161,14 @@ object PostgreSqlDialect extends SchemaDialect:
     case SqlType.Boolean => "boolean"
     case SqlType.Text => "text"
     case SqlType.Uuid => "uuid"
+    case SqlType.Char(length) => s"char($length)"
+    case SqlType.Numeric(precision, scale) => s"numeric($precision,$scale)"
+    case SqlType.Time(precision) => s"time($precision)"
+    case SqlType.SmallInt => "smallint"
+    case SqlType.Real => "real"
+    case SqlType.DoublePrecision => "double precision"
+    case SqlType.Date => "date"
+    case SqlType.Binary => "bytea"
 
   private def qualified(name: QualifiedName): String =
     (name.schema.toVector :+ name.name).map(quoted).mkString(".")

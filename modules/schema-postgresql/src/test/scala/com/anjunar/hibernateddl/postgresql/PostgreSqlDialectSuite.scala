@@ -171,6 +171,22 @@ class PostgreSqlDialectSuite extends munit.FunSuite:
     assert(PostgreSqlDialect.render(Vector(CreateTable(table))).swap.toOption.get.exists(_.contains("indexes must be separate")))
   }
 
+  test("further types render as PostgreSQL types and out-of-range sizes are rejected") {
+    val types = Vector(SqlType.Char(1) -> "char(1)", SqlType.Numeric(10, 2) -> "numeric(10,2)", SqlType.Time(0) -> "time(0)",
+      SqlType.SmallInt -> "smallint", SqlType.Real -> "real", SqlType.DoublePrecision -> "double precision",
+      SqlType.Date -> "date", SqlType.Binary -> "bytea")
+    types.foreach { (dataType, sql) =>
+      val column = ColumnModel(SchemaId("x"), SqlIdentifier("x"), dataType)
+      assertEquals(PostgreSqlDialect.render(Vector(AddColumn(tableId, name("t"), column))),
+        Right(Vector(s"ALTER TABLE \"t\" ADD COLUMN \"x\" $sql;")))
+    }
+    Vector(SqlType.Numeric(1001, 0), SqlType.Numeric(5, 6), SqlType.Time(7), SqlType.Char(10485761), SqlType.Varchar(10485761))
+      .foreach { invalid =>
+        val column = ColumnModel(SchemaId("x"), SqlIdentifier("x"), invalid)
+        assert(PostgreSqlDialect.render(Vector(AddColumn(tableId, name("t"), column))).isLeft, invalid)
+      }
+  }
+
   test("an empty plan renders to an empty statement vector") {
     assertEquals(PostgreSqlDialect.render(Vector.empty), Right(Vector.empty))
   }

@@ -14,12 +14,17 @@ final case class QualifiedName(
     catalog: Option[SqlIdentifier] = None
 )
 
-/** Timestamp precisions count fractional-second digits. */
+/** Time and timestamp precisions count fractional-second digits. Numeric precision counts
+  * all digits and scale those after the decimal point.
+  */
 enum SqlType:
   case Varchar(length: Int)
+  case Char(length: Int)
+  case Numeric(precision: Int, scale: Int)
   case Timestamp(precision: Int)
   case TimestampWithTimeZone(precision: Int)
-  case Integer, BigInt, Boolean, Text, Uuid
+  case Time(precision: Int)
+  case Integer, BigInt, Boolean, Text, Uuid, SmallInt, Real, DoublePrecision, Date, Binary
 
 final case class ColumnModel(
     id: SchemaId,
@@ -90,6 +95,12 @@ object SchemaValidation:
             errors += s"Column '${column.id.value}' has invalid TIMESTAMP precision $precision; expected zero or more"
           case SqlType.TimestampWithTimeZone(precision) if precision < 0 =>
             errors += s"Column '${column.id.value}' has invalid TIMESTAMP precision $precision; expected zero or more"
+          case SqlType.Time(precision) if precision < 0 =>
+            errors += s"Column '${column.id.value}' has invalid TIME precision $precision; expected zero or more"
+          case SqlType.Char(length) if length <= 0 =>
+            errors += s"Column '${column.id.value}' has invalid CHAR length $length; expected a positive length"
+          case SqlType.Numeric(precision, scale) if precision <= 0 || scale < 0 || scale > precision =>
+            errors += s"Column '${column.id.value}' has invalid NUMERIC($precision, $scale); expected 0 <= scale <= precision and precision > 0"
           case _ => ()
       }
       val columns = table.columns.map(c => c.id -> c).toMap

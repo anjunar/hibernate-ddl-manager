@@ -296,6 +296,33 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
     }
   }
 
+  test("further types round-trip data and are verified on restart") {
+    withDatabase { ds =>
+      val columns = Vector(
+        ColumnModel(SchemaId("T_ID"), SqlIdentifier("id"), SqlType.SmallInt, nullable = false),
+        ColumnModel(SchemaId("T_CODE"), SqlIdentifier("code"), SqlType.Char(3)),
+        ColumnModel(SchemaId("T_PRICE"), SqlIdentifier("price"), SqlType.Numeric(10, 2)),
+        ColumnModel(SchemaId("T_TOTAL"), SqlIdentifier("total"), SqlType.Numeric(38, 0)),
+        ColumnModel(SchemaId("T_OPENS"), SqlIdentifier("opens_at"), SqlType.Time(0)),
+        ColumnModel(SchemaId("T_WEIGHT"), SqlIdentifier("weight"), SqlType.Real),
+        ColumnModel(SchemaId("T_RATIO"), SqlIdentifier("ratio"), SqlType.DoublePrecision),
+        ColumnModel(SchemaId("T_DAY"), SqlIdentifier("day"), SqlType.Date),
+        ColumnModel(SchemaId("T_DATA"), SqlIdentifier("data"), SqlType.Binary)
+      )
+      val typed = SchemaModel(Vector(TableModel(SchemaId("T"), QualifiedName(SqlIdentifier("typed"), Some(SqlIdentifier("public"))),
+        columns, Vector(columns.head.id))))
+      assertEquals(executor.migrate(ds, typed).status, MigrationStatus.Applied)
+      execute(ds, "INSERT INTO public.typed VALUES (1, 'EUR', 12.345, 99999999999999999999, '08:30:15', 1.5, 0.25, " +
+        "'2026-09-24', '\\xcafe')")
+      assertEquals(scalar(ds, "SELECT concat_ws(' ', code, price, total, opens_at, weight, ratio, day, data) FROM public.typed"),
+        "EUR 12.35 99999999999999999999 08:30:15 1.5 0.25 2026-09-24 \\xcafe")
+      assertEquals(executor.migrate(ds, typed).status, MigrationStatus.AlreadyApplied)
+      execute(ds, "ALTER TABLE public.typed ALTER COLUMN price TYPE numeric(12,2)")
+      val error = intercept[MigrationException](executor.migrate(ds, typed))
+      assert(error.getMessage.contains("expected Numeric(10,2)"), error.getMessage)
+    }
+  }
+
   test("a different timestamp precision or a timestamp without precision is drift") {
     Vector("timestamp(6)", "timestamp", "timestamp(3) with time zone").foreach { actual =>
       withDatabase { ds =>

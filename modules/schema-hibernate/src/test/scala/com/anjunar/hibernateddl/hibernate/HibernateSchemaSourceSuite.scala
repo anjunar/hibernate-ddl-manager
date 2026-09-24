@@ -91,6 +91,18 @@ class HibernateSchemaSourceSuite extends munit.FunSuite:
     assertEquals(shipment.uniqueKeys, Vector(UniqueKeyModel(Vector(id("3d4e5f60")))))
   }
 
+  test("dates, times, numerics, floating point, small integers, characters and binaries are mapped") {
+    val table = read(classOf[Measurement]).toOption.get.tables.head
+    assertEquals(
+      table.columns.map(c => c.name.value -> c.dataType).toMap,
+      Map(
+        "id" -> SqlType.SmallInt, "day" -> SqlType.Date, "takenat" -> SqlType.Time(0),
+        "price" -> SqlType.Numeric(10, 2), "total" -> SqlType.Numeric(38, 0), "ratio" -> SqlType.DoublePrecision,
+        "weight" -> SqlType.Real, "unit" -> SqlType.Char(1), "raw" -> SqlType.Binary, "level" -> SqlType.SmallInt
+      )
+    )
+  }
+
   test("renaming a referenced entity keeps the foreign key, so the diff plans only the rename") {
     val before = read(classOf[Invoice], classOf[LegacyCustomer]).toOption.get
     val after = before.copy(tables = before.tables.map { table =>
@@ -116,7 +128,7 @@ class HibernateSchemaSourceSuite extends munit.FunSuite:
 
   test("mappings the model cannot represent are reported instead of dropped") {
     val diagnostics = errors(classOf[Unsupported], classOf[LegacyCustomer])
-    assert(diagnostics.exists(_.contains("Unsupported.id has SQL type 'numeric(38,2)'")), diagnostics)
+    assert(diagnostics.exists(_.contains("Unsupported.document has SQL type 'oid'")), diagnostics)
     assert(diagnostics.exists(_.contains("of entity Unsupported has ON DELETE CASCADE; unsupported")), diagnostics)
     assert(diagnostics.exists(_.contains("collection and join tables are unsupported")), diagnostics)
     assert(diagnostics.exists(_.contains("of entity Unsupported has options 'WHERE code IS NOT NULL'; unsupported")), diagnostics)
