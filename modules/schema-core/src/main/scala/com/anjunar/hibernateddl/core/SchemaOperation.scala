@@ -24,6 +24,13 @@ object SchemaOperation:
   ) extends SchemaOperation:
     val risk: RiskLevel = RiskLevel.Locking
 
+  final case class AddUniqueKey(
+      tableId: SchemaId,
+      table: QualifiedName,
+      columns: Vector[SqlIdentifier]
+  ) extends SchemaOperation:
+    val risk: RiskLevel = RiskLevel.Locking
+
   /** Runs after every table exists, so new tables may reference each other or themselves. */
   final case class AddForeignKey(
       tableId: SchemaId,

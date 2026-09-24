@@ -379,6 +379,77 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
     }
   }
 
+  private val tenant = ColumnModel(SchemaId("USER_TENANT"), SqlIdentifier("tenant"), SqlType.Text)
+  private val uniqueUsers = SchemaModel(Vector(users.copy(columns = users.columns :+ tenant,
+    uniqueKeys = Vector(UniqueKeyModel(Vector(login.id)), UniqueKeyModel(Vector(tenant.id, login.id))))))
+
+  test("unique keys are created with the table, enforced and verified on restart") {
+    withDatabase { ds =>
+      fixture(ds, uniqueUsers)
+      intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.users(username) VALUES ('patrick')"))
+      assertEquals(executor.migrate(ds, uniqueUsers), MigrationResult(1, MigrationStatus.AlreadyApplied, 0))
+    }
+  }
+
+  test("a unique key added to a populated table keeps its rows; duplicate rows roll the migration back") {
+    val keyed = SchemaModel(Vector(users.copy(uniqueKeys = Vector(UniqueKeyModel(Vector(login.id))))))
+    withDatabase { ds =>
+      fixture(ds)
+      assertEquals(executor.migrate(ds, keyed), MigrationResult(2, MigrationStatus.Applied, 1))
+      intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.users VALUES ('patrick')"))
+    }
+    withDatabase { ds =>
+      fixture(ds)
+      execute(ds, "INSERT INTO public.users VALUES ('patrick')")
+      assertEquals(intercept[MigrationException](executor.migrate(ds, keyed)).state, FailureState.RolledBack)
+      assertEquals(revisions(ds), "1")
+      assertEquals(scalar(ds, "SELECT count(*) FROM public.users"), "2")
+    }
+  }
+
+  test("renaming a table and its unique columns keeps the unique keys") {
+    withDatabase { ds =>
+      fixture(ds, uniqueUsers)
+      val renamedUnique = SchemaModel(Vector(uniqueUsers.tables.head.copy(name = renamed.name,
+        columns = Vector(login.copy(name = SqlIdentifier("login_name")), tenant.copy(name = SqlIdentifier("tenant_id"))))))
+      assertEquals(executor.migrate(ds, renamedUnique), MigrationResult(2, MigrationStatus.Applied, 3))
+      intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.accounts(login_name) VALUES ('patrick')"))
+      assertEquals(executor.migrate(ds, renamedUnique).status, MigrationStatus.AlreadyApplied)
+    }
+  }
+
+  test("missing, extra, reordered, deferrable, covering and index-only unique keys block the start") {
+    Vector(
+      "ALTER TABLE public.users DROP CONSTRAINT users_username_key" -> "unique key (\"username\") is missing",
+      "ALTER TABLE public.users ADD UNIQUE (tenant)" -> "unexpected unique key (\"tenant\")",
+      "ALTER TABLE public.users DROP CONSTRAINT users_tenant_username_key, ADD UNIQUE (username, tenant)" ->
+        "unexpected unique key (\"username\", \"tenant\")",
+      "ALTER TABLE public.users DROP CONSTRAINT users_username_key, ADD UNIQUE (username) DEFERRABLE" ->
+        "unsupported deferrable checking",
+      "ALTER TABLE public.users DROP CONSTRAINT users_username_key, ADD UNIQUE (username) INCLUDE (tenant)" ->
+        "unsupported INCLUDE columns",
+      "ALTER TABLE public.users DROP CONSTRAINT users_username_key; " +
+        "CREATE UNIQUE INDEX users_login ON public.users (username)" -> "unsupported indexes"
+    ).foreach { (change, message) =>
+      withDatabase { ds =>
+        fixture(ds, uniqueUsers)
+        execute(ds, change)
+        val error = intercept[MigrationException](executor.migrate(ds, uniqueUsers))
+        assert(error.getMessage.contains(message), error.getMessage)
+      }
+    }
+  }
+
+  test("a NULLS NOT DISTINCT unique key blocks the start on PostgreSQL 15 and newer") {
+    withDatabase { ds =>
+      assume(scalar(ds, "SHOW server_version_num").toInt >= 150000, "NULLS NOT DISTINCT needs PostgreSQL 15")
+      fixture(ds, uniqueUsers)
+      execute(ds, "ALTER TABLE public.users DROP CONSTRAINT users_username_key, ADD UNIQUE NULLS NOT DISTINCT (username)")
+      val error = intercept[MigrationException](executor.migrate(ds, uniqueUsers))
+      assert(error.getMessage.contains("unsupported NULLS NOT DISTINCT"), error.getMessage)
+    }
+  }
+
   test("a tampered stored model blocks the start") {
     withDatabase { ds =>
       fixture(ds)

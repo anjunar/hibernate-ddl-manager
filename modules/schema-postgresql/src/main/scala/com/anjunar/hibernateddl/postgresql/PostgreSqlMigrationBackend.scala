@@ -10,8 +10,8 @@ import scala.util.Using
   *
   * The initial execution envelope is deliberately narrow: explicitly qualified,
   * permanent ordinary tables containing only the modeled native types,
-  * nullability, a non-deferrable primary key and plain foreign keys (no actions,
-  * MATCH SIMPLE, not deferrable). Defaults, identities, generated columns, custom
+  * nullability, a non-deferrable primary key, plain unique constraints and plain
+  * foreign keys (no actions, MATCH SIMPLE, not deferrable). Defaults, identities, generated columns, custom
   * collations, inheritance, partitions, other indexes and constraints, triggers,
   * rules and RLS require a richer schema model before execution is supported.
   * Unmanaged tables outside the supplied model are allowed, but must not reference
@@ -155,12 +155,15 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
         |       EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i
         |               WHERE i.inhrelid = c.oid OR i.inhparent = c.oid) AS has_inheritance,
         |       EXISTS (SELECT 1 FROM pg_catalog.pg_constraint k
-        |               WHERE k.conrelid = c.oid AND k.contype <> 'f'
+        |               WHERE k.conrelid = c.oid AND k.contype NOT IN ('f', 'u')
         |                 AND NOT (k.contype = 'n' AND k.convalidated)
         |                 AND NOT (k.contype = 'p' AND NOT k.condeferrable)
         |              ) AS has_constraints,
         |       EXISTS (SELECT 1 FROM pg_catalog.pg_index i
-        |               WHERE i.indrelid = c.oid AND NOT i.indisprimary) AS has_indexes,
+        |               WHERE i.indrelid = c.oid AND NOT i.indisprimary
+        |                 AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint u
+        |                                 WHERE u.conindid = i.indexrelid AND u.contype = 'u')
+        |              ) AS has_indexes,
         |       EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t
         |               WHERE t.tgrelid = c.oid AND NOT t.tgisinternal) AS has_triggers,
         |       EXISTS (SELECT 1 FROM pg_catalog.pg_rewrite r
@@ -222,8 +225,43 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
         if actualKey != expectedKey then
           def show(key: Vector[String]) = if key.isEmpty then "none" else key.map(quoted).mkString("(", ", ", ")")
           errors += s"Database drift: primary key of $display is ${show(actualKey)}; expected ${show(expectedKey)}."
+        errors ++= compareUniqueKeys(connection, oid, display, expected)
         errors ++= compareForeignKeys(connection, oid, display, expected, model)
         errors.result()
+
+  /** Unique constraints match by their ordered columns, never by constraint name. */
+  private def compareUniqueKeys(connection: Connection, oid: Long, display: String, expected: TableModel): Vector[String] =
+    def show(columns: Vector[String]) = columns.map(quoted).mkString("(", ", ", ")")
+    val expectedKeys = expected.uniqueKeys.map(_.columns.map(id => expected.columns.find(_.id == id).get.name.value))
+    // PostgreSQL 15 added NULLS NOT DISTINCT; before, NULLs were always distinct.
+    val nullsNotDistinct =
+      if connection.getMetaData.getDatabaseMajorVersion >= 15 then "i.indnullsnotdistinct" else "false"
+    val actualKeys = query(connection,
+      s"""SELECT k.conname, k.condeferrable, i.indnatts <> i.indnkeyatts AS has_include,
+         |       $nullsNotDistinct AS nulls_not_distinct,
+         |       ARRAY(SELECT CAST(a.attname AS pg_catalog.text)
+         |             FROM pg_catalog.unnest(k.conkey) WITH ORDINALITY AS u(attnum, position)
+         |             JOIN pg_catalog.pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = u.attnum
+         |             ORDER BY u.position) AS columns
+         |FROM pg_catalog.pg_constraint k
+         |JOIN pg_catalog.pg_index i ON i.indexrelid = k.conindid
+         |WHERE k.conrelid = CAST(? AS pg_catalog.oid) AND k.contype = 'u'
+         |ORDER BY k.conname""".stripMargin
+    )(_.setLong(1, oid)) { row =>
+      val features = Vector(
+        Option.when(row.getBoolean("condeferrable"))("deferrable checking"),
+        Option.when(row.getBoolean("has_include"))("INCLUDE columns"),
+        Option.when(row.getBoolean("nulls_not_distinct"))("NULLS NOT DISTINCT")
+      ).flatten
+      (row.getString("conname"), strings(row, "columns"), features)
+    }
+    actualKeys.flatMap { (name, _, features) =>
+      features.map(feature => s"Unique key ${quoted(name)} of $display has unsupported $feature.")
+    } ++ (expectedKeys diff actualKeys.map(_._2)).map { key =>
+      s"Database drift: unique key ${show(key)} is missing from $display."
+    } ++ (actualKeys.map(_._2) diff expectedKeys).map { key =>
+      s"Database drift: unexpected unique key ${show(key)} in $display."
+    }
 
   /** Foreign keys match by columns and referenced columns, never by constraint name. Keys
     * referencing this table must come from modeled tables, whose own check covers them.

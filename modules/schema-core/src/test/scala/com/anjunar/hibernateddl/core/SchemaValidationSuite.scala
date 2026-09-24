@@ -73,6 +73,16 @@ class SchemaValidationSuite extends munit.FunSuite:
     assert(mistyped.exists(_.contains("has type Integer but references type BigInt")), mistyped)
   }
 
+  test("unique keys list existing columns once and are not declared twice") {
+    val column = table.columns.head
+    def errors(keys: UniqueKeyModel*) = SchemaValidation.validate(SchemaModel(Vector(table.copy(uniqueKeys = keys.toVector))))
+    assertEquals(errors(UniqueKeyModel(Vector(column.id))), Vector.empty)
+    assert(errors(UniqueKeyModel(Vector.empty)).exists(_.contains("has no columns")))
+    assert(errors(UniqueKeyModel(Vector(column.id, column.id))).exists(_.contains("more than once")))
+    assert(errors(UniqueKeyModel(Vector(SchemaId("missing")))).exists(_.contains("unknown column 'missing'")))
+    assert(errors(UniqueKeyModel(Vector(column.id)), UniqueKeyModel(Vector(column.id))).exists(_.contains("more than one unique key")))
+  }
+
   test("TIMESTAMP precisions must not be negative") {
     def errors(dataType: SqlType) =
       SchemaValidation.validate(SchemaModel(Vector(table.copy(columns = table.columns.map(_.copy(dataType = dataType))))))

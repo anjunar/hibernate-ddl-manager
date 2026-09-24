@@ -30,6 +30,10 @@ object PostgreSqlDialect extends SchemaDialect:
           Option.when(table.foreignKeys.nonEmpty)(
             "The new table's foreign keys must be separate operations after all tables exist."
           ).toVector
+      case SchemaOperation.AddUniqueKey(_, table, columns) =>
+        validateName(table, "table") ++
+          columns.flatMap(validateIdentifier(_, "unique key column")) ++
+          Option.when(columns.isEmpty)("A unique key needs at least one column.").toVector
       case SchemaOperation.AddForeignKey(_, table, columns, referencedTable, referencedColumns) =>
         validateName(table, "table") ++
           validateName(referencedTable, "referenced table") ++
@@ -59,7 +63,11 @@ object PostgreSqlDialect extends SchemaDialect:
       table.columns.flatMap(column => validateColumn(column, s"$label column")) ++
       table.primaryKey.filterNot(id => table.columns.exists(_.id == id)).map { id =>
         s"The $label primary key references unknown column '${id.value}'."
-      }
+      } ++
+      table.uniqueKeys.flatMap(_.columns).filterNot(id => table.columns.exists(_.id == id)).map { id =>
+        s"A $label unique key references unknown column '${id.value}'."
+      } ++
+      Option.when(table.uniqueKeys.exists(_.columns.isEmpty))(s"A $label unique key has no columns.").toVector
 
   private def validateColumn(column: ColumnModel, label: String): Vector[String] =
     validateIdentifier(column.name, label) ++ (column.dataType match
@@ -101,10 +109,16 @@ object PostgreSqlDialect extends SchemaDialect:
           val names = table.primaryKey.map(id => quoted(table.columns.find(_.id == id).get.name))
           s"PRIMARY KEY (${names.mkString(", ")})"
         }
-        val definitions = table.columns.map(renderColumn) ++ primaryKey
+        val uniqueKeys = table.uniqueKeys.map { key =>
+          val names = key.columns.map(id => quoted(table.columns.find(_.id == id).get.name))
+          s"UNIQUE (${names.mkString(", ")})"
+        }
+        val definitions = table.columns.map(renderColumn) ++ primaryKey ++ uniqueKeys
         s"CREATE TABLE ${qualified(table.name)} (${definitions.mkString(", ")});"
       case SchemaOperation.AddColumn(_, table, column) =>
         s"ALTER TABLE ${qualified(table)} ADD COLUMN ${renderColumn(column)};"
+      case SchemaOperation.AddUniqueKey(_, table, columns) =>
+        s"ALTER TABLE ${qualified(table)} ADD UNIQUE (${columns.map(quoted).mkString(", ")});"
       case SchemaOperation.AddForeignKey(_, table, columns, referencedTable, referencedColumns) =>
         s"ALTER TABLE ${qualified(table)} ADD FOREIGN KEY (${columns.map(quoted).mkString(", ")}) " +
           s"REFERENCES ${qualified(referencedTable)} (${referencedColumns.map(quoted).mkString(", ")});"

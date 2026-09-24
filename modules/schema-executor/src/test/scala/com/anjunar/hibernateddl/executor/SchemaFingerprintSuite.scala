@@ -48,6 +48,25 @@ class SchemaFingerprintSuite extends munit.FunSuite:
     assertEquals(SchemaFingerprint.of(keyed), "085d2a77eff81e4854196e811715cfedfb1248fa6809e4cf86d5875f14cc990b")
   }
 
+  test("models with foreign keys but without unique keys keep the fingerprints that earlier versions stored") {
+    val table = keyed.tables.head
+    val parent = ColumnModel(SchemaId("t/parent"), SqlIdentifier("parent"), SqlType.Uuid)
+    val model = SchemaModel(Vector(table.copy(columns = Vector(table.columns.head, parent),
+      foreignKeys = Vector(ForeignKeyModel(Vector(parent.id), table.id, table.primaryKey)))))
+    assertEquals(SchemaFingerprint.of(model), "21ad02d6ea5bab3bdc4eac7924a109696d92ef1fc741f5070e04d581e5d18aa4")
+  }
+
+  test("unique keys change the fingerprint, but their order does not") {
+    val table = keyed.tables.head
+    val keys = table.columns.drop(1).map(column => UniqueKeyModel(Vector(column.id)))
+    val fingerprint = SchemaFingerprint.of(SchemaModel(Vector(table.copy(uniqueKeys = keys))))
+    assertNotEquals(fingerprint, SchemaFingerprint.of(keyed))
+    assertEquals(SchemaFingerprint.of(SchemaModel(Vector(table.copy(uniqueKeys = keys.reverse)))), fingerprint)
+    assertNotEquals(SchemaFingerprint.of(SchemaModel(Vector(table.copy(uniqueKeys = keys.take(1))))), fingerprint)
+    val composite = UniqueKeyModel(table.columns.drop(1).map(_.id))
+    assertNotEquals(SchemaFingerprint.of(SchemaModel(Vector(table.copy(uniqueKeys = Vector(composite))))), fingerprint)
+  }
+
   test("foreign keys change the fingerprint, but their order does not") {
     val table = keyed.tables.head
     val parent = ColumnModel(SchemaId("t/parent"), SqlIdentifier("parent"), SqlType.Uuid)

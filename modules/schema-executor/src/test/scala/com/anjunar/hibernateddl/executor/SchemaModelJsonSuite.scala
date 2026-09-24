@@ -26,12 +26,12 @@ class SchemaModelJsonSuite extends munit.FunSuite:
 
   test("encoding is compact, readable and round-trips every type") {
     val json = SchemaModelJson.encode(model)
-    assert(json.startsWith("""{"format":2,"tables":[{"id":"7f3a9c21","catalog":null,"schema":"public","name":"customer","""), json)
+    assert(json.startsWith("""{"format":3,"tables":[{"id":"7f3a9c21","catalog":null,"schema":"public","name":"customer","""), json)
     assert(json.contains(""""type":"varchar(80)","nullable":true"""), json)
     assert(json.contains(""""type":"timestamp(6)","nullable":false"""), json)
     assert(json.contains(""""type":"timestamp(3) with time zone","nullable":true"""), json)
     assert(json.contains(""""type":"uuid""""), json)
-    assert(json.endsWith(""""primaryKey":["7f3a9c21/0a1b2c3d"],"foreignKeys":[]}]}"""), json)
+    assert(json.endsWith(""""primaryKey":["7f3a9c21/0a1b2c3d"],"foreignKeys":[],"uniqueKeys":[]}]}"""), json)
     assertEquals(SchemaModelJson.decode(json), Right(model))
     assertEquals(SchemaModelJson.decode(SchemaModelJson.encode(SchemaModel(Vector.empty))), Right(SchemaModel(Vector.empty)))
   }
@@ -66,6 +66,31 @@ class SchemaModelJsonSuite extends munit.FunSuite:
     assertEquals(SchemaModelJson.decode(json), Right(SchemaModel(Vector(linked))))
   }
 
+  test("unique keys round-trip in key order") {
+    val keyed = customer.copy(uniqueKeys = Vector(
+      UniqueKeyModel(Vector(SchemaId("7f3a9c21/f34e45b6"))),
+      UniqueKeyModel(Vector(SchemaId("7f3a9c21/1c2d3e4f"), SchemaId("7f3a9c21/f34e45b6")))
+    ))
+    val json = SchemaModelJson.encode(SchemaModel(Vector(keyed)))
+    assert(json.contains(""""uniqueKeys":[{"columns":["7f3a9c21/f34e45b6"]},""" +
+      """{"columns":["7f3a9c21/1c2d3e4f","7f3a9c21/f34e45b6"]}]"""), json)
+    assertEquals(SchemaModelJson.decode(json), Right(SchemaModel(Vector(keyed))))
+    assert(failure(json.replace("{\"columns\":[\"7f3a9c21/f34e45b6\"]}", "{\"cols\":[]}")).contains("expected columns"))
+  }
+
+  test("format 2, written before unique keys existed, still decodes to the same model and fingerprint") {
+    val written = """{"format":2,"tables":[{"id":"t","catalog":null,"schema":"public","name":"t","columns":""" +
+      """[{"id":"t/id","name":"id","type":"uuid","nullable":false},{"id":"t/parent","name":"parent","type":"uuid",""" +
+      """"nullable":true}],"primaryKey":["t/id"],"foreignKeys":[{"columns":["t/parent"],"referencedTable":"t",""" +
+      """"referencedColumns":["t/id"]}]}]}"""
+    val model = SchemaModelJson.decode(written).toOption.get
+    assertEquals(model.tables.head.foreignKeys.size, 1)
+    assertEquals(SchemaFingerprint.of(model), "21ad02d6ea5bab3bdc4eac7924a109696d92ef1fc741f5070e04d581e5d18aa4")
+    val withUniqueKeys = written.replace("\"t/id\"]}]}]}", "\"t/id\"]}],\"uniqueKeys\":[]}]}")
+    assertNotEquals(withUniqueKeys, written)
+    assert(failure(withUniqueKeys).contains("uniqueKeys"))
+  }
+
   test("format 1, written before foreign keys existed, still decodes to the same model and fingerprint") {
     val written = """{"format":1,"tables":[{"id":"t","catalog":null,"schema":"public","name":"t","columns":""" +
       """[{"id":"t/id","name":"id","type":"uuid","nullable":false},{"id":"t/at","name":"at","type":"timestamp(6)",""" +
@@ -79,8 +104,8 @@ class SchemaModelJsonSuite extends munit.FunSuite:
 
   test("other format versions, missing or unknown fields and unknown types are rejected") {
     val json = SchemaModelJson.encode(model)
-    assert(failure(json.replace("\"format\":2", "\"format\":3")).contains("format 3 is unsupported"))
-    assert(failure(json.replace("\"format\":2", "\"format\":0")).contains("format 0 is unsupported"))
+    assert(failure(json.replace("\"format\":3", "\"format\":4")).contains("format 4 is unsupported"))
+    assert(failure(json.replace("\"format\":3", "\"format\":0")).contains("format 0 is unsupported"))
     assert(failure(json.replace(",\"foreignKeys\":[]", "")).contains("expected catalog, columns, foreignKeys"))
     assert(failure(json.replace("\"foreignKeys\":[]", "\"foreignKeys\":[{\"columns\":[]}]")).contains("referencedTable"))
     assert(failure("""{"tables":[]}""").contains("format is missing"))
