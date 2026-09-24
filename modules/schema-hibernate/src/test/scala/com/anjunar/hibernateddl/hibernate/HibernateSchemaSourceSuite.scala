@@ -51,6 +51,33 @@ class HibernateSchemaSourceSuite extends munit.FunSuite:
     )))
   }
 
+  test("associations become foreign keys on the referenced primary key; disabled constraints stay plain columns") {
+    val model = read(classOf[Invoice], classOf[LegacyCustomer]).toOption.get
+    val invoice = model.tables.find(_.id == SchemaId("5c6d7e8f")).get
+    assertEquals(
+      invoice.columns.map(c => c.id.value -> (c.name.value, c.dataType, c.nullable)).toMap,
+      Map(
+        "5c6d7e8f/0a1b2c3d" -> ("id", SqlType.BigInt, false),
+        "5c6d7e8f/1d2e3f40" -> ("customer_id", SqlType.BigInt, false),
+        "5c6d7e8f/2e3f4051" -> ("reviewer_id", SqlType.BigInt, true),
+        "5c6d7e8f/3f405162" -> ("correction_id", SqlType.BigInt, true)
+      )
+    )
+    assertEquals(invoice.foreignKeys.toSet, Set(
+      ForeignKeyModel(Vector(SchemaId("5c6d7e8f/1d2e3f40")), SchemaId("7f3a9c21"), Vector(SchemaId("7f3a9c21/0a1b2c3d"))),
+      ForeignKeyModel(Vector(SchemaId("5c6d7e8f/3f405162")), SchemaId("5c6d7e8f"), Vector(SchemaId("5c6d7e8f/0a1b2c3d")))
+    ))
+    assertEquals(SchemaValidation.validate(model), Vector.empty)
+  }
+
+  test("renaming a referenced entity keeps the foreign key, so the diff plans only the rename") {
+    val before = read(classOf[Invoice], classOf[LegacyCustomer]).toOption.get
+    val after = before.copy(tables = before.tables.map { table =>
+      if table.id == SchemaId("7f3a9c21") then table.copy(name = table.name.copy(name = SqlIdentifier("client"))) else table
+    })
+    assertEquals(DiffEngine.diff(before, after).map(_.map(_.getClass.getSimpleName)), Right(Vector("RenameTable")))
+  }
+
   test("missing and readable IDs are rejected with a generated suggestion") {
     val diagnostics = errors(classOf[Unidentified])
     assertEquals(diagnostics.size, 3)
@@ -69,7 +96,7 @@ class HibernateSchemaSourceSuite extends munit.FunSuite:
   test("mappings the model cannot represent are reported instead of dropped") {
     val diagnostics = errors(classOf[Unsupported], classOf[LegacyCustomer])
     assert(diagnostics.exists(_.contains("Unsupported.id has SQL type 'numeric(38,2)'")), diagnostics)
-    assert(diagnostics.exists(_.contains("Unsupported.customer is an association")), diagnostics)
+    assert(diagnostics.exists(_.contains("of entity Unsupported has ON DELETE CASCADE; unsupported")), diagnostics)
     assert(diagnostics.exists(_.contains("collection and join tables are unsupported")), diagnostics)
     assert(diagnostics.exists(_.contains("unique")), diagnostics)
     assert(errors(classOf[Generated]).exists(_.startsWith("Sequence")))

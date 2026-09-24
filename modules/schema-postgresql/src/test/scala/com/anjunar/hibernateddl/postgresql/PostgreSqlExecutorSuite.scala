@@ -225,14 +225,19 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
 
   test("unmodeled constraints and defaults are rejected before DDL") {
     Vector(
-      "ALTER TABLE public.users ADD PRIMARY KEY (username)",
-      "ALTER TABLE public.users ALTER COLUMN username SET DEFAULT 'anonymous'",
-      "CREATE INDEX users_login_idx ON public.users(username)"
-    ).foreach { unsupported =>
+      "ALTER TABLE public.users ADD PRIMARY KEY (username)" -> "primary key",
+      "ALTER TABLE public.users ALTER COLUMN username SET DEFAULT 'anonymous'" -> "unsupported default",
+      "CREATE INDEX users_login_idx ON public.users(username)" -> "unsupported indexes",
+      "ALTER TABLE public.users ADD CHECK (username <> '')" -> "unsupported unmodeled constraints",
+      "CREATE FUNCTION public.keep() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$; " +
+        "CREATE TRIGGER users_keep BEFORE INSERT ON public.users FOR EACH ROW EXECUTE FUNCTION public.keep()" ->
+        "unsupported triggers"
+    ).foreach { (unsupported, message) =>
       withDatabase { ds =>
         fixture(ds)
         execute(ds, unsupported)
-        intercept[MigrationException](executor.migrate(ds, target))
+        val error = intercept[MigrationException](executor.migrate(ds, target))
+        assert(error.getMessage.contains(message), error.getMessage)
         assertEquals(scalar(ds, "SELECT username FROM public.users"), "patrick")
         assertEquals(revisions(ds), "1")
       }
@@ -299,6 +304,77 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
         execute(ds, s"ALTER TABLE public.users ALTER COLUMN seen_at TYPE $actual")
         val error = intercept[MigrationException](executor.migrate(ds, SchemaModel(Vector(users.copy(columns = users.columns :+ seen)))))
         assert(error.getMessage.contains("expected Timestamp(3)"), error.getMessage)
+      }
+    }
+  }
+
+  private val customerId = ColumnModel(SchemaId("CUSTOMER_ID"), SqlIdentifier("id"), SqlType.BigInt, false)
+  private val customers = TableModel(SchemaId("CUSTOMER"), QualifiedName(SqlIdentifier("customer"), Some(SqlIdentifier("crm"))),
+    Vector(customerId), Vector(customerId.id))
+  private val invoiceId = ColumnModel(SchemaId("INVOICE_ID"), SqlIdentifier("id"), SqlType.BigInt, false)
+  private val owner = ColumnModel(SchemaId("INVOICE_OWNER"), SqlIdentifier("customer_id"), SqlType.BigInt, false)
+  private val correction = ColumnModel(SchemaId("INVOICE_CORRECTION"), SqlIdentifier("correction_id"), SqlType.BigInt)
+  private val invoices = TableModel(SchemaId("INVOICE"), QualifiedName(SqlIdentifier("invoice"), Some(SqlIdentifier("public"))),
+    Vector(invoiceId, owner, correction), Vector(invoiceId.id), Vector(
+      ForeignKeyModel(Vector(owner.id), customers.id, customers.primaryKey),
+      ForeignKeyModel(Vector(correction.id), SchemaId("INVOICE"), Vector(invoiceId.id))
+    ))
+  private val billing = SchemaModel(Vector(invoices, customers))
+
+  private def billingFixture(ds: DataSource): Unit =
+    execute(ds, "CREATE SCHEMA crm")
+    assertEquals(executor.migrate(ds, billing), MigrationResult(1, MigrationStatus.Applied, 4))
+    execute(ds, "INSERT INTO crm.customer VALUES (1)")
+    execute(ds, "INSERT INTO public.invoice VALUES (10, 1, NULL), (11, 1, 10)")
+
+  test("foreign keys across schemas and to the own table are created, enforced and verified on restart") {
+    withDatabase { ds =>
+      billingFixture(ds)
+      intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.invoice VALUES (12, 2, NULL)"))
+      intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.invoice VALUES (12, 1, 99)"))
+      assertEquals(executor.migrate(ds, billing), MigrationResult(1, MigrationStatus.AlreadyApplied, 0))
+    }
+  }
+
+  test("renaming referenced tables and key columns keeps foreign keys and data") {
+    withDatabase { ds =>
+      billingFixture(ds)
+      val renamed = SchemaModel(Vector(
+        invoices.copy(columns = Vector(invoiceId, owner.copy(name = SqlIdentifier("client_id")), correction)),
+        customers.copy(name = customers.name.copy(name = SqlIdentifier("client")),
+          columns = Vector(customerId.copy(name = SqlIdentifier("client_no"))))
+      ))
+      assertEquals(executor.migrate(ds, renamed), MigrationResult(2, MigrationStatus.Applied, 3))
+      assertEquals(scalar(ds, "SELECT count(*) FROM public.invoice i JOIN crm.client c ON c.client_no = i.client_id"), "2")
+      intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.invoice VALUES (12, 2, NULL)"))
+    }
+  }
+
+  test("a new association adds a nullable column and its foreign key to a populated table") {
+    withDatabase { ds =>
+      billingFixture(ds)
+      val approver = ColumnModel(SchemaId("INVOICE_APPROVER"), SqlIdentifier("approver_id"), SqlType.BigInt)
+      val approved = SchemaModel(Vector(invoices.copy(columns = invoices.columns :+ approver,
+        foreignKeys = invoices.foreignKeys :+ ForeignKeyModel(Vector(approver.id), customers.id, customers.primaryKey)), customers))
+      assertEquals(executor.migrate(ds, approved), MigrationResult(2, MigrationStatus.Applied, 2))
+      execute(ds, "UPDATE public.invoice SET approver_id = 1")
+      intercept[java.sql.SQLException](execute(ds, "UPDATE public.invoice SET approver_id = 2"))
+    }
+  }
+
+  test("missing, extra and cascading foreign keys and references from unmodeled tables block the start") {
+    Vector(
+      "ALTER TABLE public.invoice DROP CONSTRAINT invoice_customer_id_fkey" -> "is missing from",
+      "ALTER TABLE public.invoice ADD FOREIGN KEY (customer_id) REFERENCES crm.customer (id)" -> "unexpected foreign key",
+      "ALTER TABLE public.invoice DROP CONSTRAINT invoice_customer_id_fkey, " +
+        "ADD FOREIGN KEY (customer_id) REFERENCES crm.customer (id) ON DELETE CASCADE" -> "unsupported ON DELETE action",
+      "CREATE TABLE public.audit (customer_id bigint REFERENCES crm.customer (id))" -> "unmodeled table \"public\".\"audit\""
+    ).foreach { (change, message) =>
+      withDatabase { ds =>
+        billingFixture(ds)
+        execute(ds, change)
+        val error = intercept[MigrationException](executor.migrate(ds, billing))
+        assert(error.getMessage.contains(message), error.getMessage)
       }
     }
   }

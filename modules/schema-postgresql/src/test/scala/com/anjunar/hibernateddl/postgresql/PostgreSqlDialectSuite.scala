@@ -126,6 +126,21 @@ class PostgreSqlDialectSuite extends munit.FunSuite:
     }
   }
 
+  test("foreign keys render as separate ALTER TABLE statements and new tables must not carry them") {
+    val key = AddForeignKey(tableId, name("invoice", Some("sales")), Vector(SqlIdentifier("customer_id")),
+      name("customer", Some("crm")), Vector(SqlIdentifier("id")))
+    assertEquals(
+      PostgreSqlDialect.render(Vector(key)),
+      Right(Vector("ALTER TABLE \"sales\".\"invoice\" ADD FOREIGN KEY (\"customer_id\") REFERENCES \"crm\".\"customer\" (\"id\");"))
+    )
+    assert(PostgreSqlDialect.render(Vector(key.copy(referencedColumns = Vector.empty))).swap.toOption.get
+      .exists(_.contains("as many referenced columns")))
+    val id = ColumnModel(SchemaId("id"), SqlIdentifier("id"), SqlType.BigInt, nullable = false)
+    val table = TableModel(tableId, name("invoice"), Vector(id), Vector(id.id),
+      Vector(ForeignKeyModel(Vector(id.id), tableId, Vector(id.id))))
+    assert(PostgreSqlDialect.render(Vector(CreateTable(table))).swap.toOption.get.exists(_.contains("separate operations")))
+  }
+
   test("an empty plan renders to an empty statement vector") {
     assertEquals(PostgreSqlDialect.render(Vector.empty), Right(Vector.empty))
   }

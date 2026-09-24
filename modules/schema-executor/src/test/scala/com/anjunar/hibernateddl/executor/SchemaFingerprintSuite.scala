@@ -38,6 +38,29 @@ class SchemaFingerprintSuite extends munit.FunSuite:
     assert(hashes.forall(_.matches("[0-9a-f]{64}")))
   }
 
+  private val keyed =
+    val id = ColumnModel(SchemaId("t/id"), SqlIdentifier("id"), SqlType.Uuid, nullable = false)
+    SchemaModel(Vector(TableModel(SchemaId("t"), QualifiedName(SqlIdentifier("t"), Some(SqlIdentifier("public"))),
+      Vector(id, ColumnModel(SchemaId("t/at"), SqlIdentifier("at"), SqlType.Timestamp(6)),
+        ColumnModel(SchemaId("t/name"), SqlIdentifier("name"), SqlType.Varchar(80))), Vector(id.id))))
+
+  test("models without foreign keys keep the fingerprints that earlier versions stored") {
+    assertEquals(SchemaFingerprint.of(keyed), "085d2a77eff81e4854196e811715cfedfb1248fa6809e4cf86d5875f14cc990b")
+  }
+
+  test("foreign keys change the fingerprint, but their order does not") {
+    val table = keyed.tables.head
+    val parent = ColumnModel(SchemaId("t/parent"), SqlIdentifier("parent"), SqlType.Uuid)
+    val other = ColumnModel(SchemaId("t/other"), SqlIdentifier("other"), SqlType.Uuid)
+    val keys = Vector(parent, other).map(c => ForeignKeyModel(Vector(c.id), table.id, table.primaryKey))
+    val linked = table.copy(columns = table.columns ++ Vector(parent, other), foreignKeys = keys)
+    val unlinked = SchemaFingerprint.of(SchemaModel(Vector(linked.copy(foreignKeys = Vector.empty))))
+    val fingerprint = SchemaFingerprint.of(SchemaModel(Vector(linked)))
+    assertNotEquals(fingerprint, unlinked)
+    assertEquals(SchemaFingerprint.of(SchemaModel(Vector(linked.copy(foreignKeys = keys.reverse)))), fingerprint)
+    assertNotEquals(SchemaFingerprint.of(SchemaModel(Vector(linked.copy(foreignKeys = keys.take(1))))), fingerprint)
+  }
+
   test("length-prefixing distinguishes delimiter-containing IDs and names") {
     val left = SchemaModel(Vector(table.copy(id = SchemaId("a|b"), name = QualifiedName(SqlIdentifier("c")))))
     val right = SchemaModel(Vector(table.copy(id = SchemaId("a"), name = QualifiedName(SqlIdentifier("b|c")))))

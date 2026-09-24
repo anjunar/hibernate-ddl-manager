@@ -2,6 +2,7 @@ package com.anjunar.hibernateddl.hibernate
 
 import com.anjunar.hibernateddl.hibernate.annotation.SchemaId
 import jakarta.persistence.*
+import org.hibernate.annotations.{OnDelete, OnDeleteAction}
 
 import scala.compiletime.uninitialized
 
@@ -64,11 +65,21 @@ class Purchase:
   @SchemaId("3d4e5f60") var shippedAt: java.time.OffsetDateTime = uninitialized
   @SchemaId("4e5f6071") @Column(secondPrecision = 3) var deliveredAt: java.time.LocalDateTime = uninitialized
 
+/** Associations: a required reference, one without a constraint and a self-reference. */
+@Entity
+@SchemaId("5c6d7e8f")
+class Invoice:
+  @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+  @SchemaId("1d2e3f40") @ManyToOne(optional = false) var customer: LegacyCustomer = uninitialized
+  @SchemaId("2e3f4051") @ManyToOne @JoinColumn(foreignKey = new ForeignKey(value = ConstraintMode.NO_CONSTRAINT))
+  var reviewer: LegacyCustomer = uninitialized
+  @SchemaId("3f405162") @ManyToOne var correction: Invoice = uninitialized
+
 @Entity
 @SchemaId("bbbbbbbb")
 class Unsupported:
   @Id @SchemaId("0a1b2c3d") var id: java.math.BigDecimal = uninitialized
-  @SchemaId("1a1b2c3d") @ManyToOne var customer: LegacyCustomer = uninitialized
+  @SchemaId("1a1b2c3d") @ManyToOne @OnDelete(action = OnDeleteAction.CASCADE) var customer: LegacyCustomer = uninitialized
   @SchemaId("2a1b2c3d") @ElementCollection var tags: java.util.Set[String] = new java.util.HashSet[String]()
   @SchemaId("3a1b2c3d") @Column(unique = true) var code: String = uninitialized
 
