@@ -1,6 +1,8 @@
 package com.anjunar.hibernateddl.core
 
-/** Plans creation, nullable additions and explicit-ID renames; all other changes fail closed. */
+/** Plans creation, nullable additions, new foreign keys and explicit-ID renames; all other
+  * changes fail closed. Foreign keys are added last, after every table exists.
+  */
 object DiffEngine:
   def diff(
       previous: SchemaModel,
@@ -18,6 +20,7 @@ object DiffEngine:
   ): Either[Vector[String], Vector[SchemaOperation]] =
     val errors = Vector.newBuilder[String]
     val operations = Vector.newBuilder[SchemaOperation]
+    val addedKeys = Vector.newBuilder[(TableModel, ForeignKeyModel)]
     val oldTables = previous.tables.map(t => t.id -> t).toMap
     val newTables = desired.tables.map(t => t.id -> t).toMap
     val oldLocations = locations(previous)
@@ -72,6 +75,18 @@ object DiffEngine:
           errors += s"Adding column '${columnId.value}' uses an occupied previous name in table '${id.value}'; manual migration required"
         else operations += SchemaOperation.AddColumn(id, newTable.name, column)
       }
+
+      val oldKeys = oldTable.foreignKeys.map(key => key.columns -> key).toMap
+      newTable.foreignKeys.foreach { key =>
+        oldKeys.get(key.columns) match
+          case None => addedKeys += newTable -> key
+          case Some(old) if old != key =>
+            errors += s"Changing foreign key ${key.display} of table '${id.value}' is unsupported; manual migration required"
+          case Some(_) => ()
+      }
+      (oldKeys.keySet -- newTable.foreignKeys.map(_.columns)).foreach { columns =>
+        errors += s"Dropping foreign key ${oldKeys(columns).display} from table '${id.value}' is unsupported; manual migration required"
+      }
     }
 
     (newTables.keySet -- oldTables.keySet).toVector.sortBy(_.value).foreach { id =>
@@ -79,7 +94,17 @@ object DiffEngine:
       previous.tables.find(_.name == table.name) match
         case Some(occupant) =>
           errors += s"Creating table '${id.value}' uses the previous name of table '${occupant.id.value}'; manual migration required"
-        case None => operations += SchemaOperation.CreateTable(table)
+        case None =>
+          operations += SchemaOperation.CreateTable(table.copy(foreignKeys = Vector.empty))
+          table.foreignKeys.foreach(key => addedKeys += table -> key)
+    }
+
+    given Ordering[Vector[String]] = Ordering.Implicits.seqOrdering[Vector, String]
+    addedKeys.result().sortBy((table, key) => (table.id.value, key.columns.map(_.value))).foreach { (table, key) =>
+      val referenced = newTables(key.referencedTable)
+      def names(owner: TableModel, ids: Vector[SchemaId]) = ids.map(id => owner.columns.find(_.id == id).get.name)
+      operations += SchemaOperation.AddForeignKey(table.id, table.name, names(table, key.columns),
+        referenced.name, names(referenced, key.referencedColumns))
     }
 
     val diagnostics = errors.result().distinct.sorted

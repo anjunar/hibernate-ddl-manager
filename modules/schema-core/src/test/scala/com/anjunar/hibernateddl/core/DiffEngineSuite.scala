@@ -151,6 +151,43 @@ class DiffEngineSuite extends munit.FunSuite:
     assert(errors(DiffEngine.diff(before, unkeyed)).exists(_.contains("Changing primary key")))
   }
 
+  test("foreign keys are added after all tables, so new tables may reference each other and themselves") {
+    val id = ColumnModel(SchemaId("category/id"), SqlIdentifier("id"), SqlType.BigInt, nullable = false)
+    val parent = ColumnModel(SchemaId("category/parent"), SqlIdentifier("parent_id"), SqlType.BigInt)
+    val category = TableModel(SchemaId("category"), QualifiedName(SqlIdentifier("category")), Vector(id, parent),
+      Vector(id.id), Vector(ForeignKeyModel(Vector(parent.id), SchemaId("category"), Vector(id.id))))
+    val label = ColumnModel(SchemaId("customer-category"), SqlIdentifier("category_id"), SqlType.BigInt)
+    val labelled = customer.copy(columns = customer.columns :+ label,
+      foreignKeys = Vector(ForeignKeyModel(Vector(label.id), category.id, Vector(id.id))))
+    assertEquals(DiffEngine.diff(initial, SchemaModel(Vector(labelled, category))), Right(Vector(
+      SchemaOperation.AddColumn(customer.id, customer.name, label),
+      SchemaOperation.CreateTable(category.copy(foreignKeys = Vector.empty)),
+      SchemaOperation.AddForeignKey(category.id, category.name, Vector(SqlIdentifier("parent_id")),
+        category.name, Vector(SqlIdentifier("id"))),
+      SchemaOperation.AddForeignKey(customer.id, customer.name, Vector(SqlIdentifier("category_id")),
+        category.name, Vector(SqlIdentifier("id")))
+    )))
+  }
+
+  test("renames keep foreign keys; dropping or changing them requires manual migration") {
+    val id = ColumnModel(SchemaId("category/id"), SqlIdentifier("id"), SqlType.BigInt, nullable = false)
+    val other = ColumnModel(SchemaId("category/other"), SqlIdentifier("other_id"), SqlType.BigInt, nullable = false)
+    val category = TableModel(SchemaId("category"), QualifiedName(SqlIdentifier("category")), Vector(id, other), Vector(id.id))
+    val link = ColumnModel(SchemaId("customer-category"), SqlIdentifier("category_id"), SqlType.BigInt)
+    val key = ForeignKeyModel(Vector(link.id), category.id, Vector(id.id))
+    val linked = customer.copy(columns = customer.columns :+ link, foreignKeys = Vector(key))
+    val before = SchemaModel(Vector(linked, category))
+    val renamed = SchemaModel(Vector(linked, category.copy(name = QualifiedName(SqlIdentifier("categories")),
+      columns = Vector(id.copy(name = SqlIdentifier("category_id")), other))))
+    assertEquals(DiffEngine.diff(before, renamed).map(_.map(_.getClass.getSimpleName)),
+      Right(Vector("RenameTable", "RenameColumn")))
+    val dropped = SchemaModel(Vector(linked.copy(foreignKeys = Vector.empty), category))
+    assert(errors(DiffEngine.diff(before, dropped)).exists(_.contains("Dropping foreign key (customer-category)")))
+    val otherKey = category.copy(primaryKey = Vector(other.id))
+    val changed = SchemaModel(Vector(linked.copy(foreignKeys = Vector(key.copy(referencedColumns = Vector(other.id)))), otherKey))
+    assert(errors(DiffEngine.diff(before, changed)).exists(_.contains("Changing foreign key (customer-category)")))
+  }
+
   test("renames expose their locking risk") {
     val renamed = customer.name.copy(name = SqlIdentifier("renamed"))
     assertEquals(SchemaOperation.RenameTable(customer.id, customer.name, renamed).risk, RiskLevel.Locking)

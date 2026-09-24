@@ -28,12 +28,24 @@ final case class ColumnModel(
     nullable: Boolean = true
 )
 
+/** A foreign key references the primary key of a table in the same model. Columns and
+  * referenced columns pair up in key order; both are IDs, so renames keep the key intact.
+  * A table has at most one foreign key per column list, which is its identity.
+  */
+final case class ForeignKeyModel(
+    columns: Vector[SchemaId],
+    referencedTable: SchemaId,
+    referencedColumns: Vector[SchemaId]
+):
+  def display: String = columns.map(_.value).mkString("(", ", ", ")")
+
 /** The primary key lists column IDs in key order, so column renames keep it intact. */
 final case class TableModel(
     id: SchemaId,
     name: QualifiedName,
     columns: Vector[ColumnModel],
-    primaryKey: Vector[SchemaId] = Vector.empty
+    primaryKey: Vector[SchemaId] = Vector.empty,
+    foreignKeys: Vector[ForeignKeyModel] = Vector.empty
 )
 
 final case class SchemaModel(tables: Vector[TableModel])
@@ -76,8 +88,37 @@ object SchemaValidation:
             errors += s"Primary key column '${id.value}' of table '${table.id.value}' must not be nullable"
           case Some(_) => ()
       }
+      table.foreignKeys.groupBy(_.columns).foreach { (_, keys) =>
+        if keys.size > 1 then
+          errors += s"Table '${table.id.value}' has more than one foreign key on ${keys.head.display}"
+      }
+      table.foreignKeys.foreach(key => errors ++= validateForeignKey(model, table, key))
     }
     errors.result().distinct.sorted
+
+  private def validateForeignKey(model: SchemaModel, table: TableModel, key: ForeignKeyModel): Vector[String] =
+    val label = s"Foreign key ${key.display} of table '${table.id.value}'"
+    val referenced = model.tables.find(_.id == key.referencedTable)
+    val structure = Vector(
+      Option.when(key.columns.isEmpty)(s"$label has no columns"),
+      Option.when(key.columns.distinct.size != key.columns.size)(s"$label lists a column more than once"),
+      Option.when(referenced.isEmpty)(s"$label references unknown table '${key.referencedTable.value}'"),
+      referenced.flatMap { target =>
+        Option.when(target.primaryKey.isEmpty || key.referencedColumns != target.primaryKey)(
+          s"$label must reference the primary key of table '${target.id.value}'")
+      }
+    ).flatten ++ key.columns.filterNot(id => table.columns.exists(_.id == id)).map { id =>
+      s"$label references unknown column '${id.value}'"
+    }
+    if structure.nonEmpty then structure
+    else
+      val target = referenced.get
+      key.columns.zip(key.referencedColumns).flatMap { (columnId, referencedId) =>
+        val column = table.columns.find(_.id == columnId).get
+        val referencedColumn = target.columns.find(_.id == referencedId).get
+        Option.when(column.dataType != referencedColumn.dataType)(
+          s"$label column '${columnId.value}' has type ${column.dataType} but references type ${referencedColumn.dataType}")
+      }
 
   private[core] def displayName(name: QualifiedName): String =
     (name.catalog.toVector ++ name.schema.toVector :+ name.name).map(_.value).mkString(".")

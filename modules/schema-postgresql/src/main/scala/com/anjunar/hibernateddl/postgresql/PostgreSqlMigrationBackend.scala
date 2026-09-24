@@ -10,11 +10,12 @@ import scala.util.Using
   *
   * The initial execution envelope is deliberately narrow: explicitly qualified,
   * permanent ordinary tables containing only the modeled native types,
-  * nullability and a non-deferrable primary key. Defaults, identities, generated
-  * columns, custom collations, inheritance, partitions, other indexes and
-  * constraints, triggers, rules and RLS
-  * require a richer schema model before execution is supported. Unmanaged tables
-  * outside the supplied model are allowed. Every modeled table is exclusively
+  * nullability, a non-deferrable primary key and plain foreign keys (no actions,
+  * MATCH SIMPLE, not deferrable). Defaults, identities, generated columns, custom
+  * collations, inheritance, partitions, other indexes and constraints, triggers,
+  * rules and RLS require a richer schema model before execution is supported.
+  * Unmanaged tables outside the supplied model are allowed, but must not reference
+  * a modeled table. Every modeled table is exclusively
   * locked before catalog inspection; callers must retain this transaction until
   * the migration and its history entry have both committed.
   *
@@ -95,11 +96,8 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
       s"SELECT revision, previous_fingerprint, target_fingerprint, CAST(model AS pg_catalog.text) AS model, statements " +
         s"FROM $HistoryTable ORDER BY revision"
     )(_ => ()) { row =>
-      val statements = row.getArray("statements")
-      try HistoryEntry(row.getLong("revision"), row.getString("previous_fingerprint"),
-        row.getString("target_fingerprint"), row.getString("model"),
-        statements.getArray.asInstanceOf[Array[String]].toVector)
-      finally statements.free()
+      HistoryEntry(row.getLong("revision"), row.getString("previous_fingerprint"),
+        row.getString("target_fingerprint"), row.getString("model"), strings(row, "statements"))
     }
 
   override def recordHistory(connection: Connection, entry: HistoryEntry): Unit =
@@ -128,7 +126,7 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
       tables.foreach { table =>
         execute(connection, s"LOCK TABLE ONLY ${qualified(table.name)} IN ACCESS EXCLUSIVE MODE")
       }
-      tables.flatMap(table => inspectTable(connection, table)).distinct.sorted
+      tables.flatMap(table => inspectTable(connection, table, expected)).distinct.sorted
 
   private def validateModel(model: SchemaModel): Vector[String] =
     val dialectErrors = model.tables.flatMap { table =>
@@ -149,7 +147,7 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
     }
     (SchemaValidation.validate(model) ++ dialectErrors ++ idErrors ++ namespaceErrors).distinct.sorted
 
-  private def inspectTable(connection: Connection, expected: TableModel): Vector[String] =
+  private def inspectTable(connection: Connection, expected: TableModel, model: SchemaModel): Vector[String] =
     val display = qualified(expected.name)
     val relations = query(connection,
       """SELECT c.oid, c.relkind, c.relispartition, c.relpersistence, c.reloftype,
@@ -157,14 +155,14 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
         |       EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i
         |               WHERE i.inhrelid = c.oid OR i.inhparent = c.oid) AS has_inheritance,
         |       EXISTS (SELECT 1 FROM pg_catalog.pg_constraint k
-        |               WHERE (k.conrelid = c.oid OR k.confrelid = c.oid)
+        |               WHERE k.conrelid = c.oid AND k.contype <> 'f'
         |                 AND NOT (k.contype = 'n' AND k.convalidated)
-        |                 AND NOT (k.contype = 'p' AND k.conrelid = c.oid AND NOT k.condeferrable)
+        |                 AND NOT (k.contype = 'p' AND NOT k.condeferrable)
         |              ) AS has_constraints,
         |       EXISTS (SELECT 1 FROM pg_catalog.pg_index i
         |               WHERE i.indrelid = c.oid AND NOT i.indisprimary) AS has_indexes,
         |       EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t
-        |               WHERE t.tgrelid = c.oid) AS has_triggers,
+        |               WHERE t.tgrelid = c.oid AND NOT t.tgisinternal) AS has_triggers,
         |       EXISTS (SELECT 1 FROM pg_catalog.pg_rewrite r
         |               WHERE r.ev_class = c.oid) AS has_rules,
         |       EXISTS (SELECT 1 FROM pg_catalog.pg_policy p
@@ -224,7 +222,85 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
         if actualKey != expectedKey then
           def show(key: Vector[String]) = if key.isEmpty then "none" else key.map(quoted).mkString("(", ", ", ")")
           errors += s"Database drift: primary key of $display is ${show(actualKey)}; expected ${show(expectedKey)}."
+        errors ++= compareForeignKeys(connection, oid, display, expected, model)
         errors.result()
+
+  /** Foreign keys match by columns and referenced columns, never by constraint name. Keys
+    * referencing this table must come from modeled tables, whose own check covers them.
+    */
+  private def compareForeignKeys(
+      connection: Connection,
+      oid: Long,
+      display: String,
+      expected: TableModel,
+      model: SchemaModel
+  ): Vector[String] =
+    def names(table: TableModel, ids: Vector[SchemaId]) = ids.map(id => table.columns.find(_.id == id).get.name.value)
+    val expectedKeys = expected.foreignKeys.map { key =>
+      val referenced = model.tables.find(_.id == key.referencedTable).get
+      ForeignKeyShape(names(expected, key.columns), qualified(referenced.name), names(referenced, key.referencedColumns))
+    }
+    val actualKeys = inspectForeignKeys(connection, oid)
+    val modeledTables = model.tables.map(table => qualified(table.name)).toSet
+    actualKeys.flatMap { key =>
+      key.features.map(feature => s"Foreign key ${quoted(key.name)} of $display has unsupported $feature.")
+    } ++ (expectedKeys diff actualKeys.map(_.shape)).map { key =>
+      s"Database drift: foreign key ${key.show} is missing from $display."
+    } ++ (actualKeys.map(_.shape) diff expectedKeys).map { key =>
+      s"Database drift: unexpected foreign key ${key.show} in $display."
+    } ++ inspectReferencingTables(connection, oid).filterNot(modeledTables.contains).map { referencing =>
+      s"Table $display is referenced by a foreign key of unmodeled table $referencing."
+    }
+
+  private final case class ForeignKeyShape(columns: Vector[String], referencedTable: String, referencedColumns: Vector[String]):
+    def show: String =
+      s"${columns.map(quoted).mkString("(", ", ", ")")} REFERENCES $referencedTable ${referencedColumns.map(quoted).mkString("(", ", ", ")")}"
+
+  private final case class DatabaseForeignKey(name: String, shape: ForeignKeyShape, features: Vector[String])
+
+  private def inspectForeignKeys(connection: Connection, oid: Long): Vector[DatabaseForeignKey] =
+    query(connection,
+      """SELECT k.conname, k.confupdtype, k.confdeltype, k.confmatchtype, k.condeferrable, k.convalidated,
+        |       n.nspname AS referenced_schema, r.relname AS referenced_table,
+        |       ARRAY(SELECT CAST(a.attname AS pg_catalog.text)
+        |             FROM pg_catalog.unnest(k.conkey) WITH ORDINALITY AS u(attnum, position)
+        |             JOIN pg_catalog.pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = u.attnum
+        |             ORDER BY u.position) AS columns,
+        |       ARRAY(SELECT CAST(a.attname AS pg_catalog.text)
+        |             FROM pg_catalog.unnest(k.confkey) WITH ORDINALITY AS u(attnum, position)
+        |             JOIN pg_catalog.pg_attribute a ON a.attrelid = k.confrelid AND a.attnum = u.attnum
+        |             ORDER BY u.position) AS referenced_columns
+        |FROM pg_catalog.pg_constraint k
+        |JOIN pg_catalog.pg_class r ON r.oid = k.confrelid
+        |JOIN pg_catalog.pg_namespace n ON n.oid = r.relnamespace
+        |WHERE k.conrelid = CAST(? AS pg_catalog.oid) AND k.contype = 'f'
+        |ORDER BY k.conname""".stripMargin
+    )(_.setLong(1, oid)) { row =>
+      val features = Vector(
+        Option.when(row.getString("confupdtype") != "a")("ON UPDATE action"),
+        Option.when(row.getString("confdeltype") != "a")("ON DELETE action"),
+        Option.when(row.getString("confmatchtype") != "s")("MATCH FULL or PARTIAL"),
+        Option.when(row.getBoolean("condeferrable"))("deferrable checking"),
+        Option.when(!row.getBoolean("convalidated"))("NOT VALID state")
+      ).flatten
+      val referenced = quoted(row.getString("referenced_schema")) + "." + quoted(row.getString("referenced_table"))
+      DatabaseForeignKey(row.getString("conname"),
+        ForeignKeyShape(strings(row, "columns"), referenced, strings(row, "referenced_columns")), features)
+    }
+
+  private def inspectReferencingTables(connection: Connection, oid: Long): Vector[String] =
+    query(connection,
+      """SELECT DISTINCT n.nspname, c.relname
+        |FROM pg_catalog.pg_constraint k
+        |JOIN pg_catalog.pg_class c ON c.oid = k.conrelid
+        |JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        |WHERE k.confrelid = CAST(? AS pg_catalog.oid) AND k.contype = 'f'""".stripMargin
+    )(_.setLong(1, oid))(row => quoted(row.getString("nspname")) + "." + quoted(row.getString("relname")))
+
+  private def strings(row: ResultSet, column: String): Vector[String] =
+    val array = row.getArray(column)
+    try array.getArray.asInstanceOf[Array[String]].toVector
+    finally array.free()
 
   private final case class DatabaseColumn(
       name: String,

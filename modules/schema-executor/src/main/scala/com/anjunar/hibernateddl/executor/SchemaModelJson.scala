@@ -6,11 +6,12 @@ import scala.util.control.NoStackTrace
 
 /** The JSON form of a schema model that every history entry stores, so that the next server
   * start plans against the model applied last. Writing escapes every non-ASCII character, so
-  * the text survives any transport unchanged. Reading is strict: another format version, a
-  * missing or unknown field and an unknown type are errors, never skipped.
+  * the text survives any transport unchanged. Reading is strict: an unknown format version, a
+  * missing or unknown field and an unknown type are errors, never skipped. Format 2 added
+  * foreign keys; format 1, written before, is still read.
   */
 object SchemaModelJson:
-  val FormatVersion = 1
+  val FormatVersion = 2
   private val VarcharType = """varchar\((\d+)\)""".r
   private val TimestampType = """timestamp\((\d+)\)""".r
   private val TimestampWithTimeZoneType = """timestamp\((\d+)\) with time zone""".r
@@ -27,6 +28,10 @@ object SchemaModelJson:
       out.append('"').toString
     def optional(identifier: Option[SqlIdentifier]) = identifier.fold("null")(value => string(value.value))
     def list(values: Vector[String]) = values.mkString("[", ",", "]")
+    def ids(values: Vector[SchemaId]) = list(values.map(id => string(id.value)))
+    def foreignKey(key: ForeignKeyModel) =
+      s"""{"columns":${ids(key.columns)},"referencedTable":${string(key.referencedTable.value)},""" +
+        s""""referencedColumns":${ids(key.referencedColumns)}}"""
     val tables = model.tables.map { table =>
       val columns = table.columns.map { column =>
         s"""{"id":${string(column.id.value)},"name":${string(column.name.value)},""" +
@@ -34,7 +39,8 @@ object SchemaModelJson:
       }
       s"""{"id":${string(table.id.value)},"catalog":${optional(table.name.catalog)},""" +
         s""""schema":${optional(table.name.schema)},"name":${string(table.name.name.value)},""" +
-        s""""columns":${list(columns)},"primaryKey":${list(table.primaryKey.map(id => string(id.value)))}}"""
+        s""""columns":${list(columns)},"primaryKey":${ids(table.primaryKey)},""" +
+        s""""foreignKeys":${list(table.foreignKeys.map(foreignKey))}}"""
     }
     s"""{"format":$FormatVersion,"tables":${list(tables)}}"""
 
@@ -67,17 +73,18 @@ object SchemaModelJson:
   private def invalid(message: String): Nothing = throw new InvalidJson(message)
 
   private def readModel(json: Json): SchemaModel =
-    json match
+    val format = json match
       case Json.Obj(values) => values.get("format") match
-        case Some(Json.Num(version)) if version == FormatVersion => ()
-        case Some(Json.Num(version)) => invalid(s"Model format $version is unsupported; expected format $FormatVersion")
+        case Some(Json.Num(version)) if version >= 1 && version <= FormatVersion => version.toInt
+        case Some(Json.Num(version)) => invalid(s"Model format $version is unsupported; expected format 1 to $FormatVersion")
         case _ => invalid("Model format is missing")
-      case _ => ()
+      case _ => 0
     val model = fields(json, "Model", Set("format", "tables"))
-    SchemaModel(array(model("tables"), "Model tables").map(readTable))
+    SchemaModel(array(model("tables"), "Model tables").map(readTable(_, format)))
 
-  private def readTable(json: Json): TableModel =
-    val table = fields(json, "Table", Set("id", "catalog", "schema", "name", "columns", "primaryKey"))
+  private def readTable(json: Json, format: Int): TableModel =
+    val common = Set("id", "catalog", "schema", "name", "columns", "primaryKey")
+    val table = fields(json, "Table", if format >= 2 then common + "foreignKeys" else common)
     val id = string(table("id"), "Table id")
     def label(field: String) = s"Table '$id' $field"
     TableModel(
@@ -88,8 +95,21 @@ object SchemaModelJson:
         optional(table("catalog"), label("catalog")).map(SqlIdentifier(_))
       ),
       array(table("columns"), label("columns")).map(readColumn(_, id)),
-      array(table("primaryKey"), label("primary key")).map(key => SchemaId(string(key, label("primary key"))))
+      ids(table("primaryKey"), label("primary key")),
+      table.get("foreignKeys").fold(Vector.empty)(keys => array(keys, label("foreign keys")).map(readForeignKey(_, id)))
     )
+
+  private def readForeignKey(json: Json, tableId: String): ForeignKeyModel =
+    val key = fields(json, s"Foreign key in table '$tableId'", Set("columns", "referencedTable", "referencedColumns"))
+    val label = s"Foreign key in table '$tableId'"
+    ForeignKeyModel(
+      ids(key("columns"), s"$label columns"),
+      SchemaId(string(key("referencedTable"), s"$label referenced table")),
+      ids(key("referencedColumns"), s"$label referenced columns")
+    )
+
+  private def ids(json: Json, label: String): Vector[SchemaId] =
+    array(json, label).map(id => SchemaId(string(id, label)))
 
   private def readColumn(json: Json, tableId: String): ColumnModel =
     val column = fields(json, s"Column in table '$tableId'", Set("id", "name", "type", "nullable"))
