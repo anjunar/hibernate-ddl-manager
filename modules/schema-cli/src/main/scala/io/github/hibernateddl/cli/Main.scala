@@ -34,18 +34,17 @@ object Main:
       QualifiedName(SqlIdentifier("users"), schema = Some(SqlIdentifier("public"))),
       Vector(login)
     )
-    val previous = SchemaSnapshot(1, 1L, SchemaModel(Vector(users)))
+    val previous = SchemaModel(Vector(users))
     val desired = SchemaModel(Vector(users.copy(
       columns = Vector(login.copy(name = SqlIdentifier("login_name")))
     )))
 
     for
-      operations <- DiffEngine.diff(previous.model, desired).left.map(_.mkString("\n"))
+      operations <- DiffEngine.diff(previous, desired).left.map(_.mkString("\n"))
       sql <- PostgreSqlDialect.render(operations).left.map(_.mkString("\n"))
     yield
       val steps = operations.map(operation => s"[${operation.risk}] $operation").mkString("\n")
       s"""Hibernate DDL Manager - review-only demo
-         |Snapshot revision: ${previous.revision}
          |Stable ID: 7f3a9c21/f34e45b6
          |
          |$steps

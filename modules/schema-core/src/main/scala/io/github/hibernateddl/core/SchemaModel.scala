@@ -35,12 +35,6 @@ final case class TableModel(
 
 final case class SchemaModel(tables: Vector[TableModel])
 
-final case class SchemaSnapshot(
-    formatVersion: Int,
-    revision: Long,
-    model: SchemaModel
-)
-
 /** Validation is independent of any particular database dialect. */
 object SchemaValidation:
   def validate(model: SchemaModel): Vector[String] =
