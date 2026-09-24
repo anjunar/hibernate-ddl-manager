@@ -1,22 +1,9 @@
 package com.anjunar.hibernateddl.hibernate
 
 import com.anjunar.hibernateddl.core.*
-import org.hibernate.boot.MetadataSources
-import org.hibernate.boot.registry.StandardServiceRegistryBuilder
 
 class HibernateSchemaSourceSuite extends munit.FunSuite:
-  private def read(classes: Class[?]*): Either[Vector[String], SchemaModel] =
-    val registry = new StandardServiceRegistryBuilder()
-      .applySetting("hibernate.dialect", "org.hibernate.dialect.PostgreSQLDialect")
-      .applySetting("hibernate.boot.allow_jdbc_metadata_access", "false")
-      .applySetting("hibernate.default_schema", "public")
-      .applySetting("hibernate.implicit_naming_strategy", "component-path")
-      .build()
-    try
-      val sources = new MetadataSources(registry)
-      classes.foreach(sources.addAnnotatedClass)
-      HibernateSchemaSource.read(sources.buildMetadata())
-    finally StandardServiceRegistryBuilder.destroy(registry)
+  private def read(classes: Class[?]*): Either[Vector[String], SchemaModel] = TestMetadata.read(classes*)
 
   private def errors(classes: Class[?]*): Vector[String] =
     read(classes*).swap.getOrElse(fail("Expected diagnostics"))
@@ -122,6 +109,45 @@ class HibernateSchemaSourceSuite extends munit.FunSuite:
     assert(diagnostics.exists(_.contains("OddChecks.amount has the check constraint 'amount >= 0'")), diagnostics)
   }
 
+  test("collections map to their own tables with IDs derived from the owning property") {
+    val model = read(classOf[Article], classOf[Label]).toOption.get
+    def table(id: String) = model.tables.find(_.id == SchemaId(id)).getOrElse(fail(s"No table $id in ${model.tables.map(_.id)}"))
+    def ids(table: TableModel) = table.columns.map(c => c.id.value -> c.name.value).toMap
+    val article = SchemaId("c3d4e5f6")
+    val articleKey = Vector(SchemaId("c3d4e5f6/0a1b2c3d"))
+    assertEquals(model.tables.size, 6)
+
+    val keywords = table("c3d4e5f6/1b2c3d4e")
+    assertEquals(keywords.name.name.value, "article_keyword")
+    assertEquals(ids(keywords), Map("c3d4e5f6/1b2c3d4e/key" -> "article_id", "c3d4e5f6/1b2c3d4e/element" -> "keywords"))
+    assertEquals(keywords.foreignKeys, Vector(ForeignKeyModel(Vector(SchemaId("c3d4e5f6/1b2c3d4e/key")), article, articleKey)))
+
+    val lines = table("c3d4e5f6/2c3d4e5f")
+    assertEquals(ids(lines), Map("c3d4e5f6/2c3d4e5f/key" -> "article_id",
+      "c3d4e5f6/2c3d4e5f/6a7b8c9d" -> "lines_text", "c3d4e5f6/2c3d4e5f/7b8c9d0e" -> "lines_amount"))
+
+    val labels = table("c3d4e5f6/3d4e5f60")
+    val labelKey = SchemaId("c3d4e5f6/3d4e5f60/key")
+    val labelElement = SchemaId("c3d4e5f6/3d4e5f60/element")
+    assertEquals(labels.primaryKey.toSet, Set(labelKey, labelElement))
+    assertEquals(labels.foreignKeys.toSet, Set(
+      ForeignKeyModel(Vector(labelKey), article, articleKey),
+      ForeignKeyModel(Vector(labelElement), SchemaId("b2c3d4e5"), Vector(SchemaId("b2c3d4e5/0a1b2c3d")))
+    ))
+
+    val statuses = table("c3d4e5f6/4e5f6071")
+    assertEquals(statuses.columns.find(_.id == SchemaId("c3d4e5f6/4e5f6071/element")).flatMap(_.check),
+      Some(ColumnCheck.AllowedValues(Vector("Draft", "Sent", "Paid"))))
+    assertEquals(SchemaValidation.validate(model), Vector.empty)
+  }
+
+  test("collections sharing a table, ordered lists and maps are reported") {
+    val diagnostics = errors(classOf[Crowded], classOf[Label], classOf[Article])
+    assert(diagnostics.exists(d => d.contains("Crowded.favorites, ") && d.contains("Crowded.pinned use table Crowded_Label")),
+      diagnostics)
+    assert(diagnostics.exists(_.contains("Crowded.ranking is a list collection")), diagnostics)
+  }
+
   test("renaming a referenced entity keeps the foreign key, so the diff plans only the rename") {
     val before = read(classOf[Invoice], classOf[LegacyCustomer]).toOption.get
     val after = before.copy(tables = before.tables.map { table =>
@@ -149,7 +175,7 @@ class HibernateSchemaSourceSuite extends munit.FunSuite:
     val diagnostics = errors(classOf[Unsupported], classOf[LegacyCustomer])
     assert(diagnostics.exists(_.contains("Unsupported.document has SQL type 'oid'")), diagnostics)
     assert(diagnostics.exists(_.contains("of entity Unsupported has ON DELETE CASCADE; unsupported")), diagnostics)
-    assert(diagnostics.exists(_.contains("collection and join tables are unsupported")), diagnostics)
+    assert(diagnostics.exists(_.contains("Unsupported.tags is a map collection")), diagnostics)
     assert(diagnostics.exists(_.contains("of entity Unsupported has options 'WHERE code IS NOT NULL'; unsupported")), diagnostics)
     assert(errors(classOf[Generated]).exists(_.startsWith("Sequence")))
   }
