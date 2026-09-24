@@ -7,27 +7,25 @@ import javax.sql.DataSource
 import scala.collection.mutable.ArrayBuffer
 
 class JdbcMigrationExecutorSuite extends munit.FunSuite:
-  private val originalTable = TableModel(SchemaId("account"), QualifiedName(SqlIdentifier("account")),
-    Vector(ColumnModel(SchemaId("account-name"), SqlIdentifier("name"), SqlType.Text)))
-  private val previous = SchemaSnapshot(1, 0, SchemaModel(Vector(originalTable)))
-  private val target = SchemaSnapshot(1, 1, SchemaModel(Vector(originalTable.copy(
+  private val name = ColumnModel(SchemaId("account-name"), SqlIdentifier("name"), SqlType.Text)
+  private val account = TableModel(SchemaId("account"), QualifiedName(SqlIdentifier("account")), Vector(name))
+  private val initial = SchemaModel(Vector(account))
+  private val renamed = SchemaModel(Vector(account.copy(
     name = QualifiedName(SqlIdentifier("accounts")),
-    columns = Vector(originalTable.columns.head.copy(name = SqlIdentifier("display_name")))
-  ))))
-  private val request = MigrationRequest("accounts-v1", previous, target)
+    columns = Vector(name.copy(name = SqlIdentifier("display_name")))
+  )))
+  private val empty = SchemaModel(Vector.empty)
 
   private class Harness:
     val events = ArrayBuffer.empty[String]
     var freshAutoCommit = true
     var failAt = Set.empty[String]
-    var recorded: Option[HistoryEntry] = None
-    var found: Option[HistoryEntry] = None
-    var latest: Option[HistoryEntry] = None
+    /** Committed history; a recorded entry becomes part of it only when the transaction commits. */
+    var history = Vector.empty[HistoryEntry]
+    private var pending = Option.empty[HistoryEntry]
     var driftAt = Set.empty[String]
     var backendErrors = Vector.empty[String]
     var renderErrors = Vector.empty[String]
-    var sqlSuffix = ""
-    var backendName = "recording-backend"
 
     def event(name: String): Unit =
       events += name
@@ -72,8 +70,14 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
                 null
               case other => throw new UnsupportedOperationException(other)
           }
-        case "commit" | "rollback" | "close" | "abort" =>
+        case "commit" =>
           event(name)
+          history ++= pending
+          pending = None
+          null
+        case "rollback" | "close" | "abort" =>
+          event(name)
+          pending = None
           null
         case other => throw new UnsupportedOperationException(other)
     }
@@ -86,162 +90,233 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     }
 
     val backend: TransactionalMigrationBackend = new TransactionalMigrationBackend:
-      def name: String = backendName
-      def validate(request: MigrationRequest): Vector[String] = backendErrors
+      def validate(model: SchemaModel): Vector[String] = backendErrors
       def render(operations: Vector[SchemaOperation]): Either[Vector[String], Vector[String]] =
         if renderErrors.nonEmpty then Left(renderErrors)
         else Right(operations.map {
-          case _: SchemaOperation.CreateTable => "create table" + sqlSuffix
-          case _: SchemaOperation.AddColumn => "add column" + sqlSuffix
-          case _: SchemaOperation.RenameTable => "rename table" + sqlSuffix
-          case _: SchemaOperation.RenameColumn => "rename column" + sqlSuffix
+          case _: SchemaOperation.CreateTable => "create table"
+          case _: SchemaOperation.AddColumn => "add column"
+          case _: SchemaOperation.RenameTable => "rename table"
+          case _: SchemaOperation.RenameColumn => "rename column"
         })
       private def onConnection(actual: Connection, label: String): Unit =
         assert(actual eq connection)
         event(label)
       def acquireLock(actual: Connection, options: ExecutionOptions): Unit = onConnection(actual, "lock")
       def initializeHistory(actual: Connection): Unit = onConnection(actual, "initialize-history")
-      def findHistory(actual: Connection, id: String): Option[HistoryEntry] =
-        onConnection(actual, s"find:$id")
-        found
-      def latestHistory(actual: Connection): Option[HistoryEntry] =
-        onConnection(actual, "latest")
-        latest
+      def readHistory(actual: Connection): Vector[HistoryEntry] =
+        onConnection(actual, "read-history")
+        history
       def lockAndValidate(actual: Connection, expected: SchemaModel): Vector[String] =
-        val label = if expected == previous.model then "previous" else "target"
+        val label = expected.tables.map(_.name.name.value).mkString(",")
         onConnection(actual, s"validate:$label")
         if driftAt.contains(label) then Vector("physical schema drift") else Vector.empty
       def recordHistory(actual: Connection, entry: HistoryEntry): Unit =
         onConnection(actual, "record-history")
-        recorded = Some(entry)
+        pending = Some(entry)
 
-    def migrate(value: MigrationRequest = request, options: ExecutionOptions = ExecutionOptions()): MigrationResult =
-      new JdbcMigrationExecutor(backend, options).migrate(dataSource, value)
+    def migrate(target: SchemaModel, options: ExecutionOptions = ExecutionOptions()): MigrationResult =
+      new JdbcMigrationExecutor(backend, options).migrate(dataSource, target)
 
-    def seedApplied(): Unit =
-      migrate()
-      found = recorded
-      latest = recorded
+    def seed(models: SchemaModel*): Unit =
+      models.foreach(model => migrate(model))
       events.clear()
+      statementNumber = 0
 
-  test("one connection locks, checks history and schemas, executes SQL, records and commits in order") {
+    def refused(target: SchemaModel, options: ExecutionOptions = ExecutionOptions()): MigrationException =
+      val before = history
+      val error = intercept[MigrationException](migrate(target, options))
+      assertEquals(history, before)
+      assert(!events.contains("commit"), events)
+      error
+
+  test("the first start creates the schema from the empty model and stores the model as revision 1") {
     val h = new Harness
-    assertEquals(h.migrate(), MigrationResult("accounts-v1", 1, MigrationStatus.Applied, 2))
+    assertEquals(h.migrate(initial), MigrationResult(1, MigrationStatus.Applied, 1))
     assertEquals(h.events.toVector, Vector(
       "connection", "get-auto-commit", "auto-commit:false", "read-committed", "lock", "initialize-history",
-      "find:accounts-v1", "latest", "validate:previous",
+      "read-history", "validate:", "statement:1", "timeout:1:30", "sql:1:create table", "close-statement:1",
+      "validate:account", "record-history", "commit", "close"
+    ))
+    val entry = h.history.head
+    assertEquals(entry.revision, 1L)
+    assertEquals(entry.previousFingerprint, SchemaFingerprint.of(empty))
+    assertEquals(entry.targetFingerprint, SchemaFingerprint.of(initial))
+    assertEquals(SchemaModelJson.decode(entry.model), Right(initial))
+    assertEquals(entry.statements, Vector("create table"))
+  }
+
+  test("a later start plans against the stored model and records the next revision") {
+    val h = new Harness
+    h.seed(initial)
+    assertEquals(h.migrate(renamed), MigrationResult(2, MigrationStatus.Applied, 2))
+    assertEquals(h.events.toVector, Vector(
+      "connection", "get-auto-commit", "auto-commit:false", "read-committed", "lock", "initialize-history",
+      "read-history", "validate:account",
       "statement:1", "timeout:1:30", "sql:1:rename table", "close-statement:1",
       "statement:2", "timeout:2:30", "sql:2:rename column", "close-statement:2",
-      "validate:target", "record-history", "commit", "close"
+      "validate:accounts", "record-history", "commit", "close"
     ))
-    val entry = h.recorded.get
-    assertEquals(entry.previousFingerprint, SchemaFingerprint.of(previous))
-    assertEquals(entry.targetFingerprint, SchemaFingerprint.of(target))
-    assertEquals(entry.fromRevision, 0L)
-    assertEquals(entry.toRevision, 1L)
-    assert(entry.checksum.matches("[0-9a-f]{64}"))
+    val entry = h.history.last
+    assertEquals(entry.revision, 2L)
+    assertEquals(entry.previousFingerprint, SchemaFingerprint.of(initial))
+    assertEquals(entry.targetFingerprint, SchemaFingerprint.of(renamed))
   }
 
-  test("invalid IDs, formats, revisions and timeouts are rejected before obtaining a connection") {
-    val invalidRequests = Vector(
-      request.copy(id = " "), request.copy(id = "x" * 201), request.copy(id = null),
-      request.copy(previous = previous.copy(formatVersion = 2)),
-      request.copy(target = target.copy(formatVersion = 0)),
-      request.copy(previous = previous.copy(revision = -1)),
-      request.copy(target = target.copy(revision = 0)),
-      request.copy(target = target.copy(revision = 2)),
-      request.copy(previous = previous.copy(revision = Long.MaxValue), target = target.copy(revision = Long.MinValue))
-    )
-    invalidRequests.foreach { invalid =>
-      val h = new Harness
-      assertEquals(intercept[MigrationException](h.migrate(invalid)).state, FailureState.NotStarted)
-      assert(h.events.isEmpty)
-    }
-    Vector(ExecutionOptions(lockTimeoutMillis = 0), ExecutionOptions(statementTimeoutMillis = -1),
-      ExecutionOptions(lockTimeoutMillis = Int.MaxValue), ExecutionOptions(statementTimeoutMillis = Int.MaxValue)
-    ).foreach { options =>
-      val h = new Harness
-      assertEquals(intercept[MigrationException](h.migrate(options = options)).state, FailureState.NotStarted)
-      assert(h.events.isEmpty)
-    }
+  test("an unchanged model validates the database under the lock without DDL or history") {
+    val h = new Harness
+    h.seed(initial)
+    val reordered = SchemaModel(initial.tables.map(t => t.copy(columns = t.columns.reverse)).reverse)
+    assertEquals(h.migrate(reordered), MigrationResult(1, MigrationStatus.AlreadyApplied, 0))
+    assertEquals(h.events.toVector, Vector(
+      "connection", "get-auto-commit", "auto-commit:false", "read-committed", "lock", "initialize-history",
+      "read-history", "validate:account", "commit", "close"
+    ))
+    h.events.clear()
+    h.driftAt = Set("account")
+    assertEquals(h.refused(initial).state, FailureState.RolledBack)
   }
 
-  test("unsupported changes and invalid schemas cannot reach the connection or execute a partial rename") {
-    val unsupported = request.copy(target = target.copy(model = SchemaModel(Vector(
-      target.model.tables.head.copy(columns = Vector(target.model.tables.head.columns.head.copy(dataType = SqlType.Integer)))
-    ))))
-    val invalid = request.copy(target = target.copy(model = SchemaModel(Vector(originalTable, originalTable))))
-    Vector(unsupported, invalid).foreach { value =>
-      val h = new Harness
-      assertEquals(intercept[MigrationException](h.migrate(value)).state, FailureState.NotStarted)
-      assert(h.events.isEmpty)
-    }
+  test("an empty model on a database without history is revision 0 and records nothing") {
+    val h = new Harness
+    assertEquals(h.migrate(empty), MigrationResult(0, MigrationStatus.AlreadyApplied, 0))
+    assert(h.history.isEmpty)
   }
 
-  test("backend validation, render errors and disallowed risks fail before a connection") {
-    val invalid = new Harness
-    invalid.backendErrors = Vector("Unsupported backend feature")
-    assertEquals(intercept[MigrationException](invalid.migrate()).state, FailureState.NotStarted)
-    assert(invalid.events.isEmpty)
+  test("a server that skipped releases applies all changes against the model applied last") {
+    val h = new Harness
+    h.seed(initial)
+    val bio = ColumnModel(SchemaId("account-bio"), SqlIdentifier("bio"), SqlType.Text)
+    val latest = SchemaModel(renamed.tables.map(t => t.copy(columns = t.columns :+ bio)))
+    assertEquals(h.migrate(latest), MigrationResult(2, MigrationStatus.Applied, 3))
+    assert(h.events.containsSlice(Vector("sql:1:rename table", "close-statement:1")))
+    assert(h.events.contains("sql:2:rename column"))
+    assert(h.events.contains("sql:3:add column"))
+  }
+
+  test("a server with an older schema cannot start after a newer migration") {
+    val h = new Harness
+    h.seed(initial, renamed)
+    val error = h.refused(initial)
+    assertEquals(error.state, FailureState.RolledBack)
+    assert(error.getMessage.contains("equals revision 1, but the database is at revision 2"), error.getMessage)
+    assert(!h.events.exists(_.startsWith("validate:")))
+  }
+
+  test("renaming back to an earlier name is refused like an older server") {
+    val h = new Harness
+    h.seed(initial, renamed)
+    val bio = ColumnModel(SchemaId("account-bio"), SqlIdentifier("bio"), SqlType.Text)
+    val reverted = SchemaModel(initial.tables.map(t => t.copy(columns = t.columns :+ bio)))
+    val error = h.refused(reverted)
+    assert(error.getMessage.contains("Renaming table 'account' back to its name from revision 1"), error.getMessage)
+    assert(error.getMessage.contains("Renaming column 'account-name' back to its name from revision 1"), error.getMessage)
+    assert(!h.events.exists(_.startsWith("sql:")))
+  }
+
+  test("unsupported changes, render errors and disallowed risks are refused under the lock before DDL") {
+    val retyped = SchemaModel(Vector(account.copy(columns = Vector(name.copy(dataType = SqlType.Integer)))))
+    val h = new Harness
+    h.seed(initial)
+    assert(h.refused(retyped).getMessage.contains("Changing type"))
+    assert(h.events.containsSlice(Vector("read-history", "rollback", "close")), h.events)
     val render = new Harness
     render.renderErrors = Vector("Cannot render plan")
-    assertEquals(intercept[MigrationException](render.migrate()).state, FailureState.NotStarted)
-    assert(render.events.isEmpty)
+    assert(render.refused(initial).getMessage.contains("Cannot render plan"))
     val risk = new Harness
-    assertEquals(intercept[MigrationException](risk.migrate(options = ExecutionOptions(allowedRisks = Set(RiskLevel.Safe)))).state,
-      FailureState.NotStarted)
-    assert(risk.events.isEmpty)
+    assert(risk.refused(initial, ExecutionOptions(allowedRisks = Set(RiskLevel.Safe))).getMessage.contains("risks"))
+    Vector(h, render, risk).foreach { harness =>
+      assert(!harness.events.exists(event => event.startsWith("sql:") || event.startsWith("validate:")))
+    }
+  }
+
+  test("invalid targets, backend validation errors and invalid timeouts fail before a connection") {
+    val invalid = new Harness
+    assertEquals(invalid.refused(SchemaModel(Vector(account, account))).state, FailureState.NotStarted)
+    val backend = new Harness
+    backend.backendErrors = Vector("Unsupported backend feature")
+    assert(backend.refused(initial).getMessage.contains("Target schema: Unsupported backend feature"))
+    val harnesses = Vector(invalid, backend) ++ Vector(ExecutionOptions(lockTimeoutMillis = 0),
+      ExecutionOptions(statementTimeoutMillis = -1), ExecutionOptions(lockTimeoutMillis = Int.MaxValue),
+      ExecutionOptions(statementTimeoutMillis = Int.MaxValue)
+    ).map { options =>
+      val h = new Harness
+      assertEquals(h.refused(initial, options).state, FailureState.NotStarted)
+      h
+    }
+    harnesses.foreach(h => assert(h.events.isEmpty))
+  }
+
+  test("an inconsistent history is refused before planning") {
+    def entry(revision: Long, previous: SchemaModel, target: SchemaModel) = HistoryEntry(revision,
+      SchemaFingerprint.of(previous), SchemaFingerprint.of(target), SchemaModelJson.encode(target), Vector.empty)
+    val valid = Vector(entry(1, empty, initial), entry(2, initial, renamed))
+    Vector(
+      "expected revision 2" -> Vector(valid(0), valid(1).copy(revision = 3)),
+      "expected revision 1" -> Vector(valid(1)),
+      "previous fingerprint" -> Vector(valid(0), valid(1).copy(previousFingerprint = SchemaFingerprint.of(empty))),
+      "does not match its fingerprint" -> Vector(valid(0), valid(1).copy(model = SchemaModelJson.encode(initial))),
+      "unreadable" -> Vector(valid(0), valid(1).copy(model = "{}"))
+    ).foreach { (reason, history) =>
+      val h = new Harness
+      h.history = history
+      val error = h.refused(renamed)
+      assert(error.getMessage.contains("Schema history is inconsistent"), error.getMessage)
+      assert(error.getMessage.contains(reason), error.getMessage)
+      assert(!h.events.exists(_.startsWith("validate:")))
+    }
   }
 
   test("a connection already in a transaction is rejected without commit or rollback") {
     val h = new Harness
     h.freshAutoCommit = false
-    assertEquals(intercept[MigrationException](h.migrate()).state, FailureState.NotStarted)
+    assertEquals(h.refused(initial).state, FailureState.NotStarted)
     assertEquals(h.events.toVector, Vector("connection", "get-auto-commit", "close"))
   }
 
   test("connection acquisition failures are NotStarted") {
     val h = new Harness
     h.failAt = Set("connection")
-    assertEquals(intercept[MigrationException](h.migrate()).state, FailureState.NotStarted)
+    assertEquals(h.refused(initial).state, FailureState.NotStarted)
     assertEquals(h.events.toVector, Vector("connection"))
   }
 
   test("statement, postcheck and history failures roll back and never commit") {
-    Vector("sql:2:rename column", "validate:target", "record-history", "close-statement:1", "lock").foreach { stage =>
-      val h = new Harness
-      h.failAt = Set(stage)
-      val error = intercept[MigrationException](h.migrate())
-      assertEquals(error.state, FailureState.RolledBack)
-      assert(h.events.contains("rollback"))
-      assert(!h.events.contains("commit"))
-      assertEquals(h.events.last, "close")
-      assert(!h.events.contains("auto-commit:true"))
-    }
+    Vector("sql:2:rename column", "validate:accounts", "record-history", "close-statement:1", "lock", "read-history")
+      .foreach { stage =>
+        val h = new Harness
+        h.seed(initial)
+        h.failAt = Set(stage)
+        val error = h.refused(renamed)
+        assertEquals(error.state, FailureState.RolledBack)
+        assert(h.events.contains("rollback"))
+        assertEquals(h.events.last, "close")
+        assert(!h.events.contains("auto-commit:true"))
+      }
   }
 
   test("drift before DDL and after DDL both roll back") {
-    Vector("previous", "target").foreach { stage =>
+    Vector("account", "accounts").foreach { stage =>
       val h = new Harness
+      h.seed(initial)
       h.driftAt = Set(stage)
-      assertEquals(intercept[MigrationException](h.migrate()).state, FailureState.RolledBack)
+      assertEquals(h.refused(renamed).state, FailureState.RolledBack)
       assert(!h.events.contains("record-history"))
-      assert(!h.events.contains("commit"))
-      if stage == "previous" then assert(!h.events.exists(_.startsWith("sql:")))
+      if stage == "account" then assert(!h.events.exists(_.startsWith("sql:")))
     }
   }
 
   test("commit failure remains OutcomeUnknown even if rollback succeeds") {
     val h = new Harness
     h.failAt = Set("commit")
-    assertEquals(intercept[MigrationException](h.migrate()).state, FailureState.OutcomeUnknown)
+    assertEquals(intercept[MigrationException](h.migrate(initial)).state, FailureState.OutcomeUnknown)
     assertEquals(h.events.takeRight(3).toVector, Vector("commit", "rollback", "close"))
   }
 
   test("rollback failure aborts the connection and never resets auto-commit") {
     val h = new Harness
-    h.failAt = Set("validate:previous", "rollback")
-    val error = intercept[MigrationException](h.migrate())
+    h.failAt = Set("validate:", "rollback")
+    val error = h.refused(initial)
     assertEquals(error.state, FailureState.OutcomeUnknown)
     assertEquals(error.getCause.getSuppressed.map(_.getMessage).toVector, Vector("Failure at rollback"))
     assertEquals(h.events.takeRight(3).toVector, Vector("rollback", "abort", "close"))
@@ -250,111 +325,18 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
 
   test("close failure cannot mask a migration failure or turn a known commit into uncertainty") {
     val failed = new Harness
-    failed.failAt = Set("validate:previous", "close")
-    val error = intercept[MigrationException](failed.migrate())
+    failed.failAt = Set("validate:", "close")
+    val error = failed.refused(initial)
     assertEquals(error.state, FailureState.RolledBack)
-    assert(error.getMessage.contains("validate:previous"))
+    assert(error.getMessage.contains("validate:"))
     assertEquals(error.getSuppressed.map(_.getMessage).toVector, Vector("Failure at close"))
     val applied = new Harness
     applied.failAt = Set("close")
-    assertEquals(applied.migrate().status, MigrationStatus.Applied)
-  }
-
-  test("already applied validates target drift under the lock without repeating DDL") {
-    val h = new Harness
-    h.seedApplied()
-    assertEquals(h.migrate(), MigrationResult("accounts-v1", 1, MigrationStatus.AlreadyApplied, 0))
-    assertEquals(h.events.toVector, Vector(
-      "connection", "get-auto-commit", "auto-commit:false", "read-committed", "lock", "initialize-history",
-      "find:accounts-v1", "latest", "validate:target", "commit", "close"
-    ))
-    h.events.clear()
-    h.driftAt = Set("target")
-    assertEquals(intercept[MigrationException](h.migrate()).state, FailureState.RolledBack)
-    assert(!h.events.contains("commit"))
-  }
-
-  test("reusing an ID with a changed SQL plan, backend or snapshot is rejected") {
-    Vector("sql", "backend", "snapshot").foreach { change =>
-      val h = new Harness
-      h.seedApplied()
-      var next = request
-      change match
-        case "sql" => h.sqlSuffix = ";"
-        case "backend" => h.backendName = "different-backend"
-        case "snapshot" =>
-          def changed(snapshot: SchemaSnapshot): SchemaSnapshot = snapshot.copy(model = SchemaModel(
-            snapshot.model.tables.map(t => t.copy(columns = t.columns.map(_.copy(nullable = false))))
-          ))
-          next = request.copy(previous = changed(previous), target = changed(target))
-        case _ => ()
-      val error = intercept[MigrationException](h.migrate(next))
-      assert(error.getMessage.contains("different plan"))
-      assertEquals(error.state, FailureState.RolledBack)
-      assert(!h.events.exists(_.startsWith("sql:")))
-    }
-  }
-
-  test("plan checksums bind the migration ID") {
-    val first = new Harness
-    val second = new Harness
-    first.migrate()
-    second.migrate(request.copy(id = "another-id"))
-    assertNotEquals(first.recorded.get.checksum, second.recorded.get.checksum)
-  }
-
-  test("an earlier applied migration cannot start a stale server after a later revision") {
-    val h = new Harness
-    h.seedApplied()
-    h.latest = h.latest.map(_.copy(id = "later", toRevision = 2, targetFingerprint = "later-fingerprint"))
-    val error = intercept[MigrationException](h.migrate())
-    assert(error.getMessage.contains("stale server"))
-    assert(!h.events.exists(_.startsWith("validate:")))
-    assert(!h.events.contains("commit"))
-  }
-
-  test("first migration requires revision zero and later migrations require exact predecessor fingerprint") {
-    val fresh = new Harness
-    assert(intercept[MigrationException](fresh.migrate(request.copy(
-      previous = previous.copy(revision = 1), target = target.copy(revision = 2)
-    ))).getMessage.contains("revision 0"))
-    assert(!fresh.events.exists(_.startsWith("sql:")))
-    Vector("revision", "fingerprint").foreach { change =>
-      val h = new Harness
-      h.seedApplied()
-      h.found = None
-      val earlier = request.copy(id = "different-id")
-      val next = request.copy(id = "next-id", previous = target,
-        target = target.copy(revision = 2, model = previous.model))
-      if change == "fingerprint" then h.latest = h.latest.map(_.copy(targetFingerprint = "wrong"))
-      val error = intercept[MigrationException](h.migrate(if change == "revision" then earlier else next))
-      assert(error.getMessage.contains("Previous snapshot"))
-      assert(!h.events.exists(_.startsWith("sql:")))
-    }
-  }
-
-  test("a matching predecessor permits the next revision") {
-    val h = new Harness
-    h.seedApplied()
-    h.found = None
-    val next = MigrationRequest("accounts-v2", target, target.copy(revision = 2, model = previous.model))
-    assertEquals(h.migrate(next).status, MigrationStatus.Applied)
-    assertEquals(h.recorded.get.fromRevision, 1L)
-    assertEquals(h.recorded.get.toRevision, 2L)
-    assertEquals(h.recorded.get.previousFingerprint, SchemaFingerprint.of(target))
+    assertEquals(applied.migrate(initial).status, MigrationStatus.Applied)
   }
 
   test("JDBC query timeout rounds up to a positive second") {
     val h = new Harness
-    h.migrate(options = ExecutionOptions(statementTimeoutMillis = 1))
+    h.migrate(initial, ExecutionOptions(statementTimeoutMillis = 1))
     assert(h.events.contains("timeout:1:1"))
-  }
-
-  test("a no-op revision checks both snapshots and records history without creating SQL statements") {
-    val h = new Harness
-    val unchanged = request.copy(target = previous.copy(revision = 1))
-    assertEquals(h.migrate(unchanged).statementCount, 0)
-    assert(!h.events.exists(_.startsWith("statement:")))
-    assert(h.events.contains("record-history"))
-    assert(h.events.contains("commit"))
   }

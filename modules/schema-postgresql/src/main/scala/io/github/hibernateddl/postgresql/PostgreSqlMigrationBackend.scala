@@ -6,7 +6,7 @@ import io.github.hibernateddl.executor.*
 import java.sql.{Connection, PreparedStatement, ResultSet, SQLException}
 import scala.util.Using
 
-/** Transactional rename execution for PostgreSQL 14 and newer.
+/** Transactional migration for PostgreSQL 14 and newer.
   *
   * The initial execution envelope is deliberately narrow: explicitly qualified,
   * permanent ordinary tables containing only the modeled native types,
@@ -17,24 +17,23 @@ import scala.util.Using
   * outside the supplied model are allowed. Every modeled table is exclusively
   * locked before catalog inspection; callers must retain this transaction until
   * the migration and its history entry have both committed.
+  *
+  * The history table stores every applied model as jsonb, together with the executed
+  * statements. A history table with another column layout was created by another version
+  * and is refused, never altered.
   */
 object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
-  override val name: String = "postgresql-rename-v1"
-
   private val HistorySchema = "__hibernate_ddl"
   private val HistoryTable = "\"__hibernate_ddl\".\"schema_history\""
-  // One transaction lock per database, independent of migration ID or schema.
+  // One transaction lock per database, independent of the migrated schemas.
   private val AdvisoryLockKey = 0x4844444c4d475231L
-  private val HistoryColumns =
-    "migration_id, checksum, from_revision, to_revision, previous_fingerprint, target_fingerprint"
+  private val HistoryColumns = Vector("revision", "previous_fingerprint", "target_fingerprint", "model", "statements")
 
   override def render(
       operations: Vector[SchemaOperation]
   ): Either[Vector[String], Vector[String]] = PostgreSqlDialect.render(operations)
 
-  override def validate(request: MigrationRequest): Vector[String] =
-    validateModel(request.previous.model).map("Previous schema: " + _) ++
-      validateModel(request.target.model).map("Target schema: " + _)
+  override def validate(model: SchemaModel): Vector[String] = validateModel(model)
 
   override def acquireLock(connection: Connection, options: ExecutionOptions): Unit =
     if connection.getAutoCommit then
@@ -72,38 +71,51 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
     execute(connection, "CREATE SCHEMA IF NOT EXISTS \"__hibernate_ddl\"")
     execute(connection,
       s"""CREATE TABLE IF NOT EXISTS $HistoryTable (
-         |  migration_id VARCHAR(200) PRIMARY KEY,
-         |  checksum CHAR(64) NOT NULL,
-         |  from_revision BIGINT NOT NULL,
-         |  to_revision BIGINT NOT NULL UNIQUE,
+         |  revision BIGINT PRIMARY KEY CHECK (revision > 0),
          |  previous_fingerprint CHAR(64) NOT NULL,
          |  target_fingerprint CHAR(64) NOT NULL,
+         |  model JSONB NOT NULL,
+         |  statements TEXT[] NOT NULL,
          |  applied_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT pg_catalog.clock_timestamp()
          |)""".stripMargin
     )
+    val columns = query(connection,
+      """SELECT a.attname
+        |FROM pg_catalog.pg_attribute a
+        |WHERE a.attrelid = pg_catalog.to_regclass(?) AND a.attnum > 0 AND NOT a.attisdropped
+        |ORDER BY a.attnum""".stripMargin
+    )(_.setString(1, HistoryTable))(_.getString("attname"))
+    val expected = HistoryColumns :+ "applied_at"
+    if columns != expected then
+      throw new SQLException(s"History table $HistoryTable has the columns ${columns.mkString(", ")}; " +
+        s"expected ${expected.mkString(", ")}. It was created by another version of Hibernate DDL Manager.")
 
-  override def findHistory(connection: Connection, id: String): Option[HistoryEntry] =
-    query(connection, s"SELECT $HistoryColumns FROM $HistoryTable WHERE migration_id = ?")(
-      _.setString(1, id)
-    )(readHistory).headOption
-
-  override def latestHistory(connection: Connection): Option[HistoryEntry] =
-    query(connection, s"SELECT $HistoryColumns FROM $HistoryTable ORDER BY to_revision DESC LIMIT 1")(
-      _ => ()
-    )(readHistory).headOption
+  override def readHistory(connection: Connection): Vector[HistoryEntry] =
+    query(connection,
+      s"SELECT revision, previous_fingerprint, target_fingerprint, CAST(model AS pg_catalog.text) AS model, statements " +
+        s"FROM $HistoryTable ORDER BY revision"
+    )(_ => ()) { row =>
+      val statements = row.getArray("statements")
+      try HistoryEntry(row.getLong("revision"), row.getString("previous_fingerprint"),
+        row.getString("target_fingerprint"), row.getString("model"),
+        statements.getArray.asInstanceOf[Array[String]].toVector)
+      finally statements.free()
+    }
 
   override def recordHistory(connection: Connection, entry: HistoryEntry): Unit =
     Using.resource(connection.prepareStatement(
-      s"INSERT INTO $HistoryTable ($HistoryColumns) VALUES (?, ?, ?, ?, ?, ?)"
+      s"INSERT INTO $HistoryTable (${HistoryColumns.mkString(", ")}) VALUES (?, ?, ?, CAST(? AS pg_catalog.jsonb), ?)"
     )) { statement =>
-      statement.setString(1, entry.id)
-      statement.setString(2, entry.checksum)
-      statement.setLong(3, entry.fromRevision)
-      statement.setLong(4, entry.toRevision)
-      statement.setString(5, entry.previousFingerprint)
-      statement.setString(6, entry.targetFingerprint)
-      if statement.executeUpdate() != 1 then
-        throw new SQLException("Recording the migration did not insert exactly one history entry.")
+      val statements = connection.createArrayOf("text", entry.statements.toArray[AnyRef])
+      try
+        statement.setLong(1, entry.revision)
+        statement.setString(2, entry.previousFingerprint)
+        statement.setString(3, entry.targetFingerprint)
+        statement.setString(4, entry.model)
+        statement.setArray(5, statements)
+        if statement.executeUpdate() != 1 then
+          throw new SQLException("Recording the migration did not insert exactly one history entry.")
+      finally statements.free()
     }
 
   override def lockAndValidate(connection: Connection, expected: SchemaModel): Vector[String] =
@@ -126,6 +138,9 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
         }
     }
     val identifierErrors = PostgreSqlDialect.render(identifiers).left.toOption.toVector.flatten
+    // The history stores models as jsonb, which cannot hold NUL.
+    val idErrors = model.tables.flatMap(table => table.id +: table.columns.map(_.id))
+      .filter(_.value.contains('\u0000')).map(id => s"Stable ID '${id.value.replace('\u0000', '?')}' must not contain NUL.")
     val namespaceErrors = model.tables.flatMap { table =>
       Vector(
         Option.when(table.name.schema.isEmpty)(
@@ -136,7 +151,7 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
         )
       ).flatten
     }
-    (SchemaValidation.validate(model) ++ identifierErrors ++ namespaceErrors).distinct.sorted
+    (SchemaValidation.validate(model) ++ identifierErrors ++ idErrors ++ namespaceErrors).distinct.sorted
 
   private def inspectTable(connection: Connection, expected: TableModel): Vector[String] =
     val display = qualified(expected.name)
@@ -266,11 +281,6 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
         |WHERE i.indrelid = CAST(? AS pg_catalog.oid) AND i.indisprimary
         |ORDER BY k.position""".stripMargin
     )(_.setLong(1, oid))(_.getString("attname"))
-
-  private def readHistory(row: ResultSet): HistoryEntry =
-    HistoryEntry(row.getString("migration_id"), row.getString("checksum"),
-      row.getLong("from_revision"), row.getLong("to_revision"),
-      row.getString("previous_fingerprint"), row.getString("target_fingerprint"))
 
   private def query[A](connection: Connection, sql: String)(bind: PreparedStatement => Unit)(
       read: ResultSet => A

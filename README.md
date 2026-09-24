@@ -82,23 +82,30 @@ Vorschlag.
 ## Datenbank beim Serverstart migrieren
 
 ```scala
+val target = HibernateSchemaSource.read(metadata) match
+  case Right(model) => model
+  case Left(errors) => throw IllegalStateException(errors.mkString("\n"))
+
 val executor = JdbcMigrationExecutor(
   PostgreSqlMigrationBackend,
   ExecutionOptions(lockTimeoutMillis = 5000, statementTimeoutMillis = 30000)
 )
-executor.migrate(dataSource, MigrationRequest("002-customer-alias", previous, target))
+executor.migrate(dataSource, target)
 ```
 
 `migrate` arbeitet synchron. Bei `Applied` oder `AlreadyApplied` darf der Server
 fortfahren; eine `MigrationException` muss den Start abbrechen. Der Executor braucht eine
 DataSource ohne JTA-Einbindung, und `hibernate.hbm2ddl.auto` darf nicht `update` sein.
 
-Vorgänger- und Zielmodell werden heute als `SchemaSnapshot` mit fortlaufenden Revisionen
-übergeben; der erste Vorgänger hat Revision `0`. Unter einem transaktionalen Advisory-Lock
-prüft der Executor die Datenbank gegen den Vorgänger, führt die DDL aus, prüft das Ziel und
-schreibt die History in `__hibernate_ddl.schema_history`, alles in einer Transaktion.
-Drift, abweichende Pläne und ein älterer Server nach einer neueren Migration blockieren
-den Start.
+Migrations-IDs, eingecheckte Snapshots und von Hand gepflegte Revisionen gibt es nicht. Jede
+Migration speichert ihr Zielmodell als JSON in `__hibernate_ddl.schema_history`, und der nächste Start plant gegen
+dieses Modell. Ohne History ist der Vorgänger das leere Modell, und alle Tabellen werden
+angelegt. Weil die IDs über alle Versionen stabil sind, darf ein Server Releases überspringen.
+
+Unter einem transaktionalen Advisory-Lock prüft der Executor die History, plant die
+Änderungen, prüft die Datenbank gegen das gespeicherte Modell, führt die DDL aus, prüft das
+Ziel und schreibt die neue Revision, alles in einer Transaktion. Drift, eine inkonsistente
+History und ein älterer Server nach einer neueren Migration blockieren den Start.
 
 ## Module
 
@@ -106,7 +113,7 @@ den Start.
 | --- | --- |
 | `schemaCore` | Modell, Validierung, Diff, Operationen |
 | `schemaHibernate` | `@SchemaId` und `HibernateSchemaSource` |
-| `schemaExecutor` | Transaktion, Planprüfung, History-Abgleich |
+| `schemaExecutor` | Transaktion, Planung gegen das gespeicherte Modell, History |
 | `schemaPostgresql` | SQL, Katalogprüfung, Sperren und History für PostgreSQL |
 | `schemaCli` | Demo |
 
