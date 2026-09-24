@@ -39,6 +39,33 @@ sbt "schemaCli/run demo"
 **2.2.2** eine temporäre lokale Datenbank; Zugangsdaten sind nicht nötig. Die Demo zeigt
 einen Spalten-Rename über eine stabile ID und das zugehörige SQL, ohne Datenbankverbindung.
 
+### In der Cloud
+
+PostgreSQL verweigert den Start als root, deshalb läuft `embedded-postgres` in
+Cloud-Containern meist nicht. Dort nutzen die Tests einen per apt installierten Server.
+Setup-Skript der Umgebung:
+
+```sh
+apt-get update
+command -v java || apt-get install -y openjdk-21-jdk-headless
+apt-get install -y postgresql
+curl -fsSL https://github.com/sbt/sbt/releases/download/v1.12.15/sbt-1.12.15.tgz | tar xz -C /opt
+ln -sf /opt/sbt/bin/sbt /usr/local/bin/sbt
+service postgresql start
+su postgres -c "psql -c \"ALTER USER postgres PASSWORD 'postgres'\""
+```
+
+Umgebungsvariable:
+
+```sh
+HIBERNATE_DDL_TEST_POSTGRES=jdbc:postgresql://127.0.0.1:5432/postgres?user=postgres&password=postgres
+```
+
+Ist sie gesetzt, verwenden die Tests diesen Server statt `embedded-postgres`. Jeder Test legt
+eine eigene temporäre Datenbank an und löscht sie danach wieder. Der Server braucht
+PostgreSQL 14 oder neuer. Läuft er in einer neuen Session nicht, genügt
+`service postgresql start`.
+
 ## Hibernate-Modell lesen
 
 ```scala
