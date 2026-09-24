@@ -158,6 +158,19 @@ class PostgreSqlDialectSuite extends munit.FunSuite:
     assert(PostgreSqlDialect.render(Vector(CreateTable(table.copy(uniqueKeys = Vector(UniqueKeyModel(Vector(SchemaId("x")))))))).isLeft)
   }
 
+  test("indexes render as unnamed CREATE INDEX with directions and new tables must not carry them") {
+    val index = CreateIndex(tableId, name("orders", Some("public")), Vector(
+      IndexedColumn(SqlIdentifier("placed_at"), descending = true), IndexedColumn(SqlIdentifier("id"), descending = false)))
+    assertEquals(
+      PostgreSqlDialect.render(Vector(index)),
+      Right(Vector("CREATE INDEX ON \"public\".\"orders\" (\"placed_at\" DESC, \"id\");"))
+    )
+    assert(PostgreSqlDialect.render(Vector(index.copy(columns = Vector.empty))).isLeft)
+    val id = ColumnModel(SchemaId("id"), SqlIdentifier("id"), SqlType.BigInt, nullable = false)
+    val table = TableModel(tableId, name("orders"), Vector(id), Vector(id.id), indexes = Vector(IndexModel(Vector(IndexColumn(id.id)))))
+    assert(PostgreSqlDialect.render(Vector(CreateTable(table))).swap.toOption.get.exists(_.contains("indexes must be separate")))
+  }
+
   test("an empty plan renders to an empty statement vector") {
     assertEquals(PostgreSqlDialect.render(Vector.empty), Right(Vector.empty))
   }

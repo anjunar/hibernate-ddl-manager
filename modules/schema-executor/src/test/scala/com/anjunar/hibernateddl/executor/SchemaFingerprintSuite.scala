@@ -56,6 +56,27 @@ class SchemaFingerprintSuite extends munit.FunSuite:
     assertEquals(SchemaFingerprint.of(model), "21ad02d6ea5bab3bdc4eac7924a109696d92ef1fc741f5070e04d581e5d18aa4")
   }
 
+  test("models with unique keys but without indexes keep the fingerprints that earlier versions stored") {
+    val table = keyed.tables.head
+    val parent = ColumnModel(SchemaId("t/parent"), SqlIdentifier("parent"), SqlType.Uuid)
+    val model = SchemaModel(Vector(table.copy(columns = Vector(table.columns.head, parent),
+      foreignKeys = Vector(ForeignKeyModel(Vector(parent.id), table.id, table.primaryKey)),
+      uniqueKeys = Vector(UniqueKeyModel(Vector(parent.id))))))
+    assertEquals(SchemaFingerprint.of(model), "1f76c2babda21275093a280117c171471900dd4fb6ab259d7fc1b655119b951e")
+  }
+
+  test("indexes and their directions change the fingerprint, but their order does not") {
+    val table = keyed.tables.head
+    val indexes = table.columns.drop(1).map(column => IndexModel(Vector(IndexColumn(column.id))))
+    val fingerprint = SchemaFingerprint.of(SchemaModel(Vector(table.copy(indexes = indexes))))
+    assertNotEquals(fingerprint, SchemaFingerprint.of(keyed))
+    assertEquals(SchemaFingerprint.of(SchemaModel(Vector(table.copy(indexes = indexes.reverse)))), fingerprint)
+    val descending = indexes.map(index => index.copy(columns = index.columns.map(_.copy(descending = true))))
+    assertNotEquals(SchemaFingerprint.of(SchemaModel(Vector(table.copy(indexes = descending)))), fingerprint)
+    val asUniqueKeys = table.columns.drop(1).map(column => UniqueKeyModel(Vector(column.id)))
+    assertNotEquals(SchemaFingerprint.of(SchemaModel(Vector(table.copy(uniqueKeys = asUniqueKeys)))), fingerprint)
+  }
+
   test("unique keys change the fingerprint, but their order does not") {
     val table = keyed.tables.head
     val keys = table.columns.drop(1).map(column => UniqueKeyModel(Vector(column.id)))

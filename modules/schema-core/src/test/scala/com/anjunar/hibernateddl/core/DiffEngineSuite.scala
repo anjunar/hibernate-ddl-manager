@@ -208,6 +208,27 @@ class DiffEngineSuite extends munit.FunSuite:
     assert(errors(DiffEngine.diff(before, dropped)).exists(_.contains("Dropping unique key (customer-code, customer-name)")))
   }
 
+  test("indexes are created after their table or added to an existing one; dropping or changing them is refused") {
+    val code = column("customer-code", "code")
+    val nameIndex = IndexModel(Vector(IndexColumn(customer.columns.head.id)))
+    val codeIndex = IndexModel(Vector(IndexColumn(code.id, descending = true), IndexColumn(customer.columns.head.id)))
+    val indexed = customer.copy(columns = customer.columns :+ code, indexes = Vector(codeIndex, nameIndex))
+    val tag = table("tag", "tag", column("tag-name", "name")).copy(indexes = Vector(IndexModel(Vector(IndexColumn(SchemaId("tag-name"))))))
+    assertEquals(DiffEngine.diff(initial, SchemaModel(Vector(indexed, tag))), Right(Vector(
+      SchemaOperation.AddColumn(customer.id, customer.name, code),
+      SchemaOperation.CreateIndex(customer.id, customer.name, Vector(
+        SchemaOperation.IndexedColumn(SqlIdentifier("code"), descending = true),
+        SchemaOperation.IndexedColumn(SqlIdentifier("name"), descending = false))),
+      SchemaOperation.CreateIndex(customer.id, customer.name, Vector(SchemaOperation.IndexedColumn(SqlIdentifier("name"), false))),
+      SchemaOperation.CreateTable(tag.copy(indexes = Vector.empty)),
+      SchemaOperation.CreateIndex(tag.id, tag.name, Vector(SchemaOperation.IndexedColumn(SqlIdentifier("name"), false)))
+    )))
+    val before = SchemaModel(Vector(indexed))
+    val flipped = SchemaModel(Vector(indexed.copy(indexes = Vector(codeIndex, IndexModel(Vector(IndexColumn(customer.columns.head.id, true)))))))
+    val diagnostics = errors(DiffEngine.diff(before, flipped))
+    assert(diagnostics.exists(_.contains("Dropping index (customer-name) from table 'customer'")), diagnostics)
+  }
+
   test("renames expose their locking risk") {
     val renamed = customer.name.copy(name = SqlIdentifier("renamed"))
     assertEquals(SchemaOperation.RenameTable(customer.id, customer.name, renamed).risk, RiskLevel.Locking)
