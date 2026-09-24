@@ -135,7 +135,6 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
         def columnId(o: Owned) = SchemaId((entityId.getOrElse(Unknown) +: o.path).mkString("/"))
 
         Vector(
-          Option.when(!table.getUniqueKeys.isEmpty)("unique constraints"),
           Option.when(!table.getIndexes.isEmpty)("indexes"),
           Option.when(!table.getChecks.isEmpty)("check constraints")
         ).flatten.foreach(feature => errors += s"Entity $label has $feature; unsupported")
@@ -149,8 +148,20 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
         }
         val primaryKey = Option(table.getPrimaryKey).toVector
           .flatMap(_.getColumns.asScala).flatMap(byColumn.get).map(columnId)
+        // @UniqueConstraint and @NaturalId become unique keys; @Column(unique) and @OneToOne only mark the column.
+        val uniqueKeys = table.getUniqueKeys.asScala.values.toVector.flatMap { key =>
+          val ordered = key.getColumnOrderMap.asScala.values.forall(order => order == null || order.isBlank ||
+            order.trim.equalsIgnoreCase("asc"))
+          if !ordered then errors += s"Unique key ${key.getName} of entity $label orders its columns; unsupported"
+          Option.when(ordered)(key.getColumns.asScala.toVector)
+        } ++ table.getColumns.asScala.toVector.filter(_.isUnique).map(Vector(_))
+        val uniqueKeyModels = uniqueKeys.distinct.flatMap { columns =>
+          val ids = columns.flatMap(byColumn.get).map(columnId)
+          Option.when(ids.size == columns.size)(UniqueKeyModel(ids))
+        }
         entityId.map { id =>
-          Mapped(label, table, TableModel(SchemaId(id), qualifiedName(table), columnModels, primaryKey),
+          Mapped(label, table, TableModel(SchemaId(id), qualifiedName(table), columnModels, primaryKey,
+            uniqueKeys = uniqueKeyModels),
             byColumn.view.mapValues(columnId).toMap)
         }
 
@@ -177,8 +188,7 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
         Option.when(column.getGeneratedAs != null)("a generation expression"),
         Option.when(column.isIdentity)("identity generation"),
         Option.when(column.getCollation != null)("a custom collation"),
-        Option.when(column.hasCheckConstraint)("a check constraint"),
-        Option.when(column.isUnique)("a unique constraint")
+        Option.when(column.hasCheckConstraint)("a check constraint")
       ).flatten.foreach(feature => errors += s"$label has $feature; unsupported")
       val sqlType = column.getSqlType(metadata)
       val dataType = sqlType.trim.toLowerCase(Locale.ROOT) match

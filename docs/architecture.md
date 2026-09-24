@@ -50,6 +50,7 @@ class Customer:
 - An association's join column takes the association property's ID. Its foreign key refers
   to the referenced table's ID and primary-key column IDs, so renames on either side keep
   it intact. Constraint names are not part of the model; PostgreSQL chooses them.
+- A unique key lists column IDs in key order and likewise survives renames.
 - If an ID is missing or has the wrong format, the adapter reports an error with a freshly
   generated suggestion, e.g. `add e.g. @SchemaId("9c1d07aa")`.
 
@@ -72,7 +73,7 @@ there:
 | --- | --- |
 | `revision` | 1, 2, 3, … without gaps; assigned by the executor |
 | `previous_fingerprint`, `target_fingerprint` | SHA-256 of the previous and the target model |
-| `model` | Target model as JSON (`jsonb`), format version 2 |
+| `model` | Target model as JSON (`jsonb`), format version 3 |
 | `statements` | Executed DDL |
 | `applied_at` | Time of application |
 
@@ -90,9 +91,9 @@ there:
   previous fingerprint equal to the target fingerprint of the row before, every stored
   model readable and matching its fingerprint. A modified history blocks the startup.
 - The JSON format is versioned and read strictly: an unknown format version, unknown fields
-  or unknown types are errors. Format 2 added foreign keys; models stored in format 1 are
-  still read, and models without foreign keys keep their fingerprints. A history table with other columns comes from another
-  version and is refused, never altered.
+  or unknown types are errors. Format 2 added foreign keys and format 3 unique keys; models
+  stored in earlier formats are still read and keep their fingerprints. A history table with
+  other columns comes from another version and is refused, never altered.
 
 ## Modules
 
@@ -110,21 +111,20 @@ Everything outside this scope is rejected, never silently ignored.
 
 | Area | Supported | Reported and rejected |
 | --- | --- | --- |
-| Model | Tables, columns `varchar(n)`, `integer`, `bigint`, `boolean`, `text`, `uuid`, `timestamp(p)`, `timestamp(p) with time zone`, nullability, primary keys, foreign keys to a primary key | All other types and objects |
-| Adapter | Entities without inheritance or secondary tables, simple properties, embeddables, generated `UUID` keys, `LocalDateTime`, `Instant`, `OffsetDateTime` and `@Column(secondPrecision)`, `@ManyToOne` with or without a constraint | `ON DELETE` actions, associations to non-primary-key or multi-column keys, collection and join tables, unique keys, indexes, checks, defaults, identity columns, sequences, columns without an ID origin |
-| Diff | New tables, new nullable columns, new foreign keys (added after all tables, so cycles work), table and column renames | Drops, type/nullability/primary key/foreign key changes, schema moves, rename collisions and swaps |
+| Model | Tables, columns `varchar(n)`, `integer`, `bigint`, `boolean`, `text`, `uuid`, `timestamp(p)`, `timestamp(p) with time zone`, nullability, primary keys, unique keys, foreign keys to a primary key | All other types and objects |
+| Adapter | Entities without inheritance or secondary tables, simple properties, embeddables, generated `UUID` keys, `LocalDateTime`, `Instant`, `OffsetDateTime` and `@Column(secondPrecision)`, `@ManyToOne` with or without a constraint, `@OneToOne`, `@Column(unique)`, `@UniqueConstraint`, `@NaturalId` | `ON DELETE` actions, associations to non-primary-key or multi-column keys, ordered unique keys, collection and join tables, indexes, checks, defaults, identity columns, sequences, columns without an ID origin |
+| Diff | New tables, new nullable columns, new unique keys, new foreign keys (added after all tables, so cycles work), table and column renames | Drops (including unique and foreign keys), type/nullability/primary key/foreign key changes, schema moves, rename collisions and swaps |
 | History | Stored model per revision, skipped releases | Target model of an earlier revision, rename back to an earlier name, modified history, tables without history (no adoption of existing databases) |
-| PostgreSQL | Ordinary permanent tables with exactly these columns, a non-deferrable primary key and plain foreign keys, matched by structure | Other constraints and indexes, foreign keys with actions, `MATCH FULL` or deferrable checking, foreign keys from unmodeled tables, triggers, rules, RLS, inheritance, partitions, custom collations |
+| PostgreSQL | Ordinary permanent tables with exactly these columns, a non-deferrable primary key, plain unique constraints and plain foreign keys, matched by structure | Other constraints and indexes (a unique index is not a unique constraint), deferrable, `INCLUDE` or `NULLS NOT DISTINCT` unique keys, foreign keys with actions, `MATCH FULL` or deferrable checking, foreign keys from unmodeled tables, triggers, rules, RLS, inheritance, partitions, custom collations |
 
 Tables that exist only in the database are left untouched.
 
 ## Open points
 
-1. **Model coverage for real entities.** `UUID` keys, timestamps and `@ManyToOne` work.
-   Next: unique constraints (also needed for `@OneToOne`), then further types such as `date`
-   and `numeric(p,s)`, then collection tables. Foreign keys need an index on their columns
-   for fast deletes; indexes are not modeled yet. New types also need a name in the
-   history's JSON format.
+1. **Model coverage for real entities.** `UUID` keys, timestamps, `@ManyToOne`,
+   `@OneToOne` and unique constraints work. Next: indexes (`@Index`, and on foreign key
+   columns for fast deletes), then further types such as `date` and `numeric(p,s)`, then
+   collection tables. New types also need a name in the history's JSON format.
 2. **Adopting existing databases.** Without history the previous model is the empty model;
    tables that already exist (for example from `hbm2ddl`) make `CREATE TABLE` fail.
    Proposal: if a database without history already matches the target model, the executor

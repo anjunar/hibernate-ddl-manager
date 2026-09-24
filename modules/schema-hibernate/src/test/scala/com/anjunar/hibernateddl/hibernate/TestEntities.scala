@@ -2,7 +2,7 @@ package com.anjunar.hibernateddl.hibernate
 
 import com.anjunar.hibernateddl.hibernate.annotation.SchemaId
 import jakarta.persistence.*
-import org.hibernate.annotations.{OnDelete, OnDeleteAction}
+import org.hibernate.annotations.{NaturalId, OnDelete, OnDeleteAction}
 
 import scala.compiletime.uninitialized
 
@@ -75,13 +75,26 @@ class Invoice:
   var reviewer: LegacyCustomer = uninitialized
   @SchemaId("3f405162") @ManyToOne var correction: Invoice = uninitialized
 
+/** Every kind of uniqueness: a column, a composite constraint, a natural ID and a one-to-one. */
+@Entity
+@SchemaId("6d7e8f90")
+@Table(uniqueConstraints = Array(new UniqueConstraint(columnNames = Array("tenant", "code"))))
+class Account:
+  @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+  @SchemaId("1a2b3c4d") @Column(unique = true) var email: String = uninitialized
+  @SchemaId("2b3c4d5e") var tenant: String = uninitialized
+  @SchemaId("3c4d5e6f") var code: String = uninitialized
+  @SchemaId("4d5e6f70") @NaturalId var handle: String = uninitialized
+  @SchemaId("5e6f7081") @OneToOne var owner: LegacyCustomer = uninitialized
+
 @Entity
 @SchemaId("bbbbbbbb")
+@Table(indexes = Array(new Index(columnList = "code")))
 class Unsupported:
   @Id @SchemaId("0a1b2c3d") var id: java.math.BigDecimal = uninitialized
   @SchemaId("1a1b2c3d") @ManyToOne @OnDelete(action = OnDeleteAction.CASCADE) var customer: LegacyCustomer = uninitialized
   @SchemaId("2a1b2c3d") @ElementCollection var tags: java.util.Set[String] = new java.util.HashSet[String]()
-  @SchemaId("3a1b2c3d") @Column(unique = true) var code: String = uninitialized
+  @SchemaId("3a1b2c3d") var code: String = uninitialized
 
 @Entity
 @SchemaId("cccccccc")

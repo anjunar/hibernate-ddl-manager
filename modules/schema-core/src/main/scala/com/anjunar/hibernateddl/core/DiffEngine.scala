@@ -1,7 +1,7 @@
 package com.anjunar.hibernateddl.core
 
-/** Plans creation, nullable additions, new foreign keys and explicit-ID renames; all other
-  * changes fail closed. Foreign keys are added last, after every table exists.
+/** Plans creation, nullable additions, new unique and foreign keys and explicit-ID renames;
+  * all other changes fail closed. Foreign keys are added last, after every table exists.
   */
 object DiffEngine:
   def diff(
@@ -13,6 +13,8 @@ object DiffEngine:
         SchemaValidation.validate(desired).map("Desired schema: " + _)
     if validationErrors.nonEmpty then Left(validationErrors.sorted)
     else plan(previous, desired)
+
+  private given Ordering[Vector[String]] = Ordering.Implicits.seqOrdering[Vector, String]
 
   private def plan(
       previous: SchemaModel,
@@ -76,6 +78,15 @@ object DiffEngine:
         else operations += SchemaOperation.AddColumn(id, newTable.name, column)
       }
 
+      val oldUniqueKeys = oldTable.uniqueKeys.toSet
+      newTable.uniqueKeys.filterNot(oldUniqueKeys.contains).sortBy(_.columns.map(_.value)).foreach { key =>
+        operations += SchemaOperation.AddUniqueKey(id, newTable.name,
+          key.columns.map(columnId => newTable.columns.find(_.id == columnId).get.name))
+      }
+      (oldUniqueKeys -- newTable.uniqueKeys).foreach { key =>
+        errors += s"Dropping unique key ${key.display} from table '${id.value}' is unsupported; manual migration required"
+      }
+
       val oldKeys = oldTable.foreignKeys.map(key => key.columns -> key).toMap
       newTable.foreignKeys.foreach { key =>
         oldKeys.get(key.columns) match
@@ -99,7 +110,6 @@ object DiffEngine:
           table.foreignKeys.foreach(key => addedKeys += table -> key)
     }
 
-    given Ordering[Vector[String]] = Ordering.Implicits.seqOrdering[Vector, String]
     addedKeys.result().sortBy((table, key) => (table.id.value, key.columns.map(_.value))).foreach { (table, key) =>
       val referenced = newTables(key.referencedTable)
       def names(owner: TableModel, ids: Vector[SchemaId]) = ids.map(id => owner.columns.find(_.id == id).get.name)
