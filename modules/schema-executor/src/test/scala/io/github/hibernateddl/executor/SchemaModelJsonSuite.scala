@@ -3,7 +3,7 @@ package io.github.hibernateddl.executor
 import io.github.hibernateddl.core.*
 
 class SchemaModelJsonSuite extends munit.FunSuite:
-  private val id = ColumnModel(SchemaId("7f3a9c21/0a1b2c3d"), SqlIdentifier("id"), SqlType.BigInt, nullable = false)
+  private val id = ColumnModel(SchemaId("7f3a9c21/0a1b2c3d"), SqlIdentifier("id"), SqlType.Uuid, nullable = false)
   private val customer = TableModel(
     SchemaId("7f3a9c21"),
     QualifiedName(SqlIdentifier("customer"), Some(SqlIdentifier("public"))),
@@ -12,7 +12,10 @@ class SchemaModelJsonSuite extends munit.FunSuite:
       ColumnModel(SchemaId("7f3a9c21/f34e45b6"), SqlIdentifier("nick_name"), SqlType.Varchar(80)),
       ColumnModel(SchemaId("7f3a9c21/1c2d3e4f"), SqlIdentifier("visits"), SqlType.Integer),
       ColumnModel(SchemaId("7f3a9c21/2d3e4f5a"), SqlIdentifier("active"), SqlType.Boolean, nullable = false),
-      ColumnModel(SchemaId("7f3a9c21/3e4f5a6b"), SqlIdentifier("notes"), SqlType.Text)
+      ColumnModel(SchemaId("7f3a9c21/3e4f5a6b"), SqlIdentifier("notes"), SqlType.Text),
+      ColumnModel(SchemaId("7f3a9c21/4f5a6b7c"), SqlIdentifier("points"), SqlType.BigInt),
+      ColumnModel(SchemaId("7f3a9c21/5a6b7c8d"), SqlIdentifier("created_at"), SqlType.Timestamp(6), nullable = false),
+      ColumnModel(SchemaId("7f3a9c21/6b7c8d9e"), SqlIdentifier("paid_at"), SqlType.TimestampWithTimeZone(3))
     ),
     Vector(id.id)
   )
@@ -25,6 +28,9 @@ class SchemaModelJsonSuite extends munit.FunSuite:
     val json = SchemaModelJson.encode(model)
     assert(json.startsWith("""{"format":1,"tables":[{"id":"7f3a9c21","catalog":null,"schema":"public","name":"customer","""), json)
     assert(json.contains(""""type":"varchar(80)","nullable":true"""), json)
+    assert(json.contains(""""type":"timestamp(6)","nullable":false"""), json)
+    assert(json.contains(""""type":"timestamp(3) with time zone","nullable":true"""), json)
+    assert(json.contains(""""type":"uuid""""), json)
     assert(json.endsWith(""""primaryKey":["7f3a9c21/0a1b2c3d"]}]}"""), json)
     assertEquals(SchemaModelJson.decode(json), Right(model))
     assertEquals(SchemaModelJson.decode(SchemaModelJson.encode(SchemaModel(Vector.empty))), Right(SchemaModel(Vector.empty)))
@@ -44,7 +50,7 @@ class SchemaModelJsonSuite extends munit.FunSuite:
   test("the text PostgreSQL returns for jsonb, with other key order and whitespace, decodes to the same model") {
     val jsonb =
       """{"format": 1, "tables": [{"id": "7f3a9c21", "name": "customer", "schema": "public", "catalog": null,
-        |  "columns": [{"id": "7f3a9c21/0a1b2c3d", "name": "id", "type": "bigint", "nullable": false},
+        |  "columns": [{"id": "7f3a9c21/0a1b2c3d", "name": "id", "type": "uuid", "nullable": false},
         |  {"id": "7f3a9c21/f34e45b6", "name": "nick_name", "type": "varchar(80)", "nullable": true}],
         |  "primaryKey": ["7f3a9c21/0a1b2c3d"]}]}""".stripMargin
     assertEquals(SchemaModelJson.decode(jsonb), Right(SchemaModel(Vector(customer.copy(columns = customer.columns.take(2))))))
@@ -56,8 +62,10 @@ class SchemaModelJsonSuite extends munit.FunSuite:
     assert(failure("""{"tables":[]}""").contains("format is missing"))
     assert(failure(json.replace("\"catalog\":null,", "")).contains("expected catalog"))
     assert(failure(json.replace("\"catalog\":null,", "\"catalog\":null,\"comment\":\"x\",")).contains("comment"))
-    assert(failure(json.replace("\"bigint\"", "\"uuid\"")).contains("unknown type 'uuid'"))
+    assert(failure(json.replace("\"bigint\"", "\"money\"")).contains("unknown type 'money'"))
     assert(failure(json.replace("varchar(80)", "varchar(99999999999)")).contains("VARCHAR length"))
+    assert(failure(json.replace("timestamp(6)", "timestamp(99999999999)")).contains("TIMESTAMP precision"))
+    assert(failure(json.replace("timestamp(3) with time zone", "timestamptz(3)")).contains("unknown type"))
     assert(failure(json.replace("\"nullable\":false", "\"nullable\":0")).contains("true or false"))
     assert(failure(json.replace("\"name\":\"customer\"", "\"name\":\"  \"")).contains("must not be blank"))
     assert(failure(json.replace("\"schema\":\"public\"", "\"schema\":[]")).contains("must be a string"))

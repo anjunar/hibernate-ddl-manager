@@ -28,7 +28,9 @@ class SchemaFingerprintSuite extends munit.FunSuite:
       column.copy(id = SchemaId("other")), column.copy(name = SqlIdentifier("other")),
       column.copy(nullable = true), column.copy(dataType = SqlType.Varchar(101)),
       column.copy(dataType = SqlType.Integer), column.copy(dataType = SqlType.BigInt),
-      column.copy(dataType = SqlType.Boolean), column.copy(dataType = SqlType.Text)
+      column.copy(dataType = SqlType.Boolean), column.copy(dataType = SqlType.Text),
+      column.copy(dataType = SqlType.Uuid), column.copy(dataType = SqlType.Timestamp(6)),
+      column.copy(dataType = SqlType.Timestamp(3)), column.copy(dataType = SqlType.TimestampWithTimeZone(6))
     ).map(c => table.copy(columns = Vector(c)))
     val variants = changedTables.map(t => SchemaModel(Vector(t))) :+ SchemaModel(Vector.empty)
     val hashes = variants.map(SchemaFingerprint.of) :+ SchemaFingerprint.of(model)

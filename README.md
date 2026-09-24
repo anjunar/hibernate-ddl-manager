@@ -1,8 +1,8 @@
 # Hibernate DDL Manager
 
-Scala-3-Framework für kontrollierte Schema-Evolution aus Hibernate-Metadaten. Der Server
-ruft es beim Start auf, bevor er die SessionFactory baut, und das Framework ändert die
-Datenbank selbst. Umbenennungen erkennt es über stabile IDs in den Entities:
+Scala 3 framework for controlled schema evolution from Hibernate metadata. The server calls
+it at startup, before it builds the SessionFactory, and the framework changes the database
+itself. It detects renames through stable IDs in the entities:
 
 ```scala
 @Entity
@@ -13,37 +13,38 @@ class Customer:
   @SchemaId("f34e45b6") @Column(name = "nick_name") var nickName: String = uninitialized
 ```
 
-Werden Feld und Spalte umbenannt, bleibt die ID gleich, und das Framework erzeugt:
+When the field and column are renamed, the ID stays the same, and the framework generates:
 
 ```sql
 ALTER TABLE "public"."customer" RENAME COLUMN "nick_name" TO "alias";
 ```
 
-Eine ID besteht aus acht zufälligen Hex-Ziffern, wird einmal vergeben und nie geändert.
-Aufbau, Regeln und offene Punkte beschreibt die [Architektur](docs/architecture.md).
+An ID consists of eight random hex digits, is assigned once and never changed. The
+[architecture](docs/architecture.md) describes the design, the rules and the open points.
 
-Stand: Prototyp für PostgreSQL 14+, noch kein produktionsfähiges Migrationstool. Eine
-typische Entity mit `UUID`, Zeitstempeln oder Fremdschlüsseln ist noch nicht abbildbar.
+Status: prototype for PostgreSQL 14+, not yet a production-ready migration tool. Entities
+with `UUID` keys and timestamps can be mapped; associations (foreign keys) and unique
+constraints cannot yet.
 
-## Starten
+## Getting started
 
-Voraussetzungen: JDK 17 oder neuer und sbt. Fixierte Versionen: Scala **3.9.0**,
-sbt **1.12.15**, Hibernate ORM **7.4.10.Final**, MUnit **1.2.0**.
+Requirements: JDK 17 or newer and sbt. Pinned versions: Scala **3.9.0**, sbt **1.12.15**,
+Hibernate ORM **7.4.10.Final**, MUnit **1.2.0**.
 
 ```sh
 sbt test
 sbt "schemaCli/run demo"
 ```
 
-`sbt check` baut sauber und testet. Die PostgreSQL-Tests starten über `embedded-postgres`
-**2.2.2** eine temporäre lokale Datenbank; Zugangsdaten sind nicht nötig. Die Demo zeigt
-einen Spalten-Rename über eine stabile ID und das zugehörige SQL, ohne Datenbankverbindung.
+`sbt check` does a clean build and runs the tests. The PostgreSQL tests start a temporary
+local database through `embedded-postgres` **2.2.2**; no credentials are needed. The demo
+shows a column rename through a stable ID and the resulting SQL, without a database
+connection.
 
-### In der Cloud
+### In the cloud
 
-PostgreSQL verweigert den Start als root, deshalb läuft `embedded-postgres` in
-Cloud-Containern meist nicht. Dort nutzen die Tests einen per apt installierten Server.
-Setup-Skript der Umgebung:
+PostgreSQL refuses to start as root, so `embedded-postgres` usually does not run in cloud
+containers. There the tests use a server installed with apt. Environment setup script:
 
 ```sh
 apt-get update
@@ -55,18 +56,17 @@ service postgresql start
 su postgres -c "psql -c \"ALTER USER postgres PASSWORD 'postgres'\""
 ```
 
-Umgebungsvariable:
+Environment variable:
 
 ```sh
 HIBERNATE_DDL_TEST_POSTGRES=jdbc:postgresql://127.0.0.1:5432/postgres?user=postgres&password=postgres
 ```
 
-Ist sie gesetzt, verwenden die Tests diesen Server statt `embedded-postgres`. Jeder Test legt
-eine eigene temporäre Datenbank an und löscht sie danach wieder. Der Server braucht
-PostgreSQL 14 oder neuer. Läuft er in einer neuen Session nicht, genügt
-`service postgresql start`.
+When it is set, the tests use this server instead of `embedded-postgres`. Every test creates
+its own temporary database and drops it afterwards. The server needs PostgreSQL 14 or
+newer. If it is not running in a new session, `service postgresql start` is enough.
 
-## Hibernate-Modell lesen
+## Reading the Hibernate model
 
 ```scala
 import io.github.hibernateddl.hibernate.HibernateSchemaSource
@@ -74,12 +74,12 @@ import io.github.hibernateddl.hibernate.HibernateSchemaSource
 val target: Either[Vector[String], SchemaModel] = HibernateSchemaSource.read(metadata)
 ```
 
-`metadata` ist das Boot-Modell (`MetadataSources.buildMetadata()`) mit dem Dialekt der
-Zieldatenbank. Fehlende oder ungültige IDs, doppelte IDs und alles, was das Modell nicht
-abbilden kann, kommen als Fehlerliste zurück; für fehlende IDs mit einem frisch erzeugten
-Vorschlag.
+`metadata` is the boot model (`MetadataSources.buildMetadata()`) with the dialect of the
+target database. Missing or invalid IDs, duplicate IDs and everything the model cannot
+represent come back as a list of errors; missing IDs come with a freshly generated
+suggestion.
 
-## Datenbank beim Serverstart migrieren
+## Migrating the database at server startup
 
 ```scala
 val target = HibernateSchemaSource.read(metadata) match
@@ -93,35 +93,36 @@ val executor = JdbcMigrationExecutor(
 executor.migrate(dataSource, target)
 ```
 
-`migrate` arbeitet synchron. Bei `Applied` oder `AlreadyApplied` darf der Server
-fortfahren; eine `MigrationException` muss den Start abbrechen. Der Executor braucht eine
-DataSource ohne JTA-Einbindung, und `hibernate.hbm2ddl.auto` darf nicht `update` sein.
+`migrate` runs synchronously. On `Applied` or `AlreadyApplied` the server may continue; a
+`MigrationException` must abort the startup. The executor needs a DataSource without JTA
+enlistment, and `hibernate.hbm2ddl.auto` must not be `update`.
 
-Migrations-IDs, eingecheckte Snapshots und von Hand gepflegte Revisionen gibt es nicht. Jede
-Migration speichert ihr Zielmodell als JSON in `__hibernate_ddl.schema_history`, und der nächste Start plant gegen
-dieses Modell. Ohne History ist der Vorgänger das leere Modell, und alle Tabellen werden
-angelegt. Weil die IDs über alle Versionen stabil sind, darf ein Server Releases überspringen.
+There are no migration IDs, checked-in snapshots or hand-maintained revisions. Every
+migration stores its target model as JSON in `__hibernate_ddl.schema_history`, and the next
+start plans against that model. Without history the previous model is the empty one, and
+all tables are created. Because the IDs are stable across all versions, a server may skip
+releases.
 
-Unter einem transaktionalen Advisory-Lock prüft der Executor die History, plant die
-Änderungen, prüft die Datenbank gegen das gespeicherte Modell, führt die DDL aus, prüft das
-Ziel und schreibt die neue Revision, alles in einer Transaktion. Drift, eine inkonsistente
-History und ein älterer Server nach einer neueren Migration blockieren den Start.
+Under a transactional advisory lock the executor checks the history, plans the changes,
+checks the database against the stored model, executes the DDL, checks the target and
+writes the new revision, all in one transaction. Drift, an inconsistent history and an
+older server after a newer migration block the startup.
 
-## Module
+## Modules
 
-| sbt-Projekt | Inhalt |
+| sbt project | Contents |
 | --- | --- |
-| `schemaCore` | Modell, Validierung, Diff, Operationen |
-| `schemaHibernate` | `@SchemaId` und `HibernateSchemaSource` |
-| `schemaExecutor` | Transaktion, Planung gegen das gespeicherte Modell, History |
-| `schemaPostgresql` | SQL, Katalogprüfung, Sperren und History für PostgreSQL |
+| `schemaCore` | Model, validation, diff, operations |
+| `schemaHibernate` | `@SchemaId` and `HibernateSchemaSource` |
+| `schemaExecutor` | Transaction, planning against the stored model, history |
+| `schemaPostgresql` | SQL, catalog checks, locking and history for PostgreSQL |
 | `schemaCli` | Demo |
 
-Paketbasis: `io.github.hibernateddl`. Der Kern hängt weder von Hibernate noch von einem
-Datenbanktreiber ab; den PostgreSQL-JDBC-Treiber liefert der Server.
+Package root: `io.github.hibernateddl`. The core depends neither on Hibernate nor on a
+database driver; the server provides the PostgreSQL JDBC driver.
 
-## Versionsreferenzen
+## Version references
 
 - [Scala 3.9.0](https://www.scala-lang.org/download/3.9.0.html)
-- [sbt-Versionen](https://www.scala-sbt.org/download)
-- [Hibernate ORM-Versionen](https://hibernate.org/orm/releases/)
+- [sbt versions](https://www.scala-sbt.org/download)
+- [Hibernate ORM versions](https://hibernate.org/orm/releases/)
