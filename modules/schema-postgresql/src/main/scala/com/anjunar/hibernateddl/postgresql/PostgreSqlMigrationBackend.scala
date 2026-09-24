@@ -53,7 +53,9 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
     query(connection,
       "SELECT pg_catalog.set_config('lock_timeout', ?, true), " +
         "pg_catalog.set_config('statement_timeout', ?, true), " +
-        "pg_catalog.set_config('search_path', 'pg_catalog', true)"
+        "pg_catalog.set_config('search_path', 'pg_catalog', true), " +
+        // Check constraints quote their values with doubled single quotes only.
+        "pg_catalog.set_config('standard_conforming_strings', 'on', true)"
     ) { statement =>
       statement.setString(1, s"${options.lockTimeoutMillis}ms")
       statement.setString(2, s"${options.statementTimeoutMillis}ms")
@@ -155,7 +157,7 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
         |       EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i
         |               WHERE i.inhrelid = c.oid OR i.inhparent = c.oid) AS has_inheritance,
         |       EXISTS (SELECT 1 FROM pg_catalog.pg_constraint k
-        |               WHERE k.conrelid = c.oid AND k.contype NOT IN ('f', 'u')
+        |               WHERE k.conrelid = c.oid AND k.contype NOT IN ('c', 'f', 'u')
         |                 AND NOT (k.contype = 'n' AND k.convalidated)
         |                 AND NOT (k.contype = 'p' AND NOT k.condeferrable)
         |              ) AS has_constraints,
@@ -221,6 +223,7 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
           errors += s"Database drift: primary key of $display is ${show(actualKey)}; expected ${show(expectedKey)}."
         errors ++= compareUniqueKeys(connection, oid, display, expected)
         errors ++= compareIndexes(connection, oid, display, expected)
+        errors ++= compareChecks(connection, oid, display, expected)
         errors ++= compareForeignKeys(connection, oid, display, expected, model)
         errors.result()
 
@@ -256,6 +259,37 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
       s"Database drift: unique key ${show(key)} is missing from $display."
     } ++ (actualKeys.map(_._2) diff expectedKeys).map { key =>
       s"Database drift: unexpected unique key ${show(key)} in $display."
+    }
+
+  /** Check constraints match by the name the dialect derives from the column ID and the check,
+    * and must cover exactly that column. Their expression is not compared: PostgreSQL rewrites
+    * it, and the name already fixes the allowed values.
+    */
+  private def compareChecks(connection: Connection, oid: Long, display: String, expected: TableModel): Vector[String] =
+    val expectedChecks = expected.columns.flatMap { column =>
+      column.check.map(check => PostgreSqlDialect.checkName(column.id, check).value -> column.name.value)
+    }.toMap
+    val actualChecks = query(connection,
+      """SELECT k.conname, k.convalidated,
+        |       ARRAY(SELECT CAST(a.attname AS pg_catalog.text)
+        |             FROM pg_catalog.unnest(k.conkey) AS u(attnum)
+        |             JOIN pg_catalog.pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = u.attnum
+        |             ORDER BY a.attname) AS columns
+        |FROM pg_catalog.pg_constraint k
+        |WHERE k.conrelid = CAST(? AS pg_catalog.oid) AND k.contype = 'c'
+        |ORDER BY k.conname""".stripMargin
+    )(_.setLong(1, oid))(row => (row.getString("conname"), row.getBoolean("convalidated"), strings(row, "columns")))
+    val actualNames = actualChecks.map(_._1).toSet
+    actualChecks.flatMap { (name, validated, columns) =>
+      Option.when(!validated)(s"Check constraint ${quoted(name)} of $display has unsupported NOT VALID state.").toVector ++
+        (expectedChecks.get(name) match
+          case None => Vector(s"Database drift: unexpected check constraint ${quoted(name)} in $display.")
+          case Some(column) if columns != Vector(column) =>
+            Vector(s"Database drift: check constraint ${quoted(name)} of $display covers " +
+              s"${columns.map(quoted).mkString("(", ", ", ")")}; expected (${quoted(column)}).")
+          case Some(_) => Vector.empty)
+    } ++ expectedChecks.toVector.sorted.filterNot((name, _) => actualNames.contains(name)).map { (name, column) =>
+      s"Database drift: check constraint ${quoted(name)} on column ${quoted(column)} is missing from $display."
     }
 
   /** Plain indexes match by their ordered columns and directions, never by name. Indexes of

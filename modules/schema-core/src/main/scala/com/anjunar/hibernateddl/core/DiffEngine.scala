@@ -1,8 +1,8 @@
 package com.anjunar.hibernateddl.core
 
-/** Plans creation, nullable additions, new unique keys, indexes and foreign keys and
-  * explicit-ID renames; all other changes fail closed. Foreign keys are added last, after
-  * every table exists.
+/** Plans creation, nullable additions, new unique keys, indexes and foreign keys, changed
+  * column checks and explicit-ID renames; all other changes fail closed. Foreign keys are
+  * added last, after every table exists.
   */
 object DiffEngine:
   def diff(
@@ -69,6 +69,8 @@ object DiffEngine:
               errors += s"Renaming column '${columnId.value}' collides with previous column '${occupant.id.value}'; dependent or swap renames require manual migration"
             case None =>
               operations += SchemaOperation.RenameColumn(id, newTable.name, columnId, oldColumn.name, newColumn.name)
+        if oldColumn.check != newColumn.check && oldColumn.dataType == newColumn.dataType then
+          operations += SchemaOperation.ChangeCheck(id, newTable.name, columnId, newColumn.name, oldColumn.check, newColumn.check)
       }
       (newColumns.keySet -- oldColumns.keySet).toVector.sortBy(_.value).foreach { columnId =>
         val column = newColumns(columnId)

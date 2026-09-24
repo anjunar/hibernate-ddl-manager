@@ -52,6 +52,9 @@ class Customer:
   it intact. Constraint names are not part of the model; PostgreSQL chooses them.
 - A unique key lists column IDs in key order and likewise survives renames; so does an
   index, which also records each column's direction.
+- An enum column carries its CHECK constraint as allowed values or an ordinal range. On
+  PostgreSQL the constraint is named after a hash of the column ID and the check, so a
+  rename keeps the name and a changed check gets a new one.
 - If an ID is missing or has the wrong format, the adapter reports an error with a freshly
   generated suggestion, e.g. `add e.g. @SchemaId("9c1d07aa")`.
 
@@ -74,7 +77,7 @@ there:
 | --- | --- |
 | `revision` | 1, 2, 3, … without gaps; assigned by the executor |
 | `previous_fingerprint`, `target_fingerprint` | SHA-256 of the previous and the target model |
-| `model` | Target model as JSON (`jsonb`), format version 4 |
+| `model` | Target model as JSON (`jsonb`), format version 5 |
 | `statements` | Executed DDL |
 | `applied_at` | Time of application |
 
@@ -92,8 +95,9 @@ there:
   previous fingerprint equal to the target fingerprint of the row before, every stored
   model readable and matching its fingerprint. A modified history blocks the startup.
 - The JSON format is versioned and read strictly: an unknown format version, unknown fields
-  or unknown types are errors. Format 2 added foreign keys, format 3 unique keys and format 4
-  indexes; models stored in earlier formats are still read and keep their fingerprints. A history table with
+  or unknown types are errors. Format 2 added foreign keys, format 3 unique keys, format 4
+  indexes and format 5 column checks; models stored in earlier formats are still read and
+  keep their fingerprints. A history table with
   other columns comes from another version and is refused, never altered.
 
 ## Modules
@@ -112,21 +116,21 @@ Everything outside this scope is rejected, never silently ignored.
 
 | Area | Supported | Reported and rejected |
 | --- | --- | --- |
-| Model | Tables, columns `varchar(n)`, `char(n)`, `text`, `smallint`, `integer`, `bigint`, `numeric(p,s)`, `real`, `double precision`, `boolean`, `uuid`, `date`, `time(p)`, `timestamp(p)`, `timestamp(p) with time zone`, binary data (`bytea`), nullability, primary keys, unique keys, plain indexes with column directions, foreign keys to a primary key | All other types and objects |
-| Adapter | Entities without inheritance or secondary tables, simple properties, embeddables, generated `UUID` keys, `LocalDate`, `LocalTime`, `LocalDateTime`, `Instant`, `OffsetDateTime` and `@Column(secondPrecision)`, `BigDecimal` and `BigInteger` with `@Column(precision, scale)`, `Short`, `Byte`, `Float`, `Double`, `Character`, `byte[]`, `Duration` (as `numeric`), `@ManyToOne` with or without a constraint, `@OneToOne`, `@Column(unique)`, `@UniqueConstraint`, `@NaturalId`, `@Index` with `asc`/`desc` | Enums (Hibernate adds a CHECK constraint), `@Lob` (PostgreSQL large objects), `ON DELETE` actions, associations to non-primary-key or multi-column keys, ordered unique keys, index options and expressions, collection and join tables, checks, defaults, identity columns, sequences, columns without an ID origin |
-| Diff | New tables, new nullable columns, new unique keys and indexes, new foreign keys (added after all tables, so cycles work), table and column renames | Drops (including keys and indexes), type/nullability/primary key/foreign key changes, schema moves, rename collisions and swaps |
+| Model | Tables, columns `varchar(n)`, `char(n)`, `text`, `smallint`, `integer`, `bigint`, `numeric(p,s)`, `real`, `double precision`, `boolean`, `uuid`, `date`, `time(p)`, `timestamp(p)`, `timestamp(p) with time zone`, binary data (`bytea`), nullability, column checks (allowed values, integer range), primary keys, unique keys, plain indexes with column directions, foreign keys to a primary key | All other types and objects |
+| Adapter | Entities without inheritance or secondary tables, simple properties, embeddables, generated `UUID` keys, `LocalDate`, `LocalTime`, `LocalDateTime`, `Instant`, `OffsetDateTime` and `@Column(secondPrecision)`, `BigDecimal` and `BigInteger` with `@Column(precision, scale)`, `Short`, `Byte`, `Float`, `Double`, `Character`, `byte[]`, `Duration` (as `numeric`), `@ManyToOne` with or without a constraint, `@OneToOne`, `@Column(unique)`, `@UniqueConstraint`, `@NaturalId`, `@Index` with `asc`/`desc`, `@Enumerated` by name or ordinal | Other CHECK constraints (`@Column(check)`, `@Check`, enum values containing a quote), `@Lob` (PostgreSQL large objects), `ON DELETE` actions, associations to non-primary-key or multi-column keys, ordered unique keys, index options and expressions, collection and join tables, table-level checks, defaults, identity columns, sequences, columns without an ID origin |
+| Diff | New tables, new nullable columns, new unique keys and indexes, new foreign keys (added after all tables, so cycles work), added, changed or removed column checks (existing rows are validated), table and column renames | Drops (including keys and indexes), type/nullability/primary key/foreign key changes, schema moves, rename collisions and swaps |
 | History | Stored model per revision, skipped releases | Target model of an earlier revision, rename back to an earlier name, modified history, tables without history (no adoption of existing databases) |
-| PostgreSQL | Ordinary permanent tables with exactly these columns, a non-deferrable primary key, plain unique constraints, plain B-tree indexes and plain foreign keys, matched by structure | Other constraints, unique, partial, expression, covering or non-B-tree indexes, custom operator classes, collations or `NULLS` ordering, deferrable, `INCLUDE` or `NULLS NOT DISTINCT` unique keys, foreign keys with actions, `MATCH FULL` or deferrable checking, foreign keys from unmodeled tables, triggers, rules, RLS, inheritance, partitions, custom collations |
+| PostgreSQL | Ordinary permanent tables with exactly these columns, a non-deferrable primary key, plain unique constraints, plain B-tree indexes and plain foreign keys, matched by structure; column checks, matched by their derived name and column | Other constraints, unexpected or `NOT VALID` checks, unique, partial, expression, covering or non-B-tree indexes, custom operator classes, collations or `NULLS` ordering, deferrable, `INCLUDE` or `NULLS NOT DISTINCT` unique keys, foreign keys with actions, `MATCH FULL` or deferrable checking, foreign keys from unmodeled tables, triggers, rules, RLS, inheritance, partitions, custom collations |
 
 Tables that exist only in the database are left untouched.
 
 ## Open points
 
-1. **Model coverage for real entities.** The common basic types, `UUID` keys,
-   `@ManyToOne`, `@OneToOne`, unique constraints and indexes work. Next: enums, which need
-   CHECK constraints in the model, then collection tables. New types also need a name in the
-   history's JSON format. Foreign key columns get no index automatically; declare one with
-   `@Index` where deletes on the referenced table must be fast.
+1. **Model coverage for real entities.** The common basic types, enums, `UUID` keys,
+   `@ManyToOne`, `@OneToOne`, unique constraints and indexes work. Next: collection and join
+   tables (`@ElementCollection`, `@ManyToMany`). New types also need a name in the history's
+   JSON format. Foreign key columns get no index automatically; declare one with `@Index`
+   where deletes on the referenced table must be fast.
 2. **Adopting existing databases.** Without history the previous model is the empty model;
    tables that already exist (for example from `hbm2ddl`) make `CREATE TABLE` fail.
    Proposal: if a database without history already matches the target model, the executor

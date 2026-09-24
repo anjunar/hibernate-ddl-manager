@@ -103,6 +103,25 @@ class HibernateSchemaSourceSuite extends munit.FunSuite:
     )
   }
 
+  test("enum columns carry their allowed values or ordinal range as a column check") {
+    val letter = read(classOf[Letter]).toOption.get.tables.head
+    assertEquals(
+      letter.columns.map(c => c.name.value -> (c.dataType, c.check)).toMap,
+      Map(
+        "id" -> (SqlType.BigInt, None),
+        "status" -> (SqlType.Varchar(255), Some(ColumnCheck.AllowedValues(Vector("Draft", "Sent", "Paid")))),
+        "priority" -> (SqlType.SmallInt, Some(ColumnCheck.Range(0, 2))),
+        "Stage" -> (SqlType.Varchar(10), Some(ColumnCheck.AllowedValues(Vector("Draft", "Sent", "Paid"))))
+      )
+    )
+  }
+
+  test("checks other than Hibernate's enum checks are reported") {
+    val diagnostics = errors(classOf[OddChecks])
+    assert(diagnostics.exists(_.contains("OddChecks.quote has the check constraint")), diagnostics)
+    assert(diagnostics.exists(_.contains("OddChecks.amount has the check constraint 'amount >= 0'")), diagnostics)
+  }
+
   test("renaming a referenced entity keeps the foreign key, so the diff plans only the rename") {
     val before = read(classOf[Invoice], classOf[LegacyCustomer]).toOption.get
     val after = before.copy(tables = before.tables.map { table =>
