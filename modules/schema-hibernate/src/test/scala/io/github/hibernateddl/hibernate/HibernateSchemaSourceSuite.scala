@@ -68,11 +68,26 @@ class HibernateSchemaSourceSuite extends munit.FunSuite:
 
   test("mappings the model cannot represent are reported instead of dropped") {
     val diagnostics = errors(classOf[Unsupported], classOf[LegacyCustomer])
-    assert(diagnostics.exists(_.contains("Unsupported.id has SQL type 'uuid'")), diagnostics)
+    assert(diagnostics.exists(_.contains("Unsupported.id has SQL type 'numeric(38,2)'")), diagnostics)
     assert(diagnostics.exists(_.contains("Unsupported.customer is an association")), diagnostics)
     assert(diagnostics.exists(_.contains("collection and join tables are unsupported")), diagnostics)
     assert(diagnostics.exists(_.contains("unique")), diagnostics)
     assert(errors(classOf[Generated]).exists(_.startsWith("Sequence")))
+  }
+
+  test("generated UUID keys and timestamps with and without time zone are mapped") {
+    val table = read(classOf[Purchase]).toOption.get.tables.head
+    assertEquals(table.primaryKey, Vector(SchemaId("9d8e7f60/0a1b2c3d")))
+    assertEquals(
+      table.columns.map(c => c.name.value -> (c.dataType, c.nullable)).toMap,
+      Map(
+        "id" -> (SqlType.Uuid, false),
+        "createdat" -> (SqlType.Timestamp(6), false),
+        "paidat" -> (SqlType.TimestampWithTimeZone(6), true),
+        "shippedat" -> (SqlType.TimestampWithTimeZone(6), true),
+        "deliveredat" -> (SqlType.Timestamp(3), true)
+      )
+    )
   }
 
   test("fresh IDs have the required format") {

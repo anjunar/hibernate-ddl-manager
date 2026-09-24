@@ -263,13 +263,43 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
         ColumnModel(SchemaId("BIG"), SqlIdentifier("big"), SqlType.BigInt),
         ColumnModel(SchemaId("ACTIVE"), SqlIdentifier("active"), SqlType.Boolean),
         ColumnModel(SchemaId("DESCRIPTION"), SqlIdentifier("description"), SqlType.Text),
+        ColumnModel(SchemaId("TOKEN"), SqlIdentifier("token"), SqlType.Uuid),
+        ColumnModel(SchemaId("SEEN"), SqlIdentifier("seen_at"), SqlType.Timestamp(3)),
+        ColumnModel(SchemaId("PAID"), SqlIdentifier("paid_at"), SqlType.TimestampWithTimeZone(6)),
         // Quotes and non-ASCII characters must survive the jsonb round trip of the stored model.
-        ColumnModel(SchemaId("NOTE"), SqlIdentifier("Notiz \"ä\" 🙂"), SqlType.Varchar(20))
+        ColumnModel(SchemaId("NOTE"), SqlIdentifier("Note \"ä\" 🙂"), SqlType.Varchar(20))
       )
       fixture(ds, SchemaModel(Vector(users.copy(columns = users.columns ++ extras))))
       val expanded = SchemaModel(Vector(renamed.copy(columns = renamed.columns ++ extras)))
       assertEquals(executor.migrate(ds, expanded).status, MigrationStatus.Applied)
       assertEquals(scalar(ds, "SELECT login_name FROM public.accounts"), "patrick")
+      execute(ds, "UPDATE public.accounts SET token = '8f2c4c1e-3f6b-4a8e-9d3a-2b7c1e5f0a94', " +
+        "seen_at = '2026-09-24 12:34:56.789', paid_at = '2026-09-24 12:34:56.123456+02'")
+      assertEquals(scalar(ds, "SELECT token::text || ' ' || seen_at::text FROM public.accounts"),
+        "8f2c4c1e-3f6b-4a8e-9d3a-2b7c1e5f0a94 2026-09-24 12:34:56.789")
+      assertEquals(executor.migrate(ds, expanded).status, MigrationStatus.AlreadyApplied)
+    }
+  }
+
+  test("a precision PostgreSQL cannot store is refused before a connection") {
+    withDatabase { ds =>
+      val precise = ColumnModel(SchemaId("SEEN"), SqlIdentifier("seen_at"), SqlType.Timestamp(9))
+      val error = intercept[MigrationException](executor.migrate(ds, SchemaModel(Vector(users.copy(columns = users.columns :+ precise)))))
+      assertEquals(error.state, FailureState.NotStarted)
+      assert(error.getMessage.contains("Table 'USER': table column has TIMESTAMP precision 9"), error.getMessage)
+      noHistory(ds)
+    }
+  }
+
+  test("a different timestamp precision or a timestamp without precision is drift") {
+    Vector("timestamp(6)", "timestamp", "timestamp(3) with time zone").foreach { actual =>
+      withDatabase { ds =>
+        val seen = ColumnModel(SchemaId("SEEN"), SqlIdentifier("seen_at"), SqlType.Timestamp(3))
+        fixture(ds, SchemaModel(Vector(users.copy(columns = users.columns :+ seen))))
+        execute(ds, s"ALTER TABLE public.users ALTER COLUMN seen_at TYPE $actual")
+        val error = intercept[MigrationException](executor.migrate(ds, SchemaModel(Vector(users.copy(columns = users.columns :+ seen)))))
+        assert(error.getMessage.contains("expected Timestamp(3)"), error.getMessage)
+      }
     }
   }
 

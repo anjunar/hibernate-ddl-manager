@@ -107,6 +107,25 @@ class PostgreSqlDialectSuite extends munit.FunSuite:
     assert(PostgreSqlDialect.render(Vector(CreateTable(table.copy(primaryKey = Vector(SchemaId("x")))))).isLeft)
   }
 
+  test("uuid and timestamps render with their precision, which PostgreSQL limits to 6") {
+    val columns = Vector(
+      ColumnModel(SchemaId("id"), SqlIdentifier("id"), SqlType.Uuid, nullable = false),
+      ColumnModel(SchemaId("created"), SqlIdentifier("created_at"), SqlType.Timestamp(0)),
+      ColumnModel(SchemaId("paid"), SqlIdentifier("paid_at"), SqlType.TimestampWithTimeZone(6))
+    )
+    val table = TableModel(tableId, name("orders", Some("public")), columns, Vector(SchemaId("id")))
+    assertEquals(
+      PostgreSqlDialect.render(Vector(CreateTable(table))),
+      Right(Vector("CREATE TABLE \"public\".\"orders\" (\"id\" uuid NOT NULL, \"created_at\" timestamp(0), " +
+        "\"paid_at\" timestamp(6) with time zone, PRIMARY KEY (\"id\"));"))
+    )
+    Vector(SqlType.Timestamp(7), SqlType.TimestampWithTimeZone(-1)).foreach { invalid =>
+      val column = ColumnModel(SchemaId("x"), SqlIdentifier("x"), invalid)
+      val diagnostics = PostgreSqlDialect.render(Vector(AddColumn(tableId, name("orders"), column))).swap.toOption.get
+      assert(diagnostics.exists(_.contains("supports 0 to 6")), diagnostics)
+    }
+  }
+
   test("an empty plan renders to an empty statement vector") {
     assertEquals(PostgreSqlDialect.render(Vector.empty), Right(Vector.empty))
   }

@@ -54,10 +54,20 @@ class DuplicateA:
 class DuplicateB:
   @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
 
+/** A typical entity: generated UUID key, timestamps with and without time zone. */
+@Entity
+@SchemaId("9d8e7f60")
+class Purchase:
+  @Id @GeneratedValue @SchemaId("0a1b2c3d") var id: java.util.UUID = uninitialized
+  @SchemaId("1b2c3d4e") @Column(nullable = false) var createdAt: java.time.LocalDateTime = uninitialized
+  @SchemaId("2c3d4e5f") var paidAt: java.time.Instant = uninitialized
+  @SchemaId("3d4e5f60") var shippedAt: java.time.OffsetDateTime = uninitialized
+  @SchemaId("4e5f6071") @Column(secondPrecision = 3) var deliveredAt: java.time.LocalDateTime = uninitialized
+
 @Entity
 @SchemaId("bbbbbbbb")
 class Unsupported:
-  @Id @SchemaId("0a1b2c3d") var id: java.util.UUID = uninitialized
+  @Id @SchemaId("0a1b2c3d") var id: java.math.BigDecimal = uninitialized
   @SchemaId("1a1b2c3d") @ManyToOne var customer: LegacyCustomer = uninitialized
   @SchemaId("2a1b2c3d") @ElementCollection var tags: java.util.Set[String] = new java.util.HashSet[String]()
   @SchemaId("3a1b2c3d") @Column(unique = true) var code: String = uninitialized

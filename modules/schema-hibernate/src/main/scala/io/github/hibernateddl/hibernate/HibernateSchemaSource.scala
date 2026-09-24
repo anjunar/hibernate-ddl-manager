@@ -28,6 +28,8 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
   // Stands in for a missing or invalid ID after it was reported, so each problem is reported once.
   private val Unknown = "?"
   private val VarcharType = """(?:varchar|character varying)\((\d+)\)""".r
+  private val TimestampType = """timestamp\((\d+)\)(?: without time zone)?""".r
+  private val TimestampWithTimeZoneType = """(?:timestamp\((\d+)\) with time zone|timestamptz\((\d+)\))""".r
 
   override def read(metadata: Metadata): Either[Vector[String], SchemaModel] =
     val reader = new Reader(metadata)
@@ -157,7 +159,11 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
         case "bigint" | "int8" => Some(SqlType.BigInt)
         case "boolean" | "bool" => Some(SqlType.Boolean)
         case "text" => Some(SqlType.Text)
+        case "uuid" => Some(SqlType.Uuid)
         case VarcharType(length) => length.toIntOption.map(SqlType.Varchar(_))
+        case TimestampType(precision) => precision.toIntOption.map(SqlType.Timestamp(_))
+        case TimestampWithTimeZoneType(long, short) =>
+          Option(long).orElse(Option(short)).flatMap(_.toIntOption).map(SqlType.TimestampWithTimeZone(_))
         case _ => None
       if dataType.isEmpty then errors += s"$label has SQL type '$sqlType'; unsupported"
       dataType.map(ColumnModel(id, physical(Identifier.toIdentifier(column.getName, column.isQuoted)), _, column.isNullable))

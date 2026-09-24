@@ -12,6 +12,8 @@ import scala.util.control.NoStackTrace
 object SchemaModelJson:
   val FormatVersion = 1
   private val VarcharType = """varchar\((\d+)\)""".r
+  private val TimestampType = """timestamp\((\d+)\)""".r
+  private val TimestampWithTimeZoneType = """timestamp\((\d+)\) with time zone""".r
 
   def encode(model: SchemaModel): String =
     def string(value: String): String =
@@ -44,10 +46,13 @@ object SchemaModelJson:
 
   private def typeName(dataType: SqlType): String = dataType match
     case SqlType.Varchar(length) => s"varchar($length)"
+    case SqlType.Timestamp(precision) => s"timestamp($precision)"
+    case SqlType.TimestampWithTimeZone(precision) => s"timestamp($precision) with time zone"
     case SqlType.Integer => "integer"
     case SqlType.BigInt => "bigint"
     case SqlType.Boolean => "boolean"
     case SqlType.Text => "text"
+    case SqlType.Uuid => "uuid"
 
   private enum Json:
     case Obj(fields: Map[String, Json])
@@ -94,12 +99,19 @@ object SchemaModelJson:
       case "bigint" => SqlType.BigInt
       case "boolean" => SqlType.Boolean
       case "text" => SqlType.Text
-      case VarcharType(length) => SqlType.Varchar(length.toIntOption.getOrElse(invalid(s"Column '$id' has VARCHAR length $length")))
+      case "uuid" => SqlType.Uuid
+      case VarcharType(length) => SqlType.Varchar(number(length, s"Column '$id' VARCHAR length"))
+      case TimestampType(precision) => SqlType.Timestamp(number(precision, s"Column '$id' TIMESTAMP precision"))
+      case TimestampWithTimeZoneType(precision) =>
+        SqlType.TimestampWithTimeZone(number(precision, s"Column '$id' TIMESTAMP precision"))
       case other => invalid(s"Column '$id' has unknown type '$other'")
     val nullable = column("nullable") match
       case Json.Bool(value) => value
       case _ => invalid(s"Column '$id' nullable must be true or false")
     ColumnModel(SchemaId(id), SqlIdentifier(string(column("name"), s"Column '$id' name")), dataType, nullable)
+
+  private def number(digits: String, label: String): Int =
+    digits.toIntOption.getOrElse(invalid(s"$label $digits is out of range"))
 
   private def fields(json: Json, label: String, expected: Set[String]): Map[String, Json] = json match
     case Json.Obj(values) if values.keySet == expected => values
