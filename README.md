@@ -69,7 +69,7 @@ newer. If it is not running in a new session, `service postgresql start` is enou
 ## Reading the Hibernate model
 
 ```scala
-import io.github.hibernateddl.hibernate.HibernateSchemaSource
+import com.anjunar.hibernateddl.hibernate.HibernateSchemaSource
 
 val target: Either[Vector[String], SchemaModel] = HibernateSchemaSource.read(metadata)
 ```
@@ -118,7 +118,7 @@ older server after a newer migration block the startup.
 | `schemaPostgresql` | SQL, catalog checks, locking and history for PostgreSQL |
 | `schemaCli` | Demo |
 
-Package root: `io.github.hibernateddl`. The core depends neither on Hibernate nor on a
+Package root: `com.anjunar.hibernateddl`. The core depends neither on Hibernate nor on a
 database driver; the server provides the PostgreSQL JDBC driver.
 
 ## Version references

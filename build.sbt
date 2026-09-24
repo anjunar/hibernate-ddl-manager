@@ -1,4 +1,4 @@
-ThisBuild / organization := "io.github.hibernateddl"
+ThisBuild / organization := "com.anjunar.hibernateddl"
 ThisBuild / version := "0.1.0-SNAPSHOT"
 ThisBuild / scalaVersion := "3.9.0"
 
@@ -48,7 +48,7 @@ lazy val schemaCli = (project in file("modules/schema-cli"))
   .settings(
     name := "schema-cli",
     publish / skip := true,
-    Compile / mainClass := Some("io.github.hibernateddl.cli.Main")
+    Compile / mainClass := Some("com.anjunar.hibernateddl.cli.Main")
   )
 
 addCommandAlias("check", ";clean;test")
