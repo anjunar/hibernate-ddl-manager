@@ -28,7 +28,8 @@ lazy val schemaHibernate = (project in file("modules/schema-hibernate"))
   )
 
 lazy val schemaPostgresql = (project in file("modules/schema-postgresql"))
-  .dependsOn(schemaCore, schemaExecutor)
+  // The Hibernate entities of schema-hibernate's tests drive the end-to-end tests.
+  .dependsOn(schemaCore, schemaExecutor, schemaHibernate % "test->test")
   .settings(commonSettings)
   .settings(
     name := "schema-postgresql",
