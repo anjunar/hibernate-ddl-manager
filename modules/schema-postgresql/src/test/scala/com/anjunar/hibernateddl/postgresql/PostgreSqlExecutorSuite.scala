@@ -588,6 +588,24 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
     }
   }
 
+  test("Hibernate entities with associations, collections, enums, keys and indexes migrate and verify end to end") {
+    import com.anjunar.hibernateddl.hibernate.*
+    val model = TestMetadata.read(classOf[Article], classOf[Label], classOf[Invoice], classOf[LegacyCustomer],
+      classOf[Account], classOf[Shipment], classOf[Measurement], classOf[Letter], classOf[Purchase])
+      .fold(errors => fail(errors.mkString("\n")), identity)
+    withDatabase { ds =>
+      val result = executor.migrate(ds, model)
+      assertEquals(result.status, MigrationStatus.Applied)
+      assert(result.statementCount > model.tables.size, result)
+      execute(ds, "INSERT INTO public.article VALUES (1); INSERT INTO public.label VALUES (7); " +
+        "INSERT INTO public.article_keyword VALUES (1, 'scala'); INSERT INTO public.article_label VALUES (1, 7); " +
+        "INSERT INTO public.article_statuses VALUES (1, 'Sent')")
+      intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.article_label VALUES (1, 8)"))
+      intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.article_statuses VALUES (1, 'Lost')"))
+      assertEquals(executor.migrate(ds, model), MigrationResult(1, MigrationStatus.AlreadyApplied, 0))
+    }
+  }
+
   test("a tampered stored model blocks the start") {
     withDatabase { ds =>
       fixture(ds)

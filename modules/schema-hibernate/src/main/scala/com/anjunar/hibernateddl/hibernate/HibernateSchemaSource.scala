@@ -20,7 +20,8 @@ import scala.jdk.CollectionConverters.*
   * Identities come from `@SchemaId` values of eight lowercase hex digits: a table uses its
   * entity's ID, a column `entity/property` and an embedded column `entity/embedded/property`.
   * An association's join column is a column like any other; its foreign key references the
-  * other entity's table and primary key by ID.
+  * other entity's table and primary key by ID. A collection table (element collection or
+  * many-to-many join table) uses the ID `entity/property`.
   * Physical names are taken after Hibernate's naming strategies and folded the way the
   * configured dialect folds unquoted identifiers. Tables without a schema use
   * `hibernate.default_schema`. Mappings the core model cannot represent are reported
@@ -49,14 +50,23 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
     val reader = new Reader(metadata)
     val model = reader.read()
     val errors = reader.errors.result().distinct.sorted
-    if errors.nonEmpty then Left(errors) else Right(model)
+    // Model-wide validation catches what no single table shows, such as a collection sharing
+    // its ID with a column; it runs last so that it never repeats a problem already reported.
+    val invalid = if errors.isEmpty then SchemaValidation.validate(model) else Vector.empty
+    if errors.nonEmpty then Left(errors) else if invalid.nonEmpty then Left(invalid) else Right(model)
 
   /** A fresh random identity for a newly mapped entity or property. */
   def newId(): String = HexFormat.of().toHexDigits(ThreadLocalRandom.current().nextInt())
 
   private final case class Owned(column: Column, path: Vector[String], label: String)
 
-  private final case class Mapped(label: String, table: Table, model: TableModel, columnIds: Map[Column, SchemaId])
+  private final case class Mapped(
+      label: String,
+      description: String,
+      table: Table,
+      model: TableModel,
+      columnIds: Map[Column, SchemaId]
+  )
 
   private final class Reader(metadata: Metadata):
     val errors = Vector.newBuilder[String]
@@ -78,8 +88,18 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
     def read(): SchemaModel =
       val entities = metadata.getEntityBindings.asScala.toVector.sortBy(_.getEntityName)
       val entityTables = entities.map(_.getTable).toSet
-      metadata.collectTableMappings.asScala.filterNot(entityTables.contains).foreach { table =>
-        errors += s"Table ${table.getName} does not belong to an entity; collection and join tables are unsupported"
+      // Inverse sides and foreign-key one-to-many collections own no table of their own.
+      val collections = metadata.getCollectionBindings.asScala.toVector
+        .filterNot(collection => collection.isInverse || collection.isOneToMany).sortBy(_.getRole)
+      val sharedTables = collections.groupBy(_.getCollectionTable).filter((table, owners) =>
+        owners.size > 1 || entityTables.contains(table))
+      sharedTables.foreach { (table, owners) =>
+        errors += s"Collections ${owners.map(_.getRole).mkString(", ")} use table ${table.getName}, which another " +
+          "collection or entity also uses; give each collection its own @CollectionTable or @JoinTable"
+      }
+      val collectionTables = collections.map(_.getCollectionTable).toSet
+      metadata.collectTableMappings.asScala.filterNot(table => entityTables(table) || collectionTables(table)).foreach { table =>
+        errors += s"Table ${table.getName} belongs to no entity or collection; unsupported"
       }
       database.getNamespaces.asScala.flatMap(_.getSequences.asScala).foreach { sequence =>
         errors += s"Sequence ${sequence.getExportIdentifier} is unsupported; use assigned identifiers"
@@ -87,24 +107,28 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
       database.getAuxiliaryDatabaseObjects.asScala.foreach { auxiliary =>
         errors += s"Auxiliary database object ${auxiliary.getExportIdentifier} is unsupported"
       }
-      val mapped = entities.flatMap(readEntity)
-      mapped.groupBy(_.model.id).foreach { (id, owners) =>
+      val mappedEntities = entities.flatMap(readEntity)
+      mappedEntities.groupBy(_.model.id).foreach { (id, owners) =>
         if owners.size > 1 then
           errors += s"Entities ${owners.map(_.label).sorted.mkString(", ")} share @SchemaId(\"${id.value}\")"
       }
+      val entityIds = mappedEntities.map(entity => entity.label -> entity.model.id.value).toMap
+      val mapped = mappedEntities ++ collections.filterNot(c => sharedTables.contains(c.getCollectionTable))
+        .flatMap(readCollection(_, entityIds))
       val byTable = mapped.map(entity => entity.table -> entity).toMap
-      SchemaModel(mapped.map(entity => entity.model.copy(foreignKeys = foreignKeys(entity, byTable, entityTables))))
+      SchemaModel(mapped.map(entity =>
+        entity.model.copy(foreignKeys = foreignKeys(entity, byTable, entityTables ++ collectionTables))))
 
     /** Foreign keys of associations, referencing the primary key of another mapped entity. */
-    private def foreignKeys(entity: Mapped, byTable: Map[Table, Mapped], entityTables: Set[Table]): Vector[ForeignKeyModel] =
+    private def foreignKeys(entity: Mapped, byTable: Map[Table, Mapped], ownedTables: Set[Table]): Vector[ForeignKeyModel] =
       entity.table.getForeignKeyCollection.asScala.toVector.filter(_.isCreationEnabled).flatMap { key =>
         val columns = key.getColumns.asScala.toVector
-        val label = s"Foreign key ${columns.map(_.getName).mkString("(", ", ", ")")} of entity ${entity.label}"
+        val label = s"Foreign key ${columns.map(_.getName).mkString("(", ", ", ")")} of ${entity.description}"
         val referenced = byTable.get(key.getReferencedTable)
         val problems = Vector(
           Option.when(!key.isReferenceToPrimaryKey)("references columns other than the primary key"),
           Option(key.getOnDeleteAction).filter(_ != OnDeleteAction.NO_ACTION).map(action => s"has ON DELETE $action"),
-          Option.when(referenced.isEmpty && !entityTables.contains(key.getReferencedTable))(
+          Option.when(referenced.isEmpty && !ownedTables.contains(key.getReferencedTable))(
             s"references table ${key.getReferencedTable.getName}, which belongs to no entity")
         ).flatten
         problems.foreach(problem => errors += s"$label $problem; unsupported")
@@ -116,7 +140,7 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
       }
 
     private def readEntity(entity: PersistentClass): Option[Mapped] =
-      val label = Option(entity.getJpaEntityName).getOrElse(entity.getEntityName)
+      val label = entityLabel(entity)
       val table = entity.getTable
       if entity.getSuperclass != null || entity.hasSubclasses then
         errors += s"Entity $label uses inheritance; unsupported"
@@ -133,52 +157,97 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
         val properties =
           (Option(entity.getIdentifierProperty) ++ Option(entity.getVersion) ++ entity.getProperties.asScala).toVector.distinct
         val owned = properties.flatMap(columns(_, entity.getMappedClass, Vector.empty, label))
-        owned.groupBy(_.path).foreach { (path, sharing) =>
-          val labels = sharing.map(_.label).distinct.sorted
-          if labels.size > 1 && !path.contains(Unknown) then
-            errors += s"${labels.mkString(" and ")} share @SchemaId(\"${path.last}\")"
-        }
-        owned.groupBy(_.column).foreach { (column, mapping) =>
-          if mapping.size > 1 then
-            errors += s"${mapping.map(_.label).sorted.mkString(" and ")} map the same column ${column.getName}; unsupported"
-        }
-        val byColumn = owned.map(o => o.column -> o).toMap
-        def columnId(o: Owned) = SchemaId((entityId.getOrElse(Unknown) +: o.path).mkString("/"))
+        mapTable(label, s"entity $label", table, entityId, entityId, owned)
 
-        Vector(
-          Option.when(!table.getChecks.isEmpty)("check constraints")
-        ).flatten.foreach(feature => errors += s"Entity $label has $feature; unsupported")
+    /** A set or unordered list of basic values, embeddables or entities (many-to-many) in its own
+      * table. The table's ID is `entity/property`, the owner key column's `entity/property/key`,
+      * a basic or entity element's `entity/property/element` and an embeddable element's
+      * columns `entity/property/embedded-property`.
+      */
+    private def readCollection(collection: CollectionMapping, entityIds: Map[String, String]): Option[Mapped] =
+      val owner = collection.getOwner
+      owner.getProperties.asScala.find(_.getValue eq collection) match
+        case None =>
+          errors += s"Collection ${collection.getRole} is not a direct property of its entity (e.g. inside an embeddable); unsupported"
+          None
+        case Some(property) =>
+          val label = s"${entityLabel(owner)}.${property.getName}"
+          val kind = collection match
+            case _: org.hibernate.mapping.Set | _: org.hibernate.mapping.Bag => None
+            case other => Some(other.getClass.getSimpleName.toLowerCase(Locale.ROOT))
+          kind.foreach(k => errors += s"$label is a $k collection; only sets and unordered lists are supported")
+          val propertyId = stableId(members(owner.getMappedClass, property.getName), label).getOrElse(Unknown)
+          val keyColumns = collection.getKey.getSelectables.asScala.toVector.collect { case column: Column => column }
+          if keyColumns.size != 1 then
+            errors += s"$label refers to its owner with ${keyColumns.size} columns; only single-column keys are supported"
+          val elementColumns = collection.getElement match
+            case component: Component =>
+              component.getProperties.asScala.toVector.flatMap(columns(_, component.getComponentClass, Vector(propertyId), label))
+            case element =>
+              val selected = element.getSelectables.asScala.toVector.collect { case column: Column => column }
+              if selected.size != 1 then errors += s"$label elements map to ${selected.size} columns; unsupported"
+              selected.map(Owned(_, Vector(propertyId, "element"), s"$label element"))
+          val owned = keyColumns.map(Owned(_, Vector(propertyId, "key"), s"$label key")) ++ elementColumns
+          val entityId = entityIds.get(entityLabel(owner))
+          val tableId = entityId.filter(_ => propertyId != Unknown).map(_ + "/" + propertyId)
+          mapTable(label, s"collection $label", collection.getCollectionTable, tableId, entityId, owned)
+            .filter(_ => kind.isEmpty)
 
-        val columnModels = table.getColumns.asScala.toVector.flatMap { column =>
-          byColumn.get(column) match
-            case Some(o) => columnModel(column, columnId(o), o.label)
-            case None =>
-              errors += s"Column ${column.getName} of entity $label has no @SchemaId origin (e.g. a discriminator or join column); unsupported"
-              None
-        }
-        val primaryKey = Option(table.getPrimaryKey).toVector
-          .flatMap(_.getColumns.asScala).flatMap(byColumn.get).map(columnId)
-        // @UniqueConstraint and @NaturalId become unique keys; @Column(unique) and @OneToOne only mark the column.
-        val uniqueKeys = table.getUniqueKeys.asScala.values.toVector.flatMap { key =>
-          val ordered = key.getColumnOrderMap.asScala.values.forall(order => order == null || order.isBlank ||
-            order.trim.equalsIgnoreCase("asc"))
-          if !ordered then errors += s"Unique key ${key.getName} of entity $label orders its columns; unsupported"
-          Option.when(ordered)(key.getColumns.asScala.toVector)
-        } ++ table.getColumns.asScala.toVector.filter(_.isUnique).map(Vector(_))
-        val uniqueKeyModels = uniqueKeys.distinct.flatMap { columns =>
-          val ids = columns.flatMap(byColumn.get).map(columnId)
-          Option.when(ids.size == columns.size)(UniqueKeyModel(ids))
-        }
-        entityId.map { id =>
-          Mapped(label, table, TableModel(SchemaId(id), qualifiedName(table), columnModels, primaryKey,
-            uniqueKeys = uniqueKeyModels, indexes = indexes(table, label, byColumn.view.mapValues(columnId).toMap)),
-            byColumn.view.mapValues(columnId).toMap)
-        }
+    private def entityLabel(entity: PersistentClass): String = Option(entity.getJpaEntityName).getOrElse(entity.getEntityName)
+
+    /** Builds the table model from the columns that properties own; `idPrefix` is the entity ID
+      * that starts every column ID. Returns None when an ID is unknown, after reporting it.
+      */
+    private def mapTable(
+        label: String,
+        description: String,
+        table: Table,
+        tableId: Option[String],
+        idPrefix: Option[String],
+        owned: Vector[Owned]
+    ): Option[Mapped] =
+      owned.groupBy(_.path).foreach { (path, sharing) =>
+        val labels = sharing.map(_.label).distinct.sorted
+        if labels.size > 1 && !path.contains(Unknown) then
+          errors += s"${labels.mkString(" and ")} share @SchemaId(\"${path.last}\")"
+      }
+      owned.groupBy(_.column).foreach { (column, mapping) =>
+        if mapping.size > 1 then
+          errors += s"${mapping.map(_.label).sorted.mkString(" and ")} map the same column ${column.getName}; unsupported"
+      }
+      val byColumn = owned.map(o => o.column -> o).toMap
+      val columnIds = byColumn.view.mapValues(o => SchemaId((idPrefix.getOrElse(Unknown) +: o.path).mkString("/"))).toMap
+      if !table.getChecks.isEmpty then errors += s"Table ${table.getName} of $description has check constraints; unsupported"
+
+      val columnModels = table.getColumns.asScala.toVector.flatMap { column =>
+        byColumn.get(column) match
+          case Some(o) => columnModel(column, columnIds(column), o.label)
+          case None =>
+            errors += s"Column ${column.getName} of $description has no @SchemaId origin (e.g. a discriminator or join column); unsupported"
+            None
+      }
+      val primaryKey = Option(table.getPrimaryKey).toVector.flatMap(_.getColumns.asScala).flatMap(columnIds.get)
+      // @UniqueConstraint and @NaturalId become unique keys; @Column(unique) and @OneToOne only mark the column.
+      val uniqueKeys = table.getUniqueKeys.asScala.values.toVector.flatMap { key =>
+        val ordered = key.getColumnOrderMap.asScala.values.forall(order => order == null || order.isBlank ||
+          order.trim.equalsIgnoreCase("asc"))
+        if !ordered then errors += s"Unique key ${key.getName} of $description orders its columns; unsupported"
+        Option.when(ordered)(key.getColumns.asScala.toVector)
+      } ++ table.getColumns.asScala.toVector.filter(_.isUnique).map(Vector(_))
+      val uniqueKeyModels = uniqueKeys.distinct.flatMap { columns =>
+        val ids = columns.flatMap(columnIds.get)
+        Option.when(ids.size == columns.size)(UniqueKeyModel(ids))
+      }
+      for
+        id <- tableId
+        _ <- idPrefix
+      yield Mapped(label, description, table, TableModel(SchemaId(id), qualifiedName(table), columnModels, primaryKey,
+        uniqueKeys = uniqueKeyModels, indexes = indexes(table, description, columnIds)), columnIds)
 
     /** @Index becomes a plain index; @Index(unique = true) is a unique key in Hibernate's model. */
-    private def indexes(table: Table, entity: String, columnIds: Map[Column, SchemaId]): Vector[IndexModel] =
+    private def indexes(table: Table, description: String, columnIds: Map[Column, SchemaId]): Vector[IndexModel] =
       table.getIndexes.asScala.values.toVector.flatMap { index =>
-        val label = s"Index ${index.getName} of entity $entity"
+        val label = s"Index ${index.getName} of $description"
         val selectables = index.getSelectables.asScala.toVector
         val columns = selectables.collect { case column: Column => column }
         val orders = index.getSelectableOrderMap.asScala
@@ -203,7 +272,7 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
         case _ if property.isSynthetic =>
           errors += s"$label is a synthetic Hibernate property (e.g. a unidirectional one-to-many join column); unsupported"
           selected.map(Owned(_, path :+ Unknown, label))
-        case _: CollectionMapping => Vector.empty // A collection table is reported separately.
+        case _: CollectionMapping => Vector.empty // A collection's columns live in its own table.
         case _ if selected.isEmpty => Vector.empty // Formulas and inverse sides own no column.
         case component: Component =>
           val id = stableId(members(owner, property.getName), label).getOrElse(Unknown)
