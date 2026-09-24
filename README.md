@@ -22,8 +22,9 @@ ALTER TABLE "public"."customer" RENAME COLUMN "nick_name" TO "alias";
 An ID consists of eight random hex digits, is assigned once and never changed. The
 [architecture](docs/architecture.md) describes the design, the rules and the open points.
 
-Status: prototype for PostgreSQL 14+, not yet a production-ready migration tool. A typical
-entity with a `UUID`, timestamps or foreign keys cannot be mapped yet.
+Status: prototype for PostgreSQL 14+, not yet a production-ready migration tool. Entities
+with `UUID` keys and timestamps can be mapped; associations (foreign keys) and unique
+constraints cannot yet.
 
 ## Getting started
 

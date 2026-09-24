@@ -4,7 +4,7 @@ import io.github.hibernateddl.core.*
 
 import java.nio.charset.StandardCharsets
 
-/** Pure PostgreSQL DDL rendering for rename operations.
+/** Pure PostgreSQL DDL rendering.
   *
   * The limit is PostgreSQL's default identifier limit of 63 UTF-8 bytes. Servers
   * compiled with a different NAMEDATALEN are deliberately outside this dialect's
@@ -12,6 +12,7 @@ import java.nio.charset.StandardCharsets
   */
 object PostgreSqlDialect extends SchemaDialect:
   private val MaxIdentifierBytes = 63
+  private val MaxTimestampPrecision = 6
 
   override def render(
       operations: Vector[SchemaOperation]
@@ -24,12 +25,7 @@ object PostgreSqlDialect extends SchemaDialect:
 
   private def validate(operation: SchemaOperation): Vector[String] =
     operation match
-      case SchemaOperation.CreateTable(table) =>
-        validateName(table.name, "new table") ++
-          table.columns.flatMap(column => validateColumn(column, "new table column")) ++
-          table.primaryKey.filterNot(id => table.columns.exists(_.id == id)).map { id =>
-            s"The new table primary key references unknown column '${id.value}'."
-          }
+      case SchemaOperation.CreateTable(table) => validateTable(table, "new table")
       case SchemaOperation.AddColumn(_, table, column) =>
         validateName(table, "table") ++
           validateColumn(column, "new column") ++
@@ -45,9 +41,21 @@ object PostgreSqlDialect extends SchemaDialect:
           validateIdentifier(from, "source column") ++
           validateIdentifier(to, "target column")
 
+  /** Checks names, column types and primary key of a table as this dialect would create it. */
+  private[postgresql] def validateTable(table: TableModel, label: String = "table"): Vector[String] =
+    validateName(table.name, label) ++
+      table.columns.flatMap(column => validateColumn(column, s"$label column")) ++
+      table.primaryKey.filterNot(id => table.columns.exists(_.id == id)).map { id =>
+        s"The $label primary key references unknown column '${id.value}'."
+      }
+
   private def validateColumn(column: ColumnModel, label: String): Vector[String] =
     validateIdentifier(column.name, label) ++ (column.dataType match
       case SqlType.Varchar(length) if length <= 0 => Vector(s"$label has invalid VARCHAR length $length.")
+      case SqlType.Timestamp(precision) if precision < 0 || precision > MaxTimestampPrecision =>
+        Vector(s"$label has TIMESTAMP precision $precision; PostgreSQL supports 0 to $MaxTimestampPrecision.")
+      case SqlType.TimestampWithTimeZone(precision) if precision < 0 || precision > MaxTimestampPrecision =>
+        Vector(s"$label has TIMESTAMP precision $precision; PostgreSQL supports 0 to $MaxTimestampPrecision.")
       case _ => Vector.empty
     )
 
@@ -96,10 +104,13 @@ object PostgreSqlDialect extends SchemaDialect:
 
   private def renderType(dataType: SqlType): String = dataType match
     case SqlType.Varchar(length) => s"varchar($length)"
+    case SqlType.Timestamp(precision) => s"timestamp($precision)"
+    case SqlType.TimestampWithTimeZone(precision) => s"timestamp($precision) with time zone"
     case SqlType.Integer => "integer"
     case SqlType.BigInt => "bigint"
     case SqlType.Boolean => "boolean"
     case SqlType.Text => "text"
+    case SqlType.Uuid => "uuid"
 
   private def qualified(name: QualifiedName): String =
     (name.schema.toVector :+ name.name).map(quoted).mkString(".")
