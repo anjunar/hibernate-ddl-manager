@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sets the release version in build.sbt and in the installation examples of README.md.
+# Sets the release version in build.sbt and in the facts row and installation examples of README.md.
 # With --check it changes nothing and fails when a file names another version; without a
 # VERSION, --check takes the one in build.sbt, so CI can verify that the files agree.
 set -euo pipefail
@@ -38,9 +38,10 @@ if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
   exit 2
 fi
 
-# Every version the examples name: sbt's `% "x"` after a module and Maven's <version>.
+# Every version the README names: the facts row, sbt's `% "x"` after a module and Maven's <version>.
 readme_versions() {
-  { grep -o '"com\.anjunar\.hibernateddl" %% "schema-[a-z]*" % "[^"]*"' README.md | sed 's/.*% "\([^"]*\)"$/\1/'
+  { grep -o '^| [0-9][^ |]* |' README.md | sed 's/^| \([^ |]*\) |$/\1/'
+    grep -o '"com\.anjunar\.hibernateddl" %% "schema-[a-z]*" % "[^"]*"' README.md | sed 's/.*% "\([^"]*\)"$/\1/'
     grep -o '<version>[^<]*</version>' README.md | sed 's/<version>\(.*\)<\/version>/\1/'
   } | sort -u
 }
@@ -65,6 +66,7 @@ fi
 # perl edits in place on Linux, macOS and Git Bash alike and keeps each file's line endings.
 perl -pi -e "s/^(\\s*version\\s*:=\\s*\")[^\"]*\"/\${1}${VERSION}\"/" build.sbt
 perl -pi \
+  -e "s/^(\\| )[0-9][^ |]*( \\|)/\${1}${VERSION}\${2}/;" \
   -e "s/(\"com\\.anjunar\\.hibernateddl\" %% \"schema-[a-z]*\" % \")[^\"]*\"/\${1}${VERSION}\"/g;" \
   -e "s/<version>[^<]*<\\/version>/<version>${VERSION}<\\/version>/g" \
   README.md
