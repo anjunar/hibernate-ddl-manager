@@ -211,6 +211,42 @@ class HibernateSchemaSourceSuite extends munit.FunSuite:
       "Sequence voucher_numbers generates the keys of entities Coupon, Voucher; give each entity its own sequence")))
   }
 
+  test("a single-table hierarchy shares one table with a discriminator; subclass columns carry the subclass ID") {
+    val animal = read(classOf[Animal], classOf[Cat], classOf[Dog]).toOption.get.tables match
+      case Vector(table) => table
+      case tables => fail(s"Expected one table, got ${tables.map(_.id)}")
+    assertEquals(animal.id, SchemaId("1a2b3c4e"))
+    assertEquals(
+      animal.columns.map(c => c.id.value -> (c.name.value, c.nullable)).toMap,
+      Map(
+        "1a2b3c4e/discriminator" -> ("dtype", false), "1a2b3c4e/0a1b2c3d" -> ("id", false),
+        "1a2b3c4e/1b2c3d4e" -> ("name", true), "2b3c4d5f/2c3d4e5f" -> ("lives", true), "3c4d5e60/3d4e5f60" -> ("breed", true)
+      )
+    )
+    assertEquals(animal.columns.find(_.id == SchemaId("1a2b3c4e/discriminator")).flatMap(_.check),
+      Some(ColumnCheck.AllowedValues(Vector("Animal", "Cat", "Dog"))))
+  }
+
+  test("a joined subclass has its own table whose key references the parent table") {
+    val model = read(classOf[Vehicle], classOf[Car]).toOption.get
+    val car = model.tables.find(_.id == SchemaId("5e6f7082")).get
+    assertEquals(car.columns.map(c => c.id.value -> c.name.value).toMap,
+      Map("5e6f7082/key" -> "id", "5e6f7082/2c3d4e5f" -> "seats"))
+    assertEquals(car.primaryKey, Vector(SchemaId("5e6f7082/key")))
+    assertEquals(car.foreignKeys, Vector(ForeignKeyModel(Vector(SchemaId("5e6f7082/key")), SchemaId("4d5e6f71"),
+      Vector(SchemaId("4d5e6f71/0a1b2c3d")))))
+    assertEquals(SchemaValidation.validate(model), Vector.empty)
+  }
+
+  test("table-per-class subclasses repeat inherited columns under their own ID and share the root's sequence") {
+    val model = read(classOf[Payment], classOf[CardPayment], classOf[TransferPayment]).toOption.get
+    assertEquals(model.tables.map(_.id).toSet, Set(SchemaId("708192a4"), SchemaId("8192a3b5")))
+    val card = model.tables.find(_.id == SchemaId("708192a4")).get
+    assertEquals(card.columns.map(c => c.id.value -> c.name.value).toMap,
+      Map("708192a4/0a1b2c3d" -> "id", "708192a4/1b2c3d4e" -> "amount", "708192a4/2c3d4e5f" -> "card"))
+    assertEquals(model.sequences.map(s => s.id.value -> s.name.name.value), Vector("6f708193/0a1b2c3d/sequence" -> "payment_seq"))
+  }
+
   test("fresh IDs have the required format") {
     assert(Vector.fill(20)(HibernateSchemaSource.newId()).forall(_.matches("[0-9a-f]{8}")))
   }
