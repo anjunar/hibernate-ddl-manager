@@ -155,7 +155,9 @@ final class JdbcMigrationExecutor(
     }
 
   /** Records a target that an operator migrated to by hand as the next revision, without DDL.
-    * The option must name exactly this target's fingerprint, and the database must match it.
+    * The option must name exactly this target's fingerprint, and the database must match it:
+    * the target's tables exactly, and no table or sequence of the previous model may remain
+    * under a name the target no longer has, since it would silently leave management.
     */
   private def acceptManual(
       connection: Connection,
@@ -170,6 +172,14 @@ final class JdbcMigrationExecutor(
     if history.isEmpty then
       refuse(Vector("A database without schema history has no previous revision to migrate by hand; " +
         "adopt an existing database with adoptExistingSchema instead"))
+    val previous = history.last.model
+    val targetNames = (target.tables.map(_.name) ++ target.sequences.map(_.name)).toSet
+    val left = SchemaModel(previous.tables.filterNot(t => targetNames.contains(t.name)),
+      previous.sequences.filterNot(s => targetNames.contains(s.name)))
+    val remaining = backend.existingRelations(connection, left)
+    if remaining.nonEmpty then
+      refuse(Vector(s"Manually migrated schema does not match database: ${remaining.map(_.display).sorted.mkString(", ")} " +
+        "of the previous schema still exist, but the target no longer has them; drop or rename them first"))
     validateDatabase(connection, target, "Manually migrated schema")
     val latest = history.last.entry
     backend.recordHistory(connection, HistoryEntry(latest.revision + 1, latest.targetFingerprint, targetFingerprint,
