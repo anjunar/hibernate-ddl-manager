@@ -163,6 +163,22 @@ there:
   model remains under a name the target no longer has, and records the target as the next
   revision with no statements. An option naming another target is refused. Earlier-revision, retired-ID and
   drift checks still apply.
+- A column that becomes required (a new required column in an existing table is added
+  nullable first) gets `SET NOT NULL` after the foreign keys and before the drops. Right
+  before it, the one registered backfill that targets the column and is not recorded yet
+  fills its NULLs, and a count under the lock must find none left. Several such backfills
+  for one column, a backfill reading a column that another fills, and a value that does not
+  fit are refused before any change. See [backfills](backfills-and-not-null.md).
+- `__hibernate_ddl.backfill_history` records each backfill once, with the format and
+  checksum of its definition, the target column ID, the schema revision and fingerprints of
+  the migration that recorded it, and whether it was executed (with the updated rows), not
+  required because a new table created the column, or adopted because adoption or a manual
+  migration found the column required. Before anything else, even when the schema is
+  already applied, every record must match the schema history and every registered backfill
+  its record; a changed definition needs a new ID. A backfill whose column does not become
+  required stays pending and is reported in `MigrationResult.pendingBackfills`. The schema
+  history, its models and fingerprints do not change; the backfill history references its
+  revisions.
 - A dropped ID is retired: an ID that an earlier revision had and the latest does not may
   never appear again, not even with approvals. This rejects an ID copied from the version
   history of the code, which would attach the dropped object's identity to a new one.
