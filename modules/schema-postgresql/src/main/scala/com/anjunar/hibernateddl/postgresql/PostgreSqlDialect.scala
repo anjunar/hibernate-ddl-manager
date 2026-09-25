@@ -201,6 +201,45 @@ object PostgreSqlDialect extends SchemaDialect:
     val check = column.check.fold("")(value => " " + renderCheck(column.id, column.name, value))
     s"${quoted(column.name)} ${renderType(column.dataType)}$nullable$identity$check"
 
+  /** An UPDATE that fills a column's NULLs. Every constant is a JDBC parameter, cast to the type
+    * it fills, which it fits without rounding. Concatenation uses `||`, which is NULL when any part
+    * is; the assignment to the column fails, rather than truncates, when a value is too long.
+    */
+  private[postgresql] def renderFill(fill: NullFill): Either[Vector[String], (String, Vector[AnyRef])] =
+    def names(value: FillValue): Vector[String] = value match
+      case FillValue.Literal(BackfillLiteral.Text(text), _) =>
+        Option.when(text.contains('\u0000'))("A text constant must not contain NUL.").toVector
+      case FillValue.Literal(_, _) => Vector.empty
+      case FillValue.Column(name) => validateIdentifier(name, "source column")
+      case FillValue.Coalesce(values) => values.flatMap(names)
+      case FillValue.Concat(values) => values.flatMap(names)
+    val errors = validateName(fill.table, "filled table") ++ validateIdentifier(fill.column, "filled column") ++ names(fill.value)
+    if errors.nonEmpty then Left(errors.map(message => s"Backfill '${fill.backfillId}': $message"))
+    else
+      val parameters = Vector.newBuilder[AnyRef]
+      def expression(value: FillValue): String = value match
+        case FillValue.Literal(literal, as) =>
+          parameters += parameter(literal)
+          s"CAST(? AS ${renderType(as)})"
+        case FillValue.Column(name) => quoted(name)
+        case FillValue.Coalesce(values) => values.map(expression).mkString("COALESCE(", ", ", ")")
+        case FillValue.Concat(values) => values.map(expression).mkString("(", " || ", ")")
+      val sql = s"UPDATE ${qualified(fill.table)} SET ${quoted(fill.column)} = ${expression(fill.value)} " +
+        s"WHERE ${quoted(fill.column)} IS NULL"
+      Right(sql -> parameters.result())
+
+  private def parameter(literal: BackfillLiteral): AnyRef = literal match
+    case BackfillLiteral.Text(value) => value
+    case BackfillLiteral.WholeNumber(value) => java.lang.Long.valueOf(value)
+    case BackfillLiteral.Decimal(value) => value
+    case BackfillLiteral.FloatingPoint(value) => java.lang.Double.valueOf(value)
+    case BackfillLiteral.Bool(value) => java.lang.Boolean.valueOf(value)
+    case BackfillLiteral.Uuid(value) => value
+    case BackfillLiteral.Date(value) => value
+    case BackfillLiteral.Time(value) => value
+    case BackfillLiteral.Timestamp(value) => value
+    case BackfillLiteral.TimestampWithTimeZone(value) => value
+
   /** Counts the rows in which a column is NULL. */
   private[postgresql] def nullCount(table: QualifiedName, column: SqlIdentifier): String =
     s"SELECT count(*) FROM ${qualified(table)} WHERE ${quoted(column)} IS NULL"
