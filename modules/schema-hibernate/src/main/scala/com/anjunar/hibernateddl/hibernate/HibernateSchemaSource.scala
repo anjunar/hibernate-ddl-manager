@@ -178,6 +178,9 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
           }
       }
       known.flatMap { sequence =>
+        options(sequence.getOptions).foreach { options =>
+          errors += s"Sequence ${sequence.getExportIdentifier} has options '$options'; unsupported"
+        }
         users.filter(_._1 eq sequence).map(_._2) match
           case Vector((_, keyId)) =>
             val name = sequence.getName
@@ -210,6 +213,7 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
         val referenced = byTable.get(key.getReferencedTable)
         val problems = Vector(
           Option.when(!key.isReferenceToPrimaryKey)("references columns other than the primary key"),
+          options(key.getOptions).map(options => s"has options '$options'"),
           Option(key.getOnDeleteAction).filter(_ != OnDeleteAction.NO_ACTION).map(action => s"has ON DELETE $action"),
           Option.when(referenced.isEmpty && !ownedTables.contains(key.getReferencedTable))(
             s"references table ${key.getReferencedTable.getName}, which belongs to no entity")
@@ -339,6 +343,9 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
           val tableId = entityId.filter(_ => propertyId != Unknown).map(_ + "/" + propertyId)
           mapTable(label, s"collection $label", collection.getCollectionTable, tableId, owned).filter(_ => !identified)
 
+    /** DDL text that Hibernate appends verbatim; the model cannot represent any of it. */
+    private def options(value: String): Option[String] = Option(value).map(_.trim).filter(_.nonEmpty)
+
     private def entityLabel(entity: PersistentClass): String = Option(entity.getJpaEntityName).getOrElse(entity.getEntityName)
 
     /** Builds the table model from the columns that properties own; each column's ID is its
@@ -364,6 +371,10 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
       val byColumn = owned.map(o => o.column -> o).toMap
       val columnIds = byColumn.view.mapValues(o => SchemaId(o.path.mkString("/"))).toMap
       if !table.getChecks.isEmpty then errors += s"Table ${table.getName} of $description has check constraints; unsupported"
+      options(table.getOptions).foreach(options => errors += s"Table ${table.getName} of $description has options '$options'; unsupported")
+      Option(table.getPrimaryKey).flatMap(key => options(key.getOptions)).foreach { options =>
+        errors += s"Primary key of $description has options '$options'; unsupported"
+      }
 
       val columnModels = table.getColumns.asScala.toVector.flatMap { column =>
         byColumn.get(column) match
@@ -378,7 +389,8 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
         val ordered = key.getColumnOrderMap.asScala.values.forall(order => order == null || order.isBlank ||
           order.trim.equalsIgnoreCase("asc"))
         if !ordered then errors += s"Unique key ${key.getName} of $description orders its columns; unsupported"
-        Option.when(ordered)(key.getColumns.asScala.toVector)
+        options(key.getOptions).foreach(options => errors += s"Unique key ${key.getName} of $description has options '$options'; unsupported")
+        Option.when(ordered && options(key.getOptions).isEmpty)(key.getColumns.asScala.toVector)
       } ++ table.getColumns.asScala.toVector.filter(_.isUnique).map(Vector(_))
       val uniqueKeyModels = uniqueKeys.distinct.flatMap { columns =>
         val ids = columns.flatMap(columnIds.get)
@@ -398,7 +410,7 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
         val orders = index.getSelectableOrderMap.asScala
         val directions = columns.map(column => Option(orders.getOrElse(column, null)).fold("")(_.trim.toLowerCase(Locale.ROOT)))
         val problems = Vector(
-          Option(index.getOptions).filterNot(_.isBlank).map(options => s"has options '$options'"),
+          options(index.getOptions).map(options => s"has options '$options'"),
           Option.when(columns.size != selectables.size)("indexes an expression"),
           Option.when(index.isUnique)("is a unique index"),
           directions.find(direction => !Set("", "asc", "desc").contains(direction)).map(order => s"orders a column '$order'")
@@ -429,6 +441,8 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
 
     private def columnModel(column: Column, id: SchemaId, label: String): Option[ColumnModel] =
       Vector(
+        // Hibernate appends options verbatim to the column's DDL, for example a CHECK clause.
+        options(column.getOptions).map(options => s"the options '$options'"),
         Option.when(column.getDefaultValue != null)("a default value"),
         Option.when(column.getGeneratedAs != null)("a generation expression"),
         Option.when(column.getCollation != null)("a custom collation")
