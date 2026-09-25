@@ -188,7 +188,8 @@ class PostgreSqlDialectSuite extends munit.FunSuite:
   test("further types render as PostgreSQL types and out-of-range sizes are rejected") {
     val types = Vector(SqlType.Char(1) -> "char(1)", SqlType.Numeric(10, 2) -> "numeric(10,2)", SqlType.Time(0) -> "time(0)",
       SqlType.SmallInt -> "smallint", SqlType.Real -> "real", SqlType.DoublePrecision -> "double precision",
-      SqlType.Date -> "date", SqlType.Binary -> "bytea")
+      SqlType.Date -> "date", SqlType.Binary -> "bytea", SqlType.LargeObject -> "oid",
+      SqlType.Json -> "jsonb")
     types.foreach { (dataType, sql) =>
       val column = ColumnModel(SchemaId("x"), SqlIdentifier("x"), dataType)
       assertEquals(PostgreSqlDialect.render(Vector(AddColumn(tableId, name("t"), column))),

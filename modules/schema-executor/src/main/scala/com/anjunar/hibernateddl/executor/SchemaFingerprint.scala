@@ -58,6 +58,8 @@ object SchemaFingerprint:
           case SqlType.DoublePrecision => string(out, "double precision")
           case SqlType.Date => string(out, "date")
           case SqlType.Binary => string(out, "binary")
+          case SqlType.LargeObject => string(out, "large object")
+          case SqlType.Json => string(out, "json")
         out.writeBoolean(column.nullable)
       }
       ids(out, table.primaryKey)

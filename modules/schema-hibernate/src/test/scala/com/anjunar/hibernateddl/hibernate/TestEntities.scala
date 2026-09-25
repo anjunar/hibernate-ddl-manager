@@ -2,7 +2,8 @@ package com.anjunar.hibernateddl.hibernate
 
 import com.anjunar.hibernateddl.hibernate.annotation.{SchemaId, SecondaryTableId}
 import jakarta.persistence.*
-import org.hibernate.annotations.{NaturalId, OnDelete, OnDeleteAction}
+import org.hibernate.annotations.{JdbcTypeCode, NaturalId, OnDelete, OnDeleteAction}
+import org.hibernate.`type`.SqlTypes
 
 import scala.compiletime.uninitialized
 
@@ -190,6 +191,38 @@ class Profile:
   @SchemaId("2c3d4e5f") @Column(table = "profile_details") var bio: String = uninitialized
   @SchemaId("3d4e5f60") @Column(table = "profile_details") var essay: String = uninitialized
 
+/** Large objects: @Lob text, bytes and JDBC LOBs, all stored as PostgreSQL large objects. */
+@Entity
+@SchemaId("a2b3c4d5")
+class Document:
+  @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+  @SchemaId("1b2c3d4e") @Lob var body: String = uninitialized
+  @SchemaId("2c3d4e5f") @Lob var scan: Array[Byte] = uninitialized
+  @SchemaId("3d4e5f60") var attachment: java.sql.Blob = uninitialized
+  @SchemaId("4e5f6071") var notes: java.sql.Clob = uninitialized
+
+/** Stored as one JSON document; its properties need no IDs. */
+@Embeddable
+class Preferences:
+  var theme: String = uninitialized
+  var pageSize: Integer = uninitialized
+
+/** Hibernate guards an enum or a NOT NULL property inside a JSON document with a table check. */
+@Embeddable
+class Guarded:
+  @Enumerated(EnumType.STRING) var status: Status = uninitialized
+  @Column(nullable = false) var name: String = uninitialized
+
+/** JSON documents: a map, a list, raw text and an embeddable stored as one JSON column. */
+@Entity
+@SchemaId("b3c4d5e6")
+class Settings:
+  @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+  @SchemaId("1b2c3d4e") @JdbcTypeCode(SqlTypes.JSON) var values: java.util.Map[String, Object] = uninitialized
+  @SchemaId("2c3d4e5f") @JdbcTypeCode(SqlTypes.JSON) var tags: java.util.List[String] = uninitialized
+  @SchemaId("3d4e5f60") @JdbcTypeCode(SqlTypes.JSON) var raw: String = uninitialized
+  @SchemaId("4e5f6071") @Embedded @JdbcTypeCode(SqlTypes.JSON) var preferences: Preferences = uninitialized
+
 /** A secondary table without @SecondaryTableId, and one that names no secondary table. */
 @Entity
 @SchemaId("4b5c6d7e")
@@ -267,11 +300,11 @@ class Measurement:
 @Table(indexes = Array(new Index(columnList = "code", options = "WHERE code IS NOT NULL")))
 class Unsupported:
   @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
-  @SchemaId("4a1b2c3d") @org.hibernate.annotations.JdbcTypeCode(org.hibernate.`type`.SqlTypes.JSON) var document: String = uninitialized
   @SchemaId("1a1b2c3d") @ManyToOne @OnDelete(action = OnDeleteAction.CASCADE) var customer: LegacyCustomer = uninitialized
   @SchemaId("2a1b2c3d") @Embedded var folder: Folder = uninitialized
   @SchemaId("3a1b2c3d") var code: String = uninitialized
-  @SchemaId("5a1b2c3d") @Lob var attachment: Array[Byte] = uninitialized
+  @SchemaId("5a1b2c3d") var tags: Array[String] = uninitialized
+  @SchemaId("6a1b2c3d") @Embedded @JdbcTypeCode(SqlTypes.JSON) var guarded: Guarded = uninitialized
 
 /** Hibernate's default key generation: the sequence Generated_SEQ with increment 50. */
 @Entity
