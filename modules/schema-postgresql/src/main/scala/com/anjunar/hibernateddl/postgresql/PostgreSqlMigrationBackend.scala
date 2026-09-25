@@ -603,6 +603,7 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
         case "float8" if typmod == -1 => Some(SqlType.DoublePrecision)
         case "date" if typmod == -1 => Some(SqlType.Date)
         case "bytea" if typmod == -1 => Some(SqlType.Binary)
+        case "oid" if typmod == -1 => Some(SqlType.LargeObject)
         case "bpchar" if typmod > 4 => Some(SqlType.Char(typmod - 4))
         // typmod - 4 holds the precision in the upper 16 bits and an 11-bit signed scale.
         case "numeric" if typmod >= 4 && ((typmod - 4) & 0x400) == 0 =>

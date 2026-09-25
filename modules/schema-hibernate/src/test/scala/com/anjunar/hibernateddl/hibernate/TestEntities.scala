@@ -190,6 +190,16 @@ class Profile:
   @SchemaId("2c3d4e5f") @Column(table = "profile_details") var bio: String = uninitialized
   @SchemaId("3d4e5f60") @Column(table = "profile_details") var essay: String = uninitialized
 
+/** Large objects: @Lob text, bytes and JDBC LOBs, all stored as PostgreSQL large objects. */
+@Entity
+@SchemaId("a2b3c4d5")
+class Document:
+  @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+  @SchemaId("1b2c3d4e") @Lob var body: String = uninitialized
+  @SchemaId("2c3d4e5f") @Lob var scan: Array[Byte] = uninitialized
+  @SchemaId("3d4e5f60") var attachment: java.sql.Blob = uninitialized
+  @SchemaId("4e5f6071") var notes: java.sql.Clob = uninitialized
+
 /** A secondary table without @SecondaryTableId, and one that names no secondary table. */
 @Entity
 @SchemaId("4b5c6d7e")
@@ -271,7 +281,7 @@ class Unsupported:
   @SchemaId("1a1b2c3d") @ManyToOne @OnDelete(action = OnDeleteAction.CASCADE) var customer: LegacyCustomer = uninitialized
   @SchemaId("2a1b2c3d") @Embedded var folder: Folder = uninitialized
   @SchemaId("3a1b2c3d") var code: String = uninitialized
-  @SchemaId("5a1b2c3d") @Lob var attachment: Array[Byte] = uninitialized
+  @SchemaId("5a1b2c3d") var tags: Array[String] = uninitialized
 
 /** Hibernate's default key generation: the sequence Generated_SEQ with increment 50. */
 @Entity

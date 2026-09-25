@@ -195,7 +195,7 @@ class HibernateSchemaSourceSuite extends munit.FunSuite:
   test("mappings the model cannot represent are reported instead of dropped") {
     val diagnostics = errors(classOf[Unsupported], classOf[LegacyCustomer])
     assert(diagnostics.exists(_.contains("Unsupported.document has SQL type 'jsonb'")), diagnostics)
-    assert(diagnostics.exists(_.contains("Unsupported.attachment has SQL type 'oid'")), diagnostics)
+    assert(diagnostics.exists(_.contains("Unsupported.tags has SQL type 'varchar(255) array'")), diagnostics)
     assert(diagnostics.exists(_.contains("of entity Unsupported has ON DELETE CASCADE; unsupported")), diagnostics)
     assert(diagnostics.exists(_.contains("Unsupported.folder.files is not a direct property")), diagnostics)
     assert(diagnostics.exists(_.contains("of entity Unsupported has options 'WHERE code IS NOT NULL'; unsupported")), diagnostics)
@@ -290,6 +290,13 @@ class HibernateSchemaSourceSuite extends munit.FunSuite:
       """The secondary table unlabelled_details of entity Unlabelled has no @SecondaryTableId; add e\.g\. """ +
         """@SecondaryTableId\(table = "unlabelled_details", value = "[0-9a-f]{8}"\)""")), diagnostics)
     assert(diagnostics.contains("@SecondaryTableId(table = \"elsewhere\") of entity Unlabelled names no secondary table"), diagnostics)
+  }
+
+  test("@Lob values, Blob and Clob are large objects") {
+    val table = read(classOf[Document]).toOption.get.tables.head
+    assertEquals(table.columns.map(c => c.name.value -> c.dataType).toMap, Map(
+      "id" -> SqlType.BigInt, "body" -> SqlType.LargeObject, "scan" -> SqlType.LargeObject,
+      "attachment" -> SqlType.LargeObject, "notes" -> SqlType.LargeObject))
   }
 
   test("DDL options that Hibernate appends verbatim are reported instead of dropped") {

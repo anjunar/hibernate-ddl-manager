@@ -97,6 +97,26 @@ class SchemaMigrationIntegrationSuite extends TestPostgres:
     }
   }
 
+  test("Hibernate writes and reads @Lob values in the large object columns the migration created") {
+    withDatabase { ds =>
+      withSessionFactory(ds, Seq(classOf[Document]), enabled, validate) { factory =>
+        factory.inTransaction { session =>
+          val document = new Document
+          document.id = 1L
+          document.body = "A long text"
+          document.scan = Array[Byte](1, 2, 3)
+          session.persist(document)
+        }
+        factory.inTransaction { session =>
+          val document = session.find(classOf[Document], 1L)
+          assertEquals(document.body, "A long text")
+          assertEquals(document.scan.toVector, Vector[Byte](1, 2, 3))
+        }
+      }
+      assertEquals(scalar(ds, "SELECT count(*) FROM pg_largeobject_metadata"), "2")
+    }
+  }
+
   test("settings carry approvals: removing an entity drops its table and sequence only when approved") {
     withDatabase { ds =>
       withSessionFactory(ds, entities, enabled)(_ => ())
