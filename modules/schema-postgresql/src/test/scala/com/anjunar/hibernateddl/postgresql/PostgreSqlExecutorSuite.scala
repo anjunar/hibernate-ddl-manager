@@ -2,68 +2,12 @@ package com.anjunar.hibernateddl.postgresql
 
 import com.anjunar.hibernateddl.core.*
 import com.anjunar.hibernateddl.executor.*
-import io.zonky.test.db.postgres.embedded.EmbeddedPostgres
-import org.postgresql.ds.PGSimpleDataSource
-import java.nio.file.Files
-import java.util.UUID
 import java.util.concurrent.{Callable, CountDownLatch, Executors, TimeUnit}
 import javax.sql.DataSource
 import scala.util.Using
 
-/** Runs against real PostgreSQL: the server named by the JDBC URL in HIBERNATE_DDL_TEST_POSTGRES,
-  * for example in the cloud, or otherwise a temporary embedded cluster. Every test uses its own
-  * temporary database, so an existing server keeps its other databases untouched.
-  */
-class PostgreSqlExecutorSuite extends munit.FunSuite:
-  private var embedded: EmbeddedPostgres = null
-  private var database: Option[String] => DataSource = null
+class PostgreSqlExecutorSuite extends TestPostgres:
   private val executor = new JdbcMigrationExecutor(PostgreSqlMigrationBackend)
-
-  override def beforeAll(): Unit =
-    database = sys.env.get("HIBERNATE_DDL_TEST_POSTGRES") match
-      case Some(url) => name =>
-        val dataSource = new PGSimpleDataSource()
-        dataSource.setUrl(url)
-        name.foreach(dataSource.setDatabaseName)
-        dataSource
-      case None =>
-        val target = java.nio.file.Path.of("target").toAbsolutePath
-        Files.createDirectories(target)
-        embedded =
-          try EmbeddedPostgres.builder()
-            .setDataDirectory(Files.createTempDirectory(target, "executor-pg-"))
-            .setServerConfig("listen_addresses", "127.0.0.1")
-            .setServerConfig("synchronous_commit", "on")
-            .setPort(0)
-            .start()
-          catch case error: Exception => throw new IllegalStateException(
-            "Embedded PostgreSQL did not start (it refuses to run as root). " +
-              "Set HIBERNATE_DDL_TEST_POSTGRES to the JDBC URL of an existing server instead.", error)
-        name => name.fold(embedded.getPostgresDatabase)(embedded.getDatabase("postgres", _))
-
-  override def afterAll(): Unit =
-    if embedded != null then embedded.close()
-
-  private def withDatabase[A](body: DataSource => A): A =
-    val name = "executor_" + UUID.randomUUID().toString.replace("-", "")
-    execute(database(None), s"CREATE DATABASE $name")
-    try body(database(Some(name)))
-    finally execute(database(None), s"DROP DATABASE $name WITH (FORCE)")
-
-  private def execute(ds: DataSource, sql: String): Unit =
-    Using.resource(ds.getConnection) { connection =>
-      Using.resource(connection.createStatement())(_.execute(sql))
-    }
-
-  private def scalar(ds: DataSource, sql: String): String =
-    Using.resource(ds.getConnection) { connection =>
-      Using.resource(connection.createStatement()) { statement =>
-        Using.resource(statement.executeQuery(sql)) { rows =>
-          assert(rows.next())
-          rows.getString(1)
-        }
-      }
-    }
 
   private val login = ColumnModel(SchemaId("USER_LOGIN"), SqlIdentifier("username"), SqlType.Varchar(100), false)
   private val users = TableModel(SchemaId("USER"), QualifiedName(SqlIdentifier("users"), Some(SqlIdentifier("public"))), Vector(login))
@@ -211,6 +155,25 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
       assertEquals(scalar(ds, "SELECT username FROM public.users"), "patrick")
       assertEquals(revisions(ds), "1")
       assertEquals(executor.migrate(ds, target).status, MigrationStatus.Applied)
+    }
+  }
+
+  test("checking an applied schema lets a running application keep writing; a migration waits for it") {
+    withDatabase { ds =>
+      fixture(ds)
+      val impatient = new JdbcMigrationExecutor(PostgreSqlMigrationBackend,
+        ExecutionOptions(lockTimeoutMillis = 200, statementTimeoutMillis = 2000))
+      Using.resource(ds.getConnection) { application =>
+        application.setAutoCommit(false)
+        try
+          Using.resource(application.createStatement())(_.execute("INSERT INTO public.users VALUES ('ada')"))
+          assertEquals(impatient.migrate(ds, initial), MigrationResult(1, MigrationStatus.AlreadyApplied, 0))
+          Using.resource(application.createStatement())(_.execute("INSERT INTO public.users VALUES ('grace')"))
+          assertEquals(intercept[MigrationException](impatient.migrate(ds, target)).state, FailureState.RolledBack)
+        finally application.commit()
+      }
+      assertEquals(scalar(ds, "SELECT count(*) FROM public.users"), "3")
+      assertEquals(impatient.migrate(ds, target).status, MigrationStatus.Applied)
     }
   }
 
@@ -593,7 +556,8 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
     val model = TestMetadata.read(classOf[Article], classOf[Label], classOf[Invoice], classOf[LegacyCustomer],
       classOf[Account], classOf[Shipment], classOf[Measurement], classOf[Letter], classOf[Purchase],
       classOf[Generated], classOf[Ticket], classOf[Voucher], classOf[Animal], classOf[Cat], classOf[Dog],
-      classOf[Vehicle], classOf[Car], classOf[Payment], classOf[CardPayment], classOf[TransferPayment], classOf[Shelf])
+      classOf[Vehicle], classOf[Car], classOf[Payment], classOf[CardPayment], classOf[TransferPayment], classOf[Shelf],
+      classOf[Profile])
       .fold(errors => fail(errors.mkString("\n")), identity)
     withDatabase { ds =>
       val result = executor.migrate(ds, model)
@@ -617,6 +581,9 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
         "INSERT INTO public.shelf_weights (shelf_id, label_id, weights) VALUES (1, 7, 3)")
       intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.shelf_titles (shelf_id, lang, titles) VALUES (1, 'de', 'Brett')"))
       intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.shelf_weights (shelf_id, label_id, weights) VALUES (1, 8, 1)"))
+      execute(ds, "INSERT INTO public.profile (id, name) VALUES (1, 'Ada'); " +
+        "INSERT INTO public.profile_details (id, bio) VALUES (1, 'Mathematician')")
+      intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.profile_details (id, bio) VALUES (2, 'Nobody')"))
       assertEquals(executor.migrate(ds, model), MigrationResult(1, MigrationStatus.AlreadyApplied, 0))
     }
   }
@@ -689,3 +656,120 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
       assertEquals(scalar(ds, "SELECT to_regclass('public.users') IS NULL"), "t")
     }
   }
+
+  private val adopting = new JdbcMigrationExecutor(PostgreSqlMigrationBackend, ExecutionOptions(adoptExistingSchema = true))
+
+  test("a database created by Hibernate's hbm2ddl is adopted as revision 1 only when enabled, then migrates normally") {
+    import com.anjunar.hibernateddl.hibernate.*
+    val classes = Seq(classOf[Purchase], classOf[Invoice], classOf[LegacyCustomer], classOf[Account], classOf[Shipment],
+      classOf[Generated], classOf[Ticket], classOf[Voucher], classOf[Vehicle], classOf[Car],
+      classOf[Payment], classOf[CardPayment], classOf[TransferPayment], classOf[Profile])
+    val model = TestMetadata.read(classes*).fold(errors => fail(errors.mkString("\n")), identity)
+    withDatabase { ds =>
+      execute(ds, TestMetadata.createScript(classes*))
+      val refused = intercept[MigrationException](executor.migrate(ds, model))
+      assertEquals(refused.state, FailureState.RolledBack)
+      assert(refused.getMessage.contains("no schema history but already contains public.account, public.car"), refused.getMessage)
+      noHistory(ds)
+      assertEquals(adopting.migrate(ds, model), MigrationResult(1, MigrationStatus.Adopted, 0))
+      assertEquals(scalar(ds, "SELECT cardinality(statements) FROM __hibernate_ddl.schema_history"), "0")
+      assertEquals(adopting.migrate(ds, model), MigrationResult(1, MigrationStatus.AlreadyApplied, 0))
+      val note = ColumnModel(SchemaId("9d8e7f60/5f607182"), SqlIdentifier("note"), SqlType.Text)
+      val extended = model.copy(tables = model.tables.map(t => if t.id.value == "9d8e7f60" then t.copy(columns = t.columns :+ note) else t))
+      assertEquals(executor.migrate(ds, extended), MigrationResult(2, MigrationStatus.Applied, 1))
+    }
+  }
+
+  test("adoption refuses a database that lacks a table or differs from the target, and records nothing") {
+    withDatabase { ds =>
+      execute(ds, "CREATE TABLE public.users (username varchar(100) NOT NULL, extra text)")
+      val drift = intercept[MigrationException](adopting.migrate(ds, initial))
+      assert(drift.getMessage.contains("Adopted schema does not match database"), drift.getMessage)
+      assert(drift.getMessage.contains("unexpected column \"extra\""), drift.getMessage)
+      val other = TableModel(SchemaId("OTHER"), QualifiedName(SqlIdentifier("others"), Some(SqlIdentifier("public"))),
+        Vector(ColumnModel(SchemaId("OTHER_NOTE"), SqlIdentifier("note"), SqlType.Text)))
+      val missing = intercept[MigrationException](adopting.migrate(ds, SchemaModel(Vector(users, other))))
+      assert(missing.getMessage.contains("missing: public.others"), missing.getMessage)
+      noHistory(ds)
+      assertEquals(scalar(ds, "SELECT count(*) FROM public.users"), "0")
+    }
+  }
+
+  test("Hibernate's enum checks carry PostgreSQL's names and block adoption until renamed to their derived names") {
+    import com.anjunar.hibernateddl.hibernate.*
+    val model = TestMetadata.read(classOf[Letter]).fold(errors => fail(errors.mkString("\n")), identity)
+    withDatabase { ds =>
+      execute(ds, TestMetadata.createScript(classOf[Letter]))
+      val drift = intercept[MigrationException](adopting.migrate(ds, model))
+      assert(drift.getMessage.contains("unexpected check constraint \"letter_status_check\""), drift.getMessage)
+      assert(drift.getMessage.contains("on column \"status\" is missing"), drift.getMessage)
+      noHistory(ds)
+      for table <- model.tables; column <- table.columns; check <- column.check do
+        val current = scalar(ds, "SELECT k.conname FROM pg_constraint k JOIN pg_attribute a " +
+          "ON a.attrelid = k.conrelid AND a.attnum = ALL (k.conkey) " +
+          s"WHERE k.conrelid = 'public.letter'::regclass AND k.contype = 'c' AND a.attname = '${column.name.value}'")
+        execute(ds, s"ALTER TABLE public.letter RENAME CONSTRAINT \"$current\" TO " +
+          s"\"${PostgreSqlDialect.checkName(column.id, check).value}\"")
+      assertEquals(adopting.migrate(ds, model), MigrationResult(1, MigrationStatus.Adopted, 0))
+    }
+  }
+
+  test("approved drops delete a column with its keys, referencing tables together and a sequence; views block them") {
+    def column(id: String, name: String, dataType: SqlType = SqlType.BigInt, nullable: Boolean = true) =
+      ColumnModel(SchemaId(id), SqlIdentifier(name), dataType, nullable)
+    def table(id: String, name: String, columns: ColumnModel*) =
+      TableModel(SchemaId(id), QualifiedName(SqlIdentifier(name), Some(SqlIdentifier("public"))), columns.toVector,
+        Vector(columns.head.id))
+    val parent = table("P", "parent", column("P_ID", "id", nullable = false), column("P_BUDDY", "buddy_id"))
+    val buddy = table("B", "buddy", column("B_ID", "id", nullable = false), column("B_PARENT", "parent_id"))
+    val parentId = column("C_PARENT", "parent_id")
+    val label = column("C_LABEL", "label", SqlType.Text)
+    val child = table("C", "child", column("C_ID", "id", nullable = false), parentId, label).copy(
+      foreignKeys = Vector(ForeignKeyModel(Vector(parentId.id), parent.id, parent.primaryKey)),
+      uniqueKeys = Vector(UniqueKeyModel(Vector(label.id, parentId.id))),
+      indexes = Vector(IndexModel(Vector(IndexColumn(parentId.id)))))
+    val sequence = SequenceModel(SchemaId("C_SEQ"), QualifiedName(SqlIdentifier("child_seq"), Some(SqlIdentifier("public"))), 1, 50)
+    val before = SchemaModel(Vector(
+      parent.copy(foreignKeys = Vector(ForeignKeyModel(Vector(SchemaId("P_BUDDY")), buddy.id, buddy.primaryKey))),
+      buddy.copy(foreignKeys = Vector(ForeignKeyModel(Vector(SchemaId("B_PARENT")), parent.id, parent.primaryKey))),
+      child), Vector(sequence))
+    val after = SchemaModel(Vector(child.copy(columns = child.columns.filterNot(_ == parentId),
+      foreignKeys = Vector.empty, uniqueKeys = Vector.empty, indexes = Vector.empty)))
+    val approvals = Set[Approval](Approval.Drop(parentId.id), Approval.Drop(parent.id), Approval.Drop(buddy.id),
+      Approval.Drop(sequence.id))
+    val approved = new JdbcMigrationExecutor(PostgreSqlMigrationBackend, ExecutionOptions(approvals = approvals))
+    withDatabase { ds =>
+      assertEquals(executor.migrate(ds, before).status, MigrationStatus.Applied)
+      execute(ds, "INSERT INTO public.parent VALUES (1, NULL); INSERT INTO public.child VALUES (1, 1, 'kept')")
+      val unapproved = intercept[MigrationException](executor.migrate(ds, after))
+      assert(unapproved.getMessage.contains("Approval.Drop(\"C_PARENT\")"), unapproved.getMessage)
+      execute(ds, "CREATE VIEW public.child_parents AS SELECT parent_id FROM public.child")
+      val blocked = intercept[MigrationException](approved.migrate(ds, after))
+      assertEquals(blocked.state, FailureState.RolledBack)
+      assertEquals(scalar(ds, "SELECT parent_id FROM public.child"), "1")
+      execute(ds, "DROP VIEW public.child_parents")
+      assertEquals(approved.migrate(ds, after), MigrationResult(2, MigrationStatus.Applied, 3))
+      assertEquals(scalar(ds, "SELECT label FROM public.child"), "kept")
+      assertEquals(scalar(ds, "SELECT to_regclass('public.parent') IS NULL AND to_regclass('public.child_seq') IS NULL"), "t")
+      assertEquals(scalar(ds, "SELECT statements[2] FROM __hibernate_ddl.schema_history WHERE revision = 2"),
+        "DROP TABLE \"public\".\"buddy\", \"public\".\"parent\";")
+    }
+  }
+
+  test("an operator migrates a refused change by hand and the executor verifies and records it") {
+    val widened = SchemaModel(Vector(users.copy(columns = Vector(login.copy(dataType = SqlType.Varchar(200))))))
+    val manual = new JdbcMigrationExecutor(PostgreSqlMigrationBackend,
+      ExecutionOptions(acceptManualMigration = Some(SchemaFingerprint.of(widened))))
+    withDatabase { ds =>
+      fixture(ds)
+      val refused = intercept[MigrationException](executor.migrate(ds, widened))
+      assert(refused.getMessage.contains("Changing type of column 'USER_LOGIN'"), refused.getMessage)
+      assert(intercept[MigrationException](manual.migrate(ds, widened)).getMessage.contains("does not match database"))
+      execute(ds, "ALTER TABLE public.users ALTER COLUMN username TYPE varchar(200)")
+      assertEquals(manual.migrate(ds, widened), MigrationResult(2, MigrationStatus.ManuallyMigrated, 0))
+      assertEquals(executor.migrate(ds, widened), MigrationResult(2, MigrationStatus.AlreadyApplied, 0))
+      assertEquals(scalar(ds, "SELECT cardinality(statements) FROM __hibernate_ddl.schema_history WHERE revision = 2"), "0")
+      assertEquals(scalar(ds, "SELECT username FROM public.users"), "patrick")
+    }
+  }
+

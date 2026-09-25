@@ -12,7 +12,8 @@ final case class QualifiedName(
     name: SqlIdentifier,
     schema: Option[SqlIdentifier] = None,
     catalog: Option[SqlIdentifier] = None
-)
+):
+  def display: String = (catalog.toVector ++ schema.toVector :+ name).map(_.value).mkString(".")
 
 /** Time and timestamp precisions count fractional-second digits. Numeric precision counts
   * all digits and scale those after the decimal point.

@@ -26,6 +26,8 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     var driftAt = Set.empty[String]
     var backendErrors = Vector.empty[String]
     var renderErrors = Vector.empty[String]
+    /** Names of relations that exist in the database outside any history. */
+    var existing = Set.empty[String]
 
     def event(name: String): Unit =
       events += name
@@ -104,6 +106,9 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
           case _: SchemaOperation.ChangeCheck => "change check"
           case _: SchemaOperation.CreateSequence => "create sequence"
           case _: SchemaOperation.RenameSequence => "rename sequence"
+          case _: SchemaOperation.DropColumn => "drop column"
+          case _: SchemaOperation.DropTables => "drop tables"
+          case _: SchemaOperation.DropSequence => "drop sequence"
         })
       private def onConnection(actual: Connection, label: String): Unit =
         assert(actual eq connection)
@@ -113,9 +118,12 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
       def readHistory(actual: Connection): Vector[HistoryEntry] =
         onConnection(actual, "read-history")
         history
-      def lockAndValidate(actual: Connection, expected: SchemaModel): Vector[String] =
+      def existingRelations(actual: Connection, model: SchemaModel): Vector[QualifiedName] =
+        onConnection(actual, "existing-relations")
+        (model.tables.map(_.name) ++ model.sequences.map(_.name)).filter(name => existing.contains(name.name.value))
+      def lockAndValidate(actual: Connection, expected: SchemaModel, lock: TableLock): Vector[String] =
         val label = expected.tables.map(_.name.name.value).mkString(",")
-        onConnection(actual, s"validate:$label")
+        onConnection(actual, if lock == TableLock.Shared then s"validate-shared:$label" else s"validate:$label")
         if driftAt.contains(label) then Vector("physical schema drift") else Vector.empty
       def recordHistory(actual: Connection, entry: HistoryEntry): Unit =
         onConnection(actual, "record-history")
@@ -141,7 +149,7 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     assertEquals(h.migrate(initial), MigrationResult(1, MigrationStatus.Applied, 1))
     assertEquals(h.events.toVector, Vector(
       "connection", "get-auto-commit", "auto-commit:false", "read-committed", "lock", "initialize-history",
-      "read-history", "validate:", "statement:1", "timeout:1:30", "sql:1:create table", "close-statement:1",
+      "read-history", "existing-relations", "validate:", "statement:1", "timeout:1:30", "sql:1:create table", "close-statement:1",
       "validate:account", "record-history", "commit", "close"
     ))
     val entry = h.history.head
@@ -176,11 +184,54 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     assertEquals(h.migrate(reordered), MigrationResult(1, MigrationStatus.AlreadyApplied, 0))
     assertEquals(h.events.toVector, Vector(
       "connection", "get-auto-commit", "auto-commit:false", "read-committed", "lock", "initialize-history",
-      "read-history", "validate:account", "commit", "close"
+      "read-history", "validate-shared:account", "commit", "close"
     ))
     h.events.clear()
     h.driftAt = Set("account")
     assertEquals(h.refused(initial).state, FailureState.RolledBack)
+  }
+
+  test("a database without history that already contains the target is refused unless adoption is enabled") {
+    val h = new Harness
+    h.existing = Set("account")
+    val error = h.refused(initial)
+    assertEquals(error.state, FailureState.RolledBack)
+    assert(error.getMessage.contains("no schema history but already contains account of the target schema"), error.getMessage)
+    assert(error.getMessage.contains("enable adoptExistingSchema"), error.getMessage)
+    assert(!h.events.exists(event => event.startsWith("sql:") || event.startsWith("validate:")), h.events)
+  }
+
+  test("an existing database that matches the target exactly is adopted as revision 1 without DDL") {
+    val h = new Harness
+    h.existing = Set("account")
+    val adopt = ExecutionOptions(adoptExistingSchema = true)
+    assertEquals(h.migrate(initial, adopt), MigrationResult(1, MigrationStatus.Adopted, 0))
+    assertEquals(h.events.toVector, Vector(
+      "connection", "get-auto-commit", "auto-commit:false", "read-committed", "lock", "initialize-history",
+      "read-history", "existing-relations", "validate:account", "record-history", "commit", "close"
+    ))
+    assertEquals(h.history, Vector(HistoryEntry(1, SchemaFingerprint.of(empty), SchemaFingerprint.of(initial),
+      SchemaModelJson.encode(initial), Vector.empty)))
+    h.events.clear()
+    assertEquals(h.migrate(initial, adopt), MigrationResult(1, MigrationStatus.AlreadyApplied, 0))
+    assertEquals(h.migrate(renamed, adopt), MigrationResult(2, MigrationStatus.Applied, 2))
+    assertEquals(h.events.count(_ == "existing-relations"), 0)
+  }
+
+  test("adoption is refused when a table or sequence is missing or the database differs from the target") {
+    val sequence = SequenceModel(SchemaId("account-sequence"), QualifiedName(SqlIdentifier("account_seq")), 1, 50)
+    val adopt = ExecutionOptions(adoptExistingSchema = true)
+    val partial = new Harness
+    partial.existing = Set("account")
+    val missing = partial.refused(SchemaModel(initial.tables, Vector(sequence)), adopt)
+    assert(missing.getMessage.contains("requires every table and sequence of the target; missing: account_seq"), missing.getMessage)
+    assert(!partial.events.exists(_.startsWith("validate:")), partial.events)
+    val drifted = new Harness
+    drifted.existing = Set("account")
+    drifted.driftAt = Set("account")
+    val drift = drifted.refused(initial, adopt)
+    assert(drift.getMessage.contains("Adopted schema does not match database: physical schema drift"), drift.getMessage)
+    assert(!drifted.events.contains("record-history"), drifted.events)
   }
 
   test("an empty model on a database without history is revision 0 and records nothing") {
@@ -218,6 +269,82 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     assert(error.getMessage.contains("Renaming table 'account' back to its name from revision 1"), error.getMessage)
     assert(error.getMessage.contains("Renaming column 'account-name' back to its name from revision 1"), error.getMessage)
     assert(!h.events.exists(_.startsWith("sql:")))
+  }
+
+  test("an intended return to an earlier model runs with approvals for the revert and each rename back") {
+    val h = new Harness
+    h.seed(initial, renamed)
+    val error = h.refused(initial, ExecutionOptions(approvals = Set(Approval.Revert(1))))
+    assert(error.getMessage.contains("approve it with Approval.RenameBack(\"account\")"), error.getMessage)
+    assert(error.getMessage.contains("approve it with Approval.RenameBack(\"account-name\")"), error.getMessage)
+    assert(h.refused(initial).getMessage.contains("approve it with Approval.Revert(1)"))
+    val approved = Set(Approval.Revert(1), Approval.RenameBack(account.id), Approval.RenameBack(name.id))
+    assertEquals(h.migrate(initial, ExecutionOptions(approvals = approved)), MigrationResult(3, MigrationStatus.Applied, 2))
+    assertEquals(SchemaModelJson.decode(h.history.last.model), Right(initial))
+  }
+
+  test("dropping a table, column or sequence deletes data and needs an approval per stable ID") {
+    val bio = ColumnModel(SchemaId("account-bio"), SqlIdentifier("bio"), SqlType.Text)
+    val note = TableModel(SchemaId("note"), QualifiedName(SqlIdentifier("note")), Vector(name.copy(id = SchemaId("note-text"))))
+    val sequence = SequenceModel(SchemaId("account-sequence"), QualifiedName(SqlIdentifier("account_seq")), 1, 50)
+    val h = new Harness
+    h.seed(SchemaModel(Vector(account.copy(columns = Vector(name, bio)), note), Vector(sequence)))
+    val error = h.refused(initial, ExecutionOptions(approvals = Set(Approval.Drop(note.id))))
+    assert(error.getMessage.contains("Dropping column 'account-bio' (account.bio) deletes its data; " +
+      "if intended, approve it with Approval.Drop(\"account-bio\")"), error.getMessage)
+    assert(error.getMessage.contains("Dropping sequence 'account-sequence' (account_seq)"), error.getMessage)
+    assert(!error.getMessage.contains("Dropping table"), error.getMessage)
+    assert(!h.events.exists(event => event.startsWith("sql:") || event.startsWith("validate:")), h.events)
+    val approved = Set[Approval](Approval.Drop(bio.id), Approval.Drop(note.id), Approval.Drop(sequence.id))
+    val risk = h.refused(initial, ExecutionOptions(approvals = approved, allowedRisks = Set(RiskLevel.Safe, RiskLevel.Locking)))
+    assert(risk.getMessage.contains("Migration risks are not allowed: Destructive"), risk.getMessage)
+    assertEquals(h.migrate(initial, ExecutionOptions(approvals = approved)), MigrationResult(2, MigrationStatus.Applied, 3))
+    assertEquals(h.history.last.statements, Vector("drop column", "drop tables", "drop sequence"))
+  }
+
+  test("a dropped ID is retired: it may never come back, not even with approvals") {
+    val bio = ColumnModel(SchemaId("account-bio"), SqlIdentifier("bio"), SqlType.Text)
+    val withBio = SchemaModel(Vector(account.copy(columns = Vector(name, bio))))
+    val h = new Harness
+    h.seed(withBio)
+    assertEquals(h.migrate(initial, ExecutionOptions(approvals = Set(Approval.Drop(bio.id)))).revision, 2L)
+    h.events.clear()
+    val note = ColumnModel(SchemaId("account-note"), SqlIdentifier("note"), SqlType.Text)
+    val reused = SchemaModel(Vector(account.copy(columns = Vector(name, note, bio.copy(name = SqlIdentifier("biography"))))))
+    val error = h.refused(reused, ExecutionOptions(approvals = Set(Approval.Revert(1))))
+    assert(error.getMessage.contains("Stable ID 'account-bio' was dropped after revision 1 and is retired"), error.getMessage)
+    val reverted = h.refused(withBio, ExecutionOptions(approvals = Set(Approval.Revert(1))))
+    assert(reverted.getMessage.contains("'account-bio' was dropped after revision 1"), reverted.getMessage)
+    assert(!h.events.exists(_.startsWith("validate:")), h.events)
+    assertEquals(h.migrate(SchemaModel(Vector(account.copy(columns = Vector(name, note))))).revision, 3L)
+  }
+
+  test("a change the executor cannot plan is recorded after an operator migrated it by hand") {
+    val retyped = SchemaModel(Vector(account.copy(columns = Vector(name.copy(dataType = SqlType.Varchar(200))))))
+    val fingerprint = SchemaFingerprint.of(retyped)
+    val h = new Harness
+    h.seed(initial)
+    val refused = h.refused(retyped)
+    assert(refused.getMessage.contains(s"start once with acceptManualMigration = \"$fingerprint\""), refused.getMessage)
+    val other = h.refused(retyped, ExecutionOptions(acceptManualMigration = Some(SchemaFingerprint.of(renamed))))
+    assert(other.getMessage.contains(s"but this target is $fingerprint"), other.getMessage)
+    h.driftAt = Set("account")
+    val drift = h.refused(retyped, ExecutionOptions(acceptManualMigration = Some(fingerprint)))
+    assert(drift.getMessage.contains("Manually migrated schema does not match database"), drift.getMessage)
+    h.driftAt = Set.empty
+    h.events.clear()
+    val manual = ExecutionOptions(acceptManualMigration = Some(fingerprint))
+    assertEquals(h.migrate(retyped, manual), MigrationResult(2, MigrationStatus.ManuallyMigrated, 0))
+    assertEquals(h.events.toVector, Vector(
+      "connection", "get-auto-commit", "auto-commit:false", "read-committed", "lock", "initialize-history",
+      "read-history", "validate:account", "record-history", "commit", "close"
+    ))
+    assertEquals(h.history.last, HistoryEntry(2, SchemaFingerprint.of(initial), fingerprint,
+      SchemaModelJson.encode(retyped), Vector.empty))
+    assertEquals(h.migrate(retyped, manual), MigrationResult(2, MigrationStatus.AlreadyApplied, 0))
+    val fresh = new Harness
+    assert(fresh.refused(initial, ExecutionOptions(acceptManualMigration = Some(SchemaFingerprint.of(initial))))
+      .getMessage.contains("adoptExistingSchema"))
   }
 
   test("renaming a sequence back to an earlier name is refused like an older server") {
