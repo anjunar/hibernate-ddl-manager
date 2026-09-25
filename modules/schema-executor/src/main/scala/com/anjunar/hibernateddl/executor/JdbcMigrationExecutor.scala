@@ -133,6 +133,12 @@ final class JdbcMigrationExecutor(
           BackfillResult.Adopted, None))), plan.pending)
       case PlanMode.Migration =>
         validateDatabase(connection, plan.previous, "Previous schema")
+        // Known dependents are named before any DDL; the database may still refuse others.
+        val blocked = MigrationPlanner.typeChanges(plan).flatMap { (change, table, column) =>
+          val blockers = backend.typeChangeBlockers(connection, table, column)
+          Option.when(blockers.nonEmpty)(MigrationPlanner.blockedTypeChange(change.columnId, table, column, blockers))
+        }
+        if blocked.nonEmpty then refuse(blocked)
         val filled = plan.steps.flatMap(step => run(connection, step))
         validateDatabase(connection, target, "Target schema")
         val statements = plan.steps.collect {

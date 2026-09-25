@@ -348,3 +348,45 @@ class Tuned:
   @SchemaId("3d4e5f60") @ManyToOne @JoinColumn(foreignKey = new ForeignKey(options = "DEFERRABLE"))
   var parent: Tuned = uninitialized
 
+
+/** A membership before its columns grow: a longer name, a counter that outgrows INTEGER and an
+  * amount with more digits before the decimal point. The status keeps its enum check, the tag its
+  * unique key and the score its descending index.
+  */
+@Entity
+@Table(name = "membership", indexes = Array(new Index(columnList = "score desc")))
+@SchemaId("a7b8c9d0")
+class MembershipBefore:
+  @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+  @SchemaId("1b2c3d4e") @Column(name = "display_name", length = 100) var displayName: String = uninitialized
+  @SchemaId("2c3d4e5f") var visits: java.lang.Integer = uninitialized
+  @SchemaId("3d4e5f60") @Column(precision = 10, scale = 2, nullable = false) var balance: java.math.BigDecimal = uninitialized
+  @SchemaId("4e5f6071") @Column(unique = true, length = 20) var tag: String = uninitialized
+  @SchemaId("5f607182") @Enumerated(EnumType.STRING) @Column(length = 10) var status: Status = uninitialized
+  @SchemaId("60718293") var score: java.lang.Integer = uninitialized
+
+/** The same membership after the mapping changed: same IDs and names, wider types. */
+@Entity
+@Table(name = "membership", indexes = Array(new Index(columnList = "score desc")))
+@SchemaId("a7b8c9d0")
+class MembershipAfter:
+  @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+  @SchemaId("1b2c3d4e") @Column(name = "display_name", length = 255) var displayName: String = uninitialized
+  @SchemaId("2c3d4e5f") var visits: java.lang.Long = uninitialized
+  @SchemaId("3d4e5f60") @Column(precision = 14, scale = 2, nullable = false) var balance: java.math.BigDecimal = uninitialized
+  @SchemaId("4e5f6071") @Column(unique = true, length = 40) var tag: String = uninitialized
+  @SchemaId("5f607182") @Enumerated(EnumType.STRING) @Column(length = 20) var status: Status = uninitialized
+  @SchemaId("60718293") var score: java.lang.Long = uninitialized
+
+/** Shrinks the name and changes the amount's scale, which the migration refuses. */
+@Entity
+@Table(name = "membership", indexes = Array(new Index(columnList = "score desc")))
+@SchemaId("a7b8c9d0")
+class MembershipNarrowed:
+  @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+  @SchemaId("1b2c3d4e") @Column(name = "display_name", length = 50) var displayName: String = uninitialized
+  @SchemaId("2c3d4e5f") var visits: java.lang.Integer = uninitialized
+  @SchemaId("3d4e5f60") @Column(precision = 12, scale = 4, nullable = false) var balance: java.math.BigDecimal = uninitialized
+  @SchemaId("4e5f6071") @Column(unique = true, length = 20) var tag: String = uninitialized
+  @SchemaId("5f607182") @Enumerated(EnumType.STRING) @Column(length = 10) var status: Status = uninitialized
+  @SchemaId("60718293") var score: java.lang.Integer = uninitialized

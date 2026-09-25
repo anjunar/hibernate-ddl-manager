@@ -117,6 +117,58 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
       statement.setString(2, table.name.value)
     }(_.getLong(1)).headOption.filter(_ >= 0)
 
+  /** The size of the table with its indexes and TOAST data, from the catalog. */
+  override def tableSize(connection: Connection, table: QualifiedName): Option[Long] =
+    query(connection,
+      """SELECT pg_catalog.pg_total_relation_size(c.oid) FROM pg_catalog.pg_class c
+        |JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ? AND c.relname = ?""".stripMargin
+    ) { statement =>
+      statement.setString(1, table.schema.get.value)
+      statement.setString(2, table.name.value)
+    }(_.getLong(1)).headOption
+
+  /** Objects that make PostgreSQL refuse `ALTER COLUMN TYPE` because they depend on the column
+    * and cannot be rebuilt with it: views and rules, triggers, policies and SQL-standard
+    * function bodies. Indexes and constraints of the table itself are rebuilt and not listed.
+    * The descriptions are built from the catalogs, since `pg_describe_object` follows the
+    * server's message language.
+    */
+  override def typeChangeBlockers(connection: Connection, table: QualifiedName, column: SqlIdentifier): Vector[String] =
+    query(connection,
+      """SELECT DISTINCT CASE d.classid
+        |  WHEN CAST('pg_catalog.pg_rewrite' AS pg_catalog.regclass) THEN
+        |    (SELECT CASE WHEN r.rulename <> '_RETURN' THEN 'rule ' || pg_catalog.quote_ident(r.rulename) || ' on '
+        |                 WHEN v.relkind = 'm' THEN 'materialized view ' ELSE 'view ' END
+        |            || pg_catalog.quote_ident(vn.nspname) || '.' || pg_catalog.quote_ident(v.relname)
+        |     FROM pg_catalog.pg_rewrite r
+        |     JOIN pg_catalog.pg_class v ON v.oid = r.ev_class
+        |     JOIN pg_catalog.pg_namespace vn ON vn.oid = v.relnamespace
+        |     WHERE r.oid = d.objid)
+        |  WHEN CAST('pg_catalog.pg_trigger' AS pg_catalog.regclass) THEN
+        |    (SELECT 'trigger ' || pg_catalog.quote_ident(t.tgname) FROM pg_catalog.pg_trigger t WHERE t.oid = d.objid)
+        |  WHEN CAST('pg_catalog.pg_policy' AS pg_catalog.regclass) THEN
+        |    (SELECT 'policy ' || pg_catalog.quote_ident(p.polname) FROM pg_catalog.pg_policy p WHERE p.oid = d.objid)
+        |  ELSE
+        |    (SELECT 'function ' || pg_catalog.quote_ident(fn.nspname) || '.' || pg_catalog.quote_ident(f.proname)
+        |     FROM pg_catalog.pg_proc f JOIN pg_catalog.pg_namespace fn ON fn.oid = f.pronamespace WHERE f.oid = d.objid)
+        |  END AS description
+        |FROM pg_catalog.pg_depend d
+        |JOIN pg_catalog.pg_class c ON c.oid = d.refobjid
+        |JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        |JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = d.refobjsubid
+        |WHERE d.refclassid = CAST('pg_catalog.pg_class' AS pg_catalog.regclass)
+        |  AND n.nspname = ? AND c.relname = ? AND a.attname = ?
+        |  AND d.classid IN (CAST('pg_catalog.pg_rewrite' AS pg_catalog.regclass),
+        |                    CAST('pg_catalog.pg_trigger' AS pg_catalog.regclass),
+        |                    CAST('pg_catalog.pg_policy' AS pg_catalog.regclass),
+        |                    CAST('pg_catalog.pg_proc' AS pg_catalog.regclass))
+        |ORDER BY description""".stripMargin
+    ) { statement =>
+      statement.setString(1, table.schema.get.value)
+      statement.setString(2, table.name.value)
+      statement.setString(3, column.value)
+    }(_.getString("description"))
+
   /** Whether a relation exists, by its catalog entry, so that missing privileges on it are not
     * mistaken for its absence.
     */

@@ -27,9 +27,11 @@ Entities with the common basic types, enums, generated keys (UUIDs, sequences, i
 columns), inheritance (all three strategies), `@ManyToOne`, `@OneToOne` and `@ManyToMany`
 associations, element collections (sets, lists, ordered lists and maps), secondary tables,
 `@Lob`, JSON columns (`jsonb`), unique constraints and indexes can be mapped. The executor
-creates, renames, adds and, with explicit approval, drops; it adopts a matching database
-without history and accepts changes migrated by hand. Everything else, such as arrays,
-collections inside embeddables or type changes, is refused with a message, never guessed.
+creates, renames, adds, widens a column (a longer `VARCHAR`, `INTEGER` to `BIGINT`, a larger
+`NUMERIC` precision with the same scale) and, with explicit approval, drops; it adopts a
+matching database without history and accepts changes migrated by hand. Everything else,
+such as arrays, collections inside embeddables or any other type change, is refused with a
+message, never guessed.
 
 Hibernate stores `@Lob` values, `Blob` and `Clob` on PostgreSQL as large objects in `oid`
 columns. PostgreSQL does not delete a large object when its row is deleted or its value

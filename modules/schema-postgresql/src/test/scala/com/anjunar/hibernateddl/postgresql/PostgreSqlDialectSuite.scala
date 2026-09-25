@@ -250,3 +250,36 @@ class PostgreSqlDialectSuite extends munit.FunSuite:
   test("an empty plan renders to an empty statement vector") {
     assertEquals(PostgreSqlDialect.render(Vector.empty), Right(Vector.empty))
   }
+
+  private def retype(from: SqlType, to: SqlType, column: String = "display_name"): SchemaOperation =
+    ChangeColumnType(tableId, name("users", Some("public")), columnId, SqlIdentifier(column), from, to)
+
+  test("the three widenings render as a quoted ALTER COLUMN TYPE from the model's type, without USING") {
+    assertEquals(PostgreSqlDialect.render(Vector(
+      retype(SqlType.Varchar(100), SqlType.Varchar(255)),
+      retype(SqlType.Integer, SqlType.BigInt, "visit\"count"),
+      retype(SqlType.Numeric(10, 2), SqlType.Numeric(14, 2), "Balance")
+    )), Right(Vector(
+      "ALTER TABLE \"public\".\"users\" ALTER COLUMN \"display_name\" TYPE varchar(255);",
+      "ALTER TABLE \"public\".\"users\" ALTER COLUMN \"visit\"\"count\" TYPE bigint;",
+      "ALTER TABLE \"public\".\"users\" ALTER COLUMN \"Balance\" TYPE numeric(14,2);"
+    )))
+  }
+
+  test("a type change built by hand cannot make the renderer emit anything but a supported widening") {
+    Vector(
+      retype(SqlType.Varchar(255), SqlType.Varchar(100)) -> "shortens VARCHAR",
+      retype(SqlType.BigInt, SqlType.Integer) -> "narrows BIGINT",
+      retype(SqlType.Numeric(10, 2), SqlType.Numeric(14, 4)) -> "NUMERIC scale",
+      retype(SqlType.Text, SqlType.Uuid) -> "not a supported widening",
+      retype(SqlType.Varchar(10), SqlType.Varchar(10)) -> "already has type",
+      retype(SqlType.Varchar(100), SqlType.Varchar(10485761)) -> "PostgreSQL supports 1 to 10485760",
+      retype(SqlType.Numeric(10, 2), SqlType.Numeric(1001, 2)) -> "precision 1 to 1000",
+      retype(SqlType.Varchar(0), SqlType.Varchar(10)) -> "The previous type has VARCHAR length 0"
+    ).foreach { (operation, reason) =>
+      val diagnostics = PostgreSqlDialect.render(Vector(operation)).swap.getOrElse(fail(s"$operation rendered"))
+      assert(diagnostics.exists(_.contains(reason)), diagnostics)
+    }
+    assert(PostgreSqlDialect.render(Vector(retype(SqlType.Varchar(100), SqlType.Varchar(10485760)))).isRight)
+    assert(PostgreSqlDialect.render(Vector(retype(SqlType.Numeric(10, 2), SqlType.Numeric(1000, 2)))).isRight)
+  }

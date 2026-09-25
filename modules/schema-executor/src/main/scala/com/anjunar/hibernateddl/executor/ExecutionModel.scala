@@ -123,6 +123,13 @@ trait PlanningBackend extends SchemaDialect:
   /** An UPDATE that fills the column's NULLs and binds every constant as a parameter. */
   def renderFill(fill: NullFill): Either[Vector[String], BoundStatement]
 
+/** What the database knows about a column beyond the model. */
+trait ColumnDependencies:
+  /** The objects outside the model, such as views, that depend on the column and keep its type
+    * from changing; each described for a message. Neither a migration nor a preview removes them.
+    */
+  def typeChangeBlockers(connection: Connection, table: QualifiedName, column: SqlIdentifier): Vector[String]
+
 /** What a read-only comparison of the database with a model found: differences, and what it
   * could not decide.
   */
@@ -132,7 +139,7 @@ final case class Inspection(differences: Vector[String], undecided: Vector[Strin
   * `beginReadOnly` made read-only on the server; nothing is created, altered, written or
   * explicitly locked, and no migration lock is taken.
   */
-trait PreviewBackend extends PlanningBackend:
+trait PreviewBackend extends PlanningBackend with ColumnDependencies:
   def beginReadOnly(connection: Connection, options: ExecutionOptions): Unit
   /** The schema history, or None when its table does not exist. */
   def readHistoryIfPresent(connection: Connection): Option[Vector[HistoryEntry]]
@@ -147,13 +154,15 @@ trait PreviewBackend extends PlanningBackend:
   def dataCheck(connection: Connection, query: DataQuery, count: Boolean): Long
   /** The table's row count as the database last estimated it, if it has one. */
   def estimateRows(connection: Connection, table: QualifiedName): Option[Long]
+  /** The bytes the table takes with its indexes and out-of-line storage, if known. */
+  def tableSize(connection: Connection, table: QualifiedName): Option[Long]
 
 /** Connection-taking methods run inside one executor-owned transaction.
   * validate and render run before a connection is acquired or while planning under
   * the lock. Implementations must support transactional DDL and never commit or close
   * the supplied connection.
   */
-trait TransactionalMigrationBackend extends PlanningBackend:
+trait TransactionalMigrationBackend extends PlanningBackend with ColumnDependencies:
   def acquireLock(connection: Connection, options: ExecutionOptions): Unit
   def initializeHistory(connection: Connection): Unit
   /** Every history entry, ordered by revision. */

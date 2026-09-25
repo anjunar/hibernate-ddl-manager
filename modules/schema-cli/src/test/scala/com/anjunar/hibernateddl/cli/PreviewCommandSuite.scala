@@ -35,7 +35,7 @@ class PreviewCommandSuite extends TestPostgres:
       assert(blocked.stdout.startsWith("Result: BLOCKED"), blocked.stdout)
       val ready = PreviewCommand.run(Vector("--target", required, "--backfills", backfills, "--format", "json", "--counts"), env(ds))
       assertEquals(ready.exitCode, PreviewCommand.Ready, ready.stdout)
-      assert(ready.stdout.startsWith("{\"format\":1,") && ready.stdout.endsWith("}"), ready.stdout)
+      assert(ready.stdout.startsWith("{\"format\":2,") && ready.stdout.endsWith("}"), ready.stdout)
       Vector("secret", env(ds)("HIBERNATE_DDL_PREVIEW_PASSWORD"), "HIBERNATE_DDL").filter(_.nonEmpty).foreach { secret =>
         assert(!ready.stdout.contains(secret), secret)
       }
