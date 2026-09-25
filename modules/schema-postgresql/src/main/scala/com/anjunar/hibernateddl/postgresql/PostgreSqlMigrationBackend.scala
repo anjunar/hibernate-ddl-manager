@@ -107,6 +107,16 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
       }
     }
 
+  /** PostgreSQL's estimate from the last VACUUM or ANALYZE; -1 means never estimated. */
+  override def estimateRows(connection: Connection, table: QualifiedName): Option[Long] =
+    query(connection,
+      """SELECT CAST(c.reltuples AS pg_catalog.int8) FROM pg_catalog.pg_class c
+        |JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ? AND c.relname = ?""".stripMargin
+    ) { statement =>
+      statement.setString(1, table.schema.get.value)
+      statement.setString(2, table.name.value)
+    }(_.getLong(1)).headOption.filter(_ >= 0)
+
   /** Whether a relation exists, by its catalog entry, so that missing privileges on it are not
     * mistaken for its absence.
     */
