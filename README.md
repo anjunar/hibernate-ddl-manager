@@ -46,20 +46,41 @@ properties live inside the document and need no `@SchemaId`; the framework manag
 column, not the document's content. Hibernate guards an enum or a non-null property inside
 such a document with a table check, which the model cannot represent, so these are refused.
 
+## Installation
+
+The libraries are on Maven Central under `com.anjunar.hibernateddl`. An application that
+migrates at startup needs `schema-integration`, which brings the other modules along:
+
+```scala
+libraryDependencies += "com.anjunar.hibernateddl" %% "schema-integration" % "1.0.0"
+```
+
+```xml
+<dependency>
+  <groupId>com.anjunar.hibernateddl</groupId>
+  <artifactId>schema-integration_3</artifactId>
+  <version>1.0.0</version>
+</dependency>
+```
+
+The artifacts are built with Scala 3.9 for Java 17 or newer, so a Scala project needs Scala
+3.9 or later. The application provides Hibernate ORM 7.4 and the PostgreSQL JDBC driver.
+
 ## Getting started
 
-Requirements: JDK 17 or newer and sbt. Pinned versions: Scala **3.9.0**, sbt **1.12.15**,
+Requirements: JDK 17 or newer and sbt 2. Pinned versions: Scala **3.9.0**, sbt **2.0.9**,
 Hibernate ORM **7.4.10.Final**, MUnit **1.2.0**.
 
 ```sh
-sbt test
+sbt --server check
 sbt "schemaCli/run demo"
 ```
 
-`sbt check` does a clean build and runs the tests. The PostgreSQL tests start a temporary
-local database through `embedded-postgres` **2.2.2**; no credentials are needed. The demo
-shows a column rename through a stable ID and the resulting SQL, without a database
-connection.
+`check` does a clean build and runs every test with `testFull`. sbt 2's `test` is
+incremental: it runs only tests whose inputs changed and replays the others from its disk
+cache, even after `clean`. The PostgreSQL tests start a temporary local database through
+`embedded-postgres` **2.2.2**; no credentials are needed. The demo shows a column rename
+through a stable ID and the resulting SQL, without a database connection.
 
 ### In the cloud
 
@@ -70,7 +91,7 @@ containers. There the tests use a server installed with apt. Environment setup s
 apt-get update
 command -v java || apt-get install -y openjdk-21-jdk-headless
 apt-get install -y postgresql
-curl -fsSL https://github.com/sbt/sbt/releases/download/v1.12.15/sbt-1.12.15.tgz | tar xz -C /opt
+curl -fsSL https://github.com/sbt/sbt/releases/download/v2.0.9/sbt-2.0.9.tgz | tar xz -C /opt
 ln -sf /opt/sbt/bin/sbt /usr/local/bin/sbt
 service postgresql start
 su postgres -c "psql -c \"ALTER USER postgres PASSWORD 'postgres'\""
@@ -304,10 +325,44 @@ blocked, 3 for incomplete and 2 for an invalid call or a technical error.
 | `schemaCli` | Demo and the read-only `preview` command |
 
 Package root: `com.anjunar.hibernateddl`. The core depends neither on Hibernate nor on a
-database driver; the server provides the PostgreSQL JDBC driver.
+database driver; the server provides the PostgreSQL JDBC driver. `schemaCli` is not published.
+
+## Releasing
+
+Set the version in `build.sbt` and in the installation examples above with one command;
+`--check` changes nothing and fails when the files disagree, as CI does on every push:
+
+```sh
+scripts/set-version.sh 1.0.1
+scripts/set-version.sh --check
+```
+
+After `sbt --server check` passes, one script signs every published module with gpg
+(`sbt-pgp`), bundles the staging directory `target/sona-staging` and uploads it to the
+Sonatype Central Portal. It waits until Maven Central has published the release:
+
+```powershell
+.\scripts\publish-central.ps1
+```
+
+```sh
+scripts/publish-central.sh
+```
+
+Without a version the scripts read the one in `build.sbt`. The Central Portal credentials come
+from `SONATYPE_CENTRAL_USERNAME` and `SONATYPE_CENTRAL_PASSWORD`, or from the lines `user=` and
+`password=` in `~/.sbt/sonatype_central_credentials`. `-PublishingType USER_MANAGED` (or
+`--publishing-type USER_MANAGED`) stops after validation, so the release is published by hand
+in the portal; `-SkipPublishSigned` uploads an existing staging directory again. A
+`-SNAPSHOT` version goes to Central's snapshot repository with `sbt --server publishSigned`
+instead.
 
 ## Version references
 
 - [Scala 3.9.0](https://www.scala-lang.org/download/3.9.0.html)
 - [sbt versions](https://www.scala-sbt.org/download)
 - [Hibernate ORM versions](https://hibernate.org/orm/releases/)
+
+## License
+
+Hibernate DDL Manager is available under the [MIT License](LICENSE).

@@ -1,0 +1,91 @@
+name: verify
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # The oldest supported versions: JDK 17 and PostgreSQL 14 from embedded-postgres. It also
+  # builds every artifact Maven Central receives, with sources, Scaladoc and POM.
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up sbt
+        uses: sbt/setup-sbt@v1
+
+      - name: Cache Coursier and sbt
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/coursier
+            ~/.sbt
+            ~/.ivy2/cache
+          key: ${{ runner.os }}-sbt-${{ hashFiles('project/build.properties', 'project/plugins.sbt', 'build.sbt') }}
+          restore-keys: |
+            ${{ runner.os }}-sbt-
+
+      - name: build.sbt and README.md name the same version
+        run: scripts/set-version.sh --check
+
+      # `check` runs every test with testFull; sbt 2's `test` would replay cached results.
+      - name: Clean build and every test
+        run: sbt --server check
+
+      - name: Build the published artifacts
+        run: sbt --server publishLocal
+
+  # The newest versions: JDK 25 and PostgreSQL 18 as a service, which the tests reach through
+  # HIBERNATE_DDL_TEST_POSTGRES instead of starting embedded-postgres.
+  verify-latest:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      HIBERNATE_DDL_TEST_POSTGRES: jdbc:postgresql://localhost:5432/postgres?user=postgres&password=postgres
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Set up sbt
+        uses: sbt/setup-sbt@v1
+
+      - name: Cache Coursier and sbt
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/coursier
+            ~/.sbt
+            ~/.ivy2/cache
+          key: ${{ runner.os }}-sbt-${{ hashFiles('project/build.properties', 'project/plugins.sbt', 'build.sbt') }}
+          restore-keys: |
+            ${{ runner.os }}-sbt-
+
+      - name: Clean build and every test
+        run: sbt --server check

@@ -14,7 +14,7 @@ import scala.util.control.NonFatal
   * and dropping a table, column or sequence deletes data: each is refused unless the options
   * carry an explicit [[Approval]] for it.
   *
-  * A column that becomes required gets its NULLs filled by the one registered [[Backfill]]
+  * A column that becomes required gets its NULLs filled by the one registered [[com.anjunar.hibernateddl.core.Backfill]]
   * that targets it and is not recorded yet; what is left must be no NULL at all. Each backfill
   * is recorded once, with its definition's checksum, and never runs again; a recorded one with
   * another definition blocks the start, even when the schema is already applied.
