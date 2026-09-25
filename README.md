@@ -213,8 +213,13 @@ val backfills = Vector(
       BackfillValue.literal("Unknown"))
   )
 )
-JdbcMigrationExecutor(PostgreSqlMigrationBackend).migrate(dataSource, target, backfills)
+HibernateSchemaMigration.migrate(metadata, dataSource, backfills = backfills)
 ```
+
+For the integrator, and for the explicit call as well, a `BackfillProvider` supplies rules
+through `META-INF/services/com.anjunar.hibernateddl.integration.BackfillProvider`; the
+explicit call adds its `backfills` to those, and an ID found twice is refused. Keep the rules
+of every release that a server may still skip.
 
 When the target column becomes required, the backfill runs
 `UPDATE … SET "display_name" = … WHERE "display_name" IS NULL` right before `SET NOT NULL`,
@@ -225,7 +230,10 @@ be text for text. A backfill runs once: it is recorded with its definition's che
 `__hibernate_ddl.backfill_history`, and the same ID with another definition blocks the start.
 A column that a new table creates required, or that adoption or a manual migration finds
 required, records the backfill without running it. Backfills for a release that a server
-skips still run, from columns the same migration drops only afterwards.
+skips still run, from columns the same migration drops only afterwards. A rule whose column
+does not become required stays pending and appears in `MigrationResult.pendingBackfills`.
+Backfills run inside the migration's transaction while its tables are locked exclusively;
+large tables and deployments without downtime need a separate, stepwise data migration.
 
 ### Changes the executor cannot plan
 

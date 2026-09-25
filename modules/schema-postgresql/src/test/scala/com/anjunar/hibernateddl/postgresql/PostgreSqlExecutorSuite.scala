@@ -921,20 +921,36 @@ class PostgreSqlExecutorSuite extends TestPostgres:
     }
   }
 
-  test("unique and check violations of the filled values roll back the schema, the data and both histories") {
+  test("a backfill reads a source column under the name a rename in the same migration gives it") {
+    withPeople { ds =>
+      val renamedFirst = firstName.copy(name = SqlIdentifier("given_name"))
+      assertEquals(executor.migrate(ds, people(renamedFirst, lastName, display), Vector(displayRule)).backfills.size, 1)
+      assertEquals(displays(ds), s"Ada Lovelace|Grace|$strange")
+      assertEquals(scalar(ds, "SELECT string_agg(given_name, '|' ORDER BY id) FROM public.people"), "Ada|Grace")
+    }
+  }
+
+  test("unique, check and foreign key violations of the filled values roll back the schema, the data and both histories") {
     val unique = people(firstName, lastName, display).tables.head
+    val teamId = ColumnModel(SchemaId("TEAM_ID"), SqlIdentifier("id"), SqlType.BigInt, false)
+    val teams = TableModel(SchemaId("TEAM"), QualifiedName(SqlIdentifier("teams"), public), Vector(teamId), Vector(teamId.id))
+    val team = ColumnModel(SchemaId("PEOPLE_TEAM"), SqlIdentifier("team_id"), SqlType.BigInt, false)
+    val member = people(firstName, lastName, team).tables.head
+      .copy(foreignKeys = Vector(ForeignKeyModel(Vector(team.id), teams.id, teams.primaryKey)))
     Vector(
       SchemaModel(Vector(unique.copy(uniqueKeys = Vector(UniqueKeyModel(Vector(display.id)))))) ->
         Backfill.fillNulls("people-display-v1", display.id, BackfillTrigger.BecomesRequired, BackfillValue.literal("same")),
       people(firstName, lastName, display.copy(check = Some(ColumnCheck.AllowedValues(Vector("A", "B"))))) ->
-        Backfill.fillNulls("people-display-v1", display.id, BackfillTrigger.BecomesRequired, BackfillValue.literal("C"))
+        Backfill.fillNulls("people-display-v1", display.id, BackfillTrigger.BecomesRequired, BackfillValue.literal("C")),
+      SchemaModel(Vector(member, teams)) ->
+        Backfill.fillNulls("people-team-v1", team.id, BackfillTrigger.BecomesRequired, BackfillValue.literal(99L))
     ).foreach { (target, rule) =>
       withPeople { ds =>
         assertEquals(intercept[MigrationException](executor.migrate(ds, target, Vector(rule))).state, FailureState.RolledBack)
         assertEquals(revisions(ds), "1")
         assertEquals(scalar(ds, "SELECT count(*) FROM __hibernate_ddl.backfill_history"), "0")
         assertEquals(scalar(ds, "SELECT count(*) FROM pg_attribute WHERE attrelid = 'public.people'::regclass " +
-          "AND attname = 'Display Name'"), "0")
+          "AND attname IN ('Display Name', 'team_id')"), "0")
       }
     }
   }

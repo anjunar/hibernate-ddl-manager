@@ -142,6 +142,28 @@ class SchemaMigrationIntegrationSuite extends TestPostgres:
     }
   }
 
+  test("both ways of starting fill a column that becomes required from the providers' backfills") {
+    withDatabase { ds =>
+      withSessionFactory(ds, Seq(classOf[Member]), enabled)(_ => ())
+      execute(ds, "INSERT INTO public.member VALUES (1, 'ada'), (2, NULL)")
+      withSessionFactory(ds, Seq(classOf[RequiredMember]), enabled, validate)(_ => ())
+      assertEquals(scalar(ds, "SELECT string_agg(nick, '|' ORDER BY id) FROM public.member"), "ada|anonymous")
+      assertEquals(scalar(ds, "SELECT concat_ws(' ', backfill_id, result, updated_rows) FROM __hibernate_ddl.backfill_history"),
+        "member-nick-v1 executed 1")
+    }
+    withDatabase { ds =>
+      withMetadata(ds, Seq(classOf[Member]))(metadata => HibernateSchemaMigration.migrate(metadata, ds))
+      execute(ds, "INSERT INTO public.member VALUES (1, NULL)")
+      withMetadata(ds, Seq(classOf[RequiredMember])) { metadata =>
+        val twice = intercept[MigrationException](HibernateSchemaMigration.migrate(metadata, ds, backfills = Vector(TestBackfills.nick)))
+        assertEquals(twice.state, FailureState.NotStarted)
+        assert(twice.getMessage.contains("Backfill ID 'member-nick-v1' is registered 2 times"), twice.getMessage)
+        assertEquals(HibernateSchemaMigration.migrate(metadata, ds).backfills,
+          Vector(BackfillOutcome("member-nick-v1", BackfillResult.Executed, Some(1L))))
+      }
+    }
+  }
+
   test("settings carry approvals: removing an entity drops its table and sequence only when approved") {
     withDatabase { ds =>
       withSessionFactory(ds, entities, enabled)(_ => ())
@@ -186,7 +208,8 @@ class SchemaMigrationIntegrationSuite extends TestPostgres:
       }
       val result = withMetadata(ds, entities, validate) { metadata =>
         val adopted = HibernateSchemaMigration.migrate(metadata, ds, ExecutionOptions(adoptExistingSchema = true))
-        assertEquals(adopted, MigrationResult(1, MigrationStatus.Adopted, 0))
+        // The test provider's backfill targets another table and stays pending.
+        assertEquals(adopted, MigrationResult(1, MigrationStatus.Adopted, 0, pendingBackfills = Vector("member-nick-v1")))
         metadata.buildSessionFactory().close()
         adopted
       }
