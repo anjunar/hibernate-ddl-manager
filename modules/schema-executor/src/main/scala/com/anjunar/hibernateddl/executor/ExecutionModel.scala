@@ -40,8 +40,47 @@ enum Approval:
 enum MigrationStatus:
   case Applied, AlreadyApplied, Adopted, ManuallyMigrated
 
-/** Revision 0 is the empty model of a database without history. */
-final case class MigrationResult(revision: Long, status: MigrationStatus, statementCount: Int)
+/** Revision 0 is the empty model of a database without history. `backfills` lists what this
+  * start recorded for backfills; `pendingBackfills` names the registered backfills that are
+  * not recorded yet and did not apply, because none of their columns became required.
+  */
+final case class MigrationResult(
+    revision: Long,
+    status: MigrationStatus,
+    statementCount: Int,
+    backfills: Vector[BackfillOutcome] = Vector.empty,
+    pendingBackfills: Vector[String] = Vector.empty
+)
+
+/** How a database reached the state a backfill's column is required in. */
+enum BackfillResult:
+  /** The backfill filled the column's NULLs while it became required. */
+  case Executed
+  /** The column was created required with a new table, so there was nothing to fill. */
+  case NotRequiredOnCreation
+  /** The column was found required when the database was adopted or migrated by hand. */
+  case Adopted
+
+/** `updatedRows` is known only for an executed backfill. */
+final case class BackfillOutcome(id: String, result: BackfillResult, updatedRows: Option[Long])
+
+/** A recorded backfill: its definition's checksum in the given format, and the schema
+  * revision whose migration recorded it. Each ID is recorded once.
+  */
+final case class BackfillRecord(
+    id: String,
+    format: Int,
+    checksum: String,
+    target: SchemaId,
+    revision: Long,
+    previousFingerprint: String,
+    targetFingerprint: String,
+    result: BackfillResult,
+    updatedRows: Option[Long]
+)
+
+/** SQL with JDBC parameters, bound in order. */
+final case class BoundStatement(sql: String, parameters: Vector[AnyRef])
 
 /** Unknown means the server must stop and reconcile history before retrying. Committed means
   * the migration committed, but the connection could not be restored to the state it arrived
@@ -90,4 +129,11 @@ trait TransactionalMigrationBackend extends SchemaDialect:
   /** The model's tables and sequences whose names are taken by any relation in the database. */
   def existingRelations(connection: Connection, model: SchemaModel): Vector[QualifiedName]
   def lockAndValidate(connection: Connection, expected: SchemaModel, lock: TableLock): Vector[String]
+  /** A query whose single row and column counts the rows in which the column is NULL. */
+  def nullCount(table: QualifiedName, column: SqlIdentifier): String
+  /** An UPDATE that fills the column's NULLs and binds every constant as a parameter. */
+  def renderFill(fill: NullFill): Either[Vector[String], BoundStatement]
   def recordHistory(connection: Connection, entry: HistoryEntry): Unit
+  /** Every recorded backfill, ordered by revision and ID. */
+  def readBackfills(connection: Connection): Vector[BackfillRecord]
+  def recordBackfill(connection: Connection, record: BackfillRecord): Unit

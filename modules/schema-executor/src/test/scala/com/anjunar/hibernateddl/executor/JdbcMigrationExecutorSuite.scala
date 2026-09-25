@@ -28,6 +28,12 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     var driftAt = Set.empty[String]
     var backendErrors = Vector.empty[String]
     var renderErrors = Vector.empty[String]
+    /** What every NULL count returns, and how many rows every fill updates. */
+    var nullRows = 0L
+    var filledRows = 0
+    /** Committed backfill records; recorded ones become part of them only when the transaction commits. */
+    var backfills = Vector.empty[BackfillRecord]
+    private var pendingBackfills = Vector.empty[BackfillRecord]
     /** Names of relations that exist in the database outside any history. */
     var existing = Set.empty[String]
 
@@ -71,6 +77,39 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
               case "execute" =>
                 event(s"sql:$number:${values(0)}")
                 Boolean.box(false)
+              case "executeQuery" =>
+                event(s"query:$number:${values(0)}")
+                var read = false
+                proxy(classOf[java.sql.ResultSet]) { (method, _) =>
+                  method match
+                    case "next" =>
+                      val first = !read
+                      read = true
+                      Boolean.box(first)
+                    case "getLong" => Long.box(nullRows)
+                    case "close" => null
+                    case other => throw new UnsupportedOperationException(other)
+                }
+              case "close" =>
+                event(s"close-statement:$number")
+                null
+              case other => throw new UnsupportedOperationException(other)
+          }
+        case "prepareStatement" =>
+          statementNumber += 1
+          val number = statementNumber
+          event(s"statement:$number")
+          proxy(classOf[java.sql.PreparedStatement]) { (method, values) =>
+            method match
+              case "setQueryTimeout" =>
+                event(s"timeout:$number:${values(0)}")
+                null
+              case "setObject" =>
+                event(s"parameter:$number:${values(0)}:${values(1)}")
+                null
+              case "executeUpdate" =>
+                event(s"update:$number:${args(0)}")
+                Int.box(filledRows)
               case "close" =>
                 event(s"close-statement:$number")
                 null
@@ -79,11 +118,14 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
         case "commit" =>
           event(name)
           history ++= pending
+          backfills ++= pendingBackfills
           pending = None
+          pendingBackfills = Vector.empty
           null
         case "rollback" | "close" | "abort" =>
           event(name)
           pending = None
+          pendingBackfills = Vector.empty
           null
         case other => throw new UnsupportedOperationException(other)
     }
@@ -113,7 +155,18 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
           case _: SchemaOperation.DropColumn => "drop column"
           case _: SchemaOperation.DropTables => "drop tables"
           case _: SchemaOperation.DropSequence => "drop sequence"
+          case _: SchemaOperation.SetNotNull => "set not null"
+          case _: SchemaOperation.DropNotNull => "drop not null"
         })
+      def nullCount(table: QualifiedName, column: SqlIdentifier): String = s"count nulls ${column.value}"
+      def renderFill(fill: NullFill): Either[Vector[String], BoundStatement] =
+        Right(BoundStatement(s"fill ${fill.column.value}", Vector(fill.value.toString)))
+      def readBackfills(actual: Connection): Vector[BackfillRecord] =
+        onConnection(actual, "read-backfills")
+        backfills
+      def recordBackfill(actual: Connection, record: BackfillRecord): Unit =
+        onConnection(actual, s"record-backfill:${record.id}")
+        pendingBackfills :+= record
       private def onConnection(actual: Connection, label: String): Unit =
         assert(actual eq connection)
         event(label)
@@ -133,17 +186,25 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
         onConnection(actual, "record-history")
         pending = Some(entry)
 
-    def migrate(target: SchemaModel, options: ExecutionOptions = ExecutionOptions()): MigrationResult =
-      new JdbcMigrationExecutor(backend, options).migrate(dataSource, target)
+    def migrate(
+        target: SchemaModel,
+        options: ExecutionOptions = ExecutionOptions(),
+        backfills: Vector[Backfill] = Vector.empty
+    ): MigrationResult =
+      new JdbcMigrationExecutor(backend, options).migrate(dataSource, target, backfills)
 
     def seed(models: SchemaModel*): Unit =
       models.foreach(model => migrate(model))
       events.clear()
       statementNumber = 0
 
-    def refused(target: SchemaModel, options: ExecutionOptions = ExecutionOptions()): MigrationException =
+    def refused(
+        target: SchemaModel,
+        options: ExecutionOptions = ExecutionOptions(),
+        backfills: Vector[Backfill] = Vector.empty
+    ): MigrationException =
       val before = history
-      val error = intercept[MigrationException](migrate(target, options))
+      val error = intercept[MigrationException](migrate(target, options, backfills))
       assertEquals(history, before)
       assert(!events.contains("commit"), events)
       error
@@ -153,7 +214,7 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     assertEquals(h.migrate(initial), MigrationResult(1, MigrationStatus.Applied, 1))
     assertEquals(h.events.toVector, Vector(
       "connection", "get-auto-commit", "auto-commit:false", "read-committed", "lock", "initialize-history",
-      "read-history", "existing-relations", "validate:", "statement:1", "timeout:1:30", "sql:1:create table", "close-statement:1",
+      "read-history", "read-backfills", "existing-relations", "validate:", "statement:1", "timeout:1:30", "sql:1:create table", "close-statement:1",
       "validate:account", "record-history", "commit", "auto-commit:true", "isolation:8", "close"
     ))
     val entry = h.history.head
@@ -170,7 +231,7 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     assertEquals(h.migrate(renamed), MigrationResult(2, MigrationStatus.Applied, 2))
     assertEquals(h.events.toVector, Vector(
       "connection", "get-auto-commit", "auto-commit:false", "read-committed", "lock", "initialize-history",
-      "read-history", "validate:account",
+      "read-history", "read-backfills", "validate:account",
       "statement:1", "timeout:1:30", "sql:1:rename table", "close-statement:1",
       "statement:2", "timeout:2:30", "sql:2:rename column", "close-statement:2",
       "validate:accounts", "record-history", "commit", "auto-commit:true", "isolation:8", "close"
@@ -188,7 +249,7 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     assertEquals(h.migrate(reordered), MigrationResult(1, MigrationStatus.AlreadyApplied, 0))
     assertEquals(h.events.toVector, Vector(
       "connection", "get-auto-commit", "auto-commit:false", "read-committed", "lock", "initialize-history",
-      "read-history", "validate-shared:account", "commit", "auto-commit:true", "isolation:8", "close"
+      "read-history", "read-backfills", "validate-shared:account", "commit", "auto-commit:true", "isolation:8", "close"
     ))
     h.events.clear()
     h.driftAt = Set("account")
@@ -212,7 +273,7 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     assertEquals(h.migrate(initial, adopt), MigrationResult(1, MigrationStatus.Adopted, 0))
     assertEquals(h.events.toVector, Vector(
       "connection", "get-auto-commit", "auto-commit:false", "read-committed", "lock", "initialize-history",
-      "read-history", "existing-relations", "validate:account", "record-history", "commit", "auto-commit:true", "isolation:8", "close"
+      "read-history", "read-backfills", "existing-relations", "validate:account", "record-history", "commit", "auto-commit:true", "isolation:8", "close"
     ))
     assertEquals(h.history, Vector(HistoryEntry(1, SchemaFingerprint.of(empty), SchemaFingerprint.of(initial),
       SchemaModelJson.encode(initial), Vector.empty)))
@@ -341,7 +402,7 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     assertEquals(h.migrate(retyped, manual), MigrationResult(2, MigrationStatus.ManuallyMigrated, 0))
     assertEquals(h.events.toVector, Vector(
       "connection", "get-auto-commit", "auto-commit:false", "read-committed", "lock", "initialize-history",
-      "read-history", "existing-relations", "validate:account", "record-history", "commit", "auto-commit:true", "isolation:8", "close"
+      "read-history", "read-backfills", "existing-relations", "validate:account", "record-history", "commit", "auto-commit:true", "isolation:8", "close"
     ))
     assertEquals(h.history.last, HistoryEntry(2, SchemaFingerprint.of(initial), fingerprint,
       SchemaModelJson.encode(retyped), Vector.empty))
@@ -364,6 +425,152 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     assertEquals(h.migrate(renamed, manual), MigrationResult(2, MigrationStatus.ManuallyMigrated, 0))
   }
 
+  test("a column becomes required only after a count under the lock finds no NULL") {
+    val required = SchemaModel(Vector(account.copy(columns = Vector(name.copy(nullable = false)))))
+    val h = new Harness
+    h.seed(initial)
+    h.nullRows = 2
+    val error = h.refused(required)
+    assert(error.getMessage.contains("Column 'account-name' (account.name) becomes required, but 2 rows hold NULL; " +
+      "register a backfill for it or fill the rows before the migration"), error.getMessage)
+    assert(!h.events.exists(_.startsWith("sql:")), h.events)
+    h.nullRows = 0
+    h.events.clear()
+    assertEquals(h.migrate(required), MigrationResult(2, MigrationStatus.Applied, 1))
+    assertEquals(h.events.toVector.filter(e => e.startsWith("validate") || e.startsWith("query") || e.startsWith("sql"))
+      .map(_.replaceAll(":[0-9]+:", ":")), Vector("validate:account", "query:count nulls name", "sql:set not null",
+        "validate:account"))
+    assertEquals(h.history.last.statements, Vector("set not null"))
+    assertEquals(h.migrate(initial, ExecutionOptions(approvals = Set(Approval.Revert(1)))).statementCount, 1)
+    assertEquals(h.history.last.statements, Vector("drop not null"))
+  }
+
+  private val required = SchemaModel(Vector(account.copy(columns = Vector(name.copy(nullable = false)))))
+  private def fill(id: String, value: String = "Unknown", target: SchemaId = name.id) =
+    Backfill.fillNulls(id, target, BackfillTrigger.BecomesRequired, BackfillValue.literal(value))
+
+  test("a backfill fills the NULLs of a column that becomes required, before the count, and is recorded once") {
+    val h = new Harness
+    h.seed(initial)
+    h.filledRows = 3
+    val rule = fill("name-v1")
+    val result = h.migrate(required, backfills = Vector(rule))
+    assertEquals(result, MigrationResult(2, MigrationStatus.Applied, 2,
+      Vector(BackfillOutcome("name-v1", BackfillResult.Executed, Some(3L)))))
+    assertEquals(h.events.toVector.filter(e => e.startsWith("update") || e.startsWith("query") || e.startsWith("sql") ||
+      e.startsWith("parameter") || e.startsWith("record")).map(_.replaceAll(":[0-9]+:", ":")), Vector(
+      "parameter:1:Literal(Text(Unknown),Text)", "update:fill name", "query:count nulls name", "sql:set not null",
+      "record-history", "record-backfill:name-v1"))
+    assertEquals(h.history.last.statements, Vector("fill name", "set not null"))
+    val record = h.backfills.head
+    assertEquals((record.id, record.checksum, record.target, record.revision, record.result, record.updatedRows),
+      ("name-v1", BackfillChecksum.of(rule), name.id, 2L, BackfillResult.Executed, Some(3L)))
+    h.events.clear()
+    assertEquals(h.migrate(required, backfills = Vector(rule)), MigrationResult(2, MigrationStatus.AlreadyApplied, 0))
+    assert(!h.events.exists(e => e.startsWith("update") || e.startsWith("record")), h.events)
+  }
+
+  test("a recorded backfill with another definition blocks the start, even with the schema applied") {
+    val h = new Harness
+    h.seed(initial)
+    h.migrate(required, backfills = Vector(fill("name-v1")))
+    h.events.clear()
+    val changed = h.refused(required, backfills = Vector(fill("name-v1", "Anonymous")))
+    assertEquals(changed.state, FailureState.RolledBack)
+    assert(changed.getMessage.contains("Backfill 'name-v1' was recorded in revision 2 with another definition; " +
+      "a changed rule needs a new ID"), changed.getMessage)
+    assert(!h.events.exists(_.startsWith("validate")), h.events)
+  }
+
+  test("NULLs left without a backfill, after a recorded one or after a pending one name the reason") {
+    val h = new Harness
+    h.seed(initial)
+    h.nullRows = 4
+    assert(h.refused(required).getMessage.contains("but 4 rows hold NULL; register a backfill for it"))
+    assert(h.refused(required, backfills = Vector(fill("name-v1"))).getMessage
+      .contains("but 4 rows hold NULL; backfill 'name-v1' left them NULL"))
+    assertEquals(h.history.size, 1)
+    assertEquals(h.backfills, Vector.empty)
+    h.nullRows = 0
+    h.migrate(required, backfills = Vector(fill("name-v1")))
+    h.migrate(initial, ExecutionOptions(approvals = Set(Approval.Revert(1))), Vector(fill("name-v1")))
+    h.nullRows = 1
+    h.events.clear()
+    assert(h.refused(SchemaModel(Vector(account.copy(columns = Vector(name.copy(name = SqlIdentifier("full"),
+      nullable = false))))), backfills = Vector(fill("name-v1"))).getMessage
+      .contains("backfill 'name-v1' was recorded in revision 2 and does not run again; a new rule for it needs a new ID"))
+  }
+
+  test("backfills that compete for a column, chain or do not type-check are refused before any change") {
+    val h = new Harness
+    h.seed(initial)
+    val competing = h.refused(required, backfills = Vector(fill("a"), fill("b")))
+    assert(competing.getMessage.contains("Backfills 'a', 'b' all fill column 'account-name'; only one may apply"),
+      competing.getMessage)
+    val count = ColumnModel(SchemaId("account-count"), SqlIdentifier("count"), SqlType.Integer)
+    val typed = SchemaModel(Vector(account.copy(columns = Vector(name, count.copy(nullable = false)))))
+    h.migrate(SchemaModel(Vector(account.copy(columns = Vector(name, count)))))
+    h.events.clear()
+    val wrong = h.refused(typed, backfills = Vector(fill("count-v1", "3", count.id)))
+    assert(wrong.getMessage.contains("the constant '3' cannot fill a column of type Integer"), wrong.getMessage)
+    val chained = SchemaModel(Vector(account.copy(columns = Vector(name.copy(nullable = false), count.copy(nullable = false)))))
+    val chain = Backfill.fillNulls("count-v1", count.id, BackfillTrigger.BecomesRequired,
+      BackfillValue.coalesce(BackfillValue.column(name.id), BackfillValue.literal(1L)))
+    assert(h.refused(chained, backfills = Vector(fill("name-v1"), chain)).getMessage
+      .contains("reads column 'account-name', which another backfill fills"))
+    assert(!h.events.exists(e => e.startsWith("validate") || e.startsWith("update")), h.events)
+    val invalid = new Harness
+    assertEquals(invalid.refused(initial, backfills = Vector(fill(" "))).state, FailureState.NotStarted)
+  }
+
+  test("a backfill whose column a new table creates required, or that adoption finds required, is recorded but not run") {
+    val bio = ColumnModel(SchemaId("profile-bio"), SqlIdentifier("bio"), SqlType.Text, nullable = false)
+    val profile = TableModel(SchemaId("profile"), QualifiedName(SqlIdentifier("profile")), Vector(bio))
+    val rules = Vector(fill("bio-v1", target = bio.id), fill("unused-v1", target = SchemaId("elsewhere")))
+    val h = new Harness
+    h.seed(initial)
+    val created = h.migrate(SchemaModel(Vector(account, profile)), backfills = rules)
+    assertEquals(created.backfills, Vector(BackfillOutcome("bio-v1", BackfillResult.NotRequiredOnCreation, None)))
+    assertEquals(created.pendingBackfills, Vector("unused-v1"))
+    assert(!h.events.exists(_.startsWith("update")), h.events)
+    val adopted = new Harness
+    adopted.existing = Set("account")
+    val adoption = adopted.migrate(required, ExecutionOptions(adoptExistingSchema = true), Vector(fill("name-v1")))
+    assertEquals(adoption.backfills, Vector(BackfillOutcome("name-v1", BackfillResult.Adopted, None)))
+    assertEquals(adopted.backfills.map(r => (r.revision, r.result)), Vector(1L -> BackfillResult.Adopted))
+    val manual = new Harness
+    manual.seed(initial)
+    manual.existing = Set("account")
+    val options = ExecutionOptions(acceptManualMigration = Some(SchemaFingerprint.of(required)))
+    assertEquals(manual.migrate(required, options, Vector(fill("name-v1"))).backfills,
+      Vector(BackfillOutcome("name-v1", BackfillResult.Adopted, None)))
+  }
+
+  test("a failure after the fill rolls back the schema history and the backfill history together") {
+    val h = new Harness
+    h.seed(initial)
+    h.failAt = Set("record-backfill:name-v1")
+    assertEquals(h.refused(required, backfills = Vector(fill("name-v1"))).state, FailureState.RolledBack)
+    assert(h.events.exists(_.startsWith("update")), h.events)
+    assertEquals((h.history.size, h.backfills), (1, Vector.empty))
+  }
+
+  test("an inconsistent backfill history is refused before planning") {
+    val rule = fill("name-v1")
+    def record(revision: Long, format: Int = BackfillChecksum.Format) = BackfillRecord("name-v1", format,
+      BackfillChecksum.of(rule), name.id, revision, SchemaFingerprint.of(empty), SchemaFingerprint.of(initial),
+      BackfillResult.Adopted, None)
+    Vector(record(2) -> "revision 2 with its fingerprints is not in the schema history",
+      record(1, 9) -> "its definition format 9 is unknown", record(1).copy(updatedRows = Some(1)) -> "only an executed backfill"
+    ).foreach { (broken, reason) =>
+      val h = new Harness
+      h.seed(initial)
+      h.backfills = Vector(broken)
+      val error = h.refused(required, backfills = Vector(rule))
+      assert(error.getMessage.contains(s"Backfill history is inconsistent at backfill 'name-v1': $reason"), error.getMessage)
+    }
+  }
+
   test("renaming a sequence back to an earlier name is refused like an older server") {
     val sequence = SequenceModel(SchemaId("account-sequence"), QualifiedName(SqlIdentifier("account_seq")), 1, 50)
     val renamedSequence = sequence.copy(name = QualifiedName(SqlIdentifier("accounts_seq")))
@@ -380,7 +587,7 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     val h = new Harness
     h.seed(initial)
     assert(h.refused(retyped).getMessage.contains("Changing type"))
-    assert(h.events.containsSlice(Vector("read-history", "rollback", "auto-commit:true", "isolation:8", "close")), h.events)
+    assert(h.events.containsSlice(Vector("read-history", "read-backfills", "rollback", "auto-commit:true", "isolation:8", "close")), h.events)
     val render = new Harness
     render.renderErrors = Vector("Cannot render plan")
     assert(render.refused(initial).getMessage.contains("Cannot render plan"))

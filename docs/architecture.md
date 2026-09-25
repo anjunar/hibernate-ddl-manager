@@ -46,6 +46,8 @@ multi-tenancy, where the server must call the explicit API with a suitable DataS
 Both paths refuse a non-PostgreSQL dialect and any Hibernate schema action other than
 `none` or `validate`, because Hibernate must not change the managed schema itself.
 `hibernate.ddl_manager.*` settings map onto the execution options; unknown ones are errors.
+Both paths pass the backfills of every `BackfillProvider` found through Hibernate's class
+loader service to the executor; the explicit call can add more.
 
 ## Stable identity with `@SchemaId`
 
@@ -163,6 +165,22 @@ there:
   model remains under a name the target no longer has, and records the target as the next
   revision with no statements. An option naming another target is refused. Earlier-revision, retired-ID and
   drift checks still apply.
+- A column that becomes required (a new required column in an existing table is added
+  nullable first) gets `SET NOT NULL` after the foreign keys and before the drops. Right
+  before it, the one registered backfill that targets the column and is not recorded yet
+  fills its NULLs, and a count under the lock must find none left. Several such backfills
+  for one column, a backfill reading a column that another fills, and a value that does not
+  fit are refused before any change. See [backfills](backfills-and-not-null.md).
+- `__hibernate_ddl.backfill_history` records each backfill once, with the format and
+  checksum of its definition, the target column ID, the schema revision and fingerprints of
+  the migration that recorded it, and whether it was executed (with the updated rows), not
+  required because a new table created the column, or adopted because adoption or a manual
+  migration found the column required. Before anything else, even when the schema is
+  already applied, every record must match the schema history and every registered backfill
+  its record; a changed definition needs a new ID. A backfill whose column does not become
+  required stays pending and is reported in `MigrationResult.pendingBackfills`. The schema
+  history, its models and fingerprints do not change; the backfill history references its
+  revisions.
 - A dropped ID is retired: an ID that an earlier revision had and the latest does not may
   never appear again, not even with approvals. This rejects an ID copied from the version
   history of the code, which would attach the dropped object's identity to a new one.
@@ -183,7 +201,7 @@ there:
 | `schema-hibernate` | `@SchemaId` and `HibernateSchemaSource` (boot metadata → model), pinned to Hibernate 7.4.10 |
 | `schema-executor` | Transaction, planning against the stored model, fingerprints, JSON format and history verification, failure states |
 | `schema-postgresql` | SQL renderer, catalog checks, locking and history for PostgreSQL 14+ |
-| `schema-integration` | `HibernateSchemaMigration`, the opt-in `SchemaMigrationIntegrator` and the `hibernate.ddl_manager.*` settings |
+| `schema-integration` | `HibernateSchemaMigration`, the opt-in `SchemaMigrationIntegrator`, the `hibernate.ddl_manager.*` settings and the `BackfillProvider` SPI |
 | `schema-cli` | Demo without a database connection |
 
 ## Scope of 1.0
@@ -194,7 +212,7 @@ Everything outside this scope is rejected, never silently ignored.
 | --- | --- | --- |
 | Model | Tables, columns `varchar(n)`, `char(n)`, `text`, `smallint`, `integer`, `bigint`, `numeric(p,s)`, `real`, `double precision`, `boolean`, `uuid`, `date`, `time(p)`, `timestamp(p)`, `timestamp(p) with time zone`, binary data (`bytea`), large objects (`oid`), JSON documents (`jsonb`), nullability, identity columns, column checks (allowed values, integer range), ascending bigint sequences, primary keys, unique keys, plain indexes with column directions, foreign keys to a primary key | All other types and objects |
 | Adapter | Entities, secondary tables with `@SecondaryTableId`, inheritance by `SINGLE_TABLE` (with its discriminator check), `JOINED` or `TABLE_PER_CLASS` (also with an abstract root and one sequence for the hierarchy), `@MappedSuperclass`, simple properties, embeddables, generated `UUID` keys, `@GeneratedValue` by sequence (Hibernate's default `Entity_SEQ` or `@SequenceGenerator`) or identity, `LocalDate`, `LocalTime`, `LocalDateTime`, `Instant`, `OffsetDateTime` and `@Column(secondPrecision)`, `BigDecimal` and `BigInteger` with `@Column(precision, scale)`, `Short`, `Byte`, `Float`, `Double`, `Character`, `byte[]`, `@Lob`, `Blob` and `Clob` (as large objects), `@JdbcTypeCode(SqlTypes.JSON)` on a basic property or an `@Embedded` embeddable (one `jsonb` column), `Duration` (as `numeric`), `@ManyToOne` with or without a constraint, `@OneToOne`, `@Column(unique)`, `@UniqueConstraint`, `@NaturalId`, `@Index` with `asc`/`desc`, `@Enumerated` by name or ordinal, `@ElementCollection` and `@ManyToMany` (also unidirectional `@OneToMany` through a join table) as sets, lists, `@OrderColumn` lists or maps (basic, embeddable or entity keys) of basic values, enums, embeddables or entities | Other CHECK constraints (`@Column(check)`, `@Check`, enum values containing a quote), enums and non-null properties inside a JSON embeddable (Hibernate guards them with a table check), arrays and other types, `ON DELETE` actions, associations to non-primary-key or multi-column keys, ordered unique keys, DDL `options` of columns, tables, primary and unique keys, foreign keys, indexes and sequences (Hibernate appends them verbatim), index expressions, `@CollectionId` bags, collections inside embeddables or sharing a table, sequences shared by several keys or used by no key, `GenerationType.TABLE`, table-level checks, defaults, columns without an ID origin |
-| Diff | New and renamed sequences, new tables, new nullable columns, new unique keys and indexes, new foreign keys (added after all tables, so cycles work), added, changed or removed column checks (existing rows are validated), table and column renames; approved drops of columns (with the keys and indexes over them), tables (all in one statement, so they may reference each other) and sequences, run last and without `CASCADE` | Unapproved drops, dropping a key, index or foreign key whose columns remain, reusing a dropped name in the same plan, sequence start or increment changes, identity changes, type/nullability/primary key/foreign key changes, schema moves, rename collisions and swaps |
+| Diff | New and renamed sequences, new tables, new columns (a required one is added nullable and made required after a NULL count under the lock), columns becoming required or optional, new unique keys and indexes, new foreign keys (added after all tables, so cycles work), added, changed or removed column checks (existing rows are validated), table and column renames; approved drops of columns (with the keys and indexes over them), tables (all in one statement, so they may reference each other) and sequences, run last and without `CASCADE` | Unapproved drops, dropping a key, index or foreign key whose columns remain, reusing a dropped name in the same plan, sequence start or increment changes, identity changes, new identity columns in existing tables, a required column with NULLs left, type/primary key/foreign key changes, schema moves, rename collisions and swaps |
 | History | Stored model per revision, skipped releases, opt-in adoption of an existing database that matches the target exactly, approved returns to an earlier revision or name | Unapproved target model of an earlier revision or rename back to an earlier name, modified history, existing tables without history unless adopted, partial adoption |
 | PostgreSQL | Ordinary permanent tables with exactly these columns and `GENERATED BY DEFAULT` identity columns whose sequence has PostgreSQL's defaults (start, increment and minimum 1, the type's maximum, cache 1, no cycling), unowned bigint sequences with default minimum, maximum, cache and no cycling, a non-deferrable primary key, plain unique constraints, plain B-tree indexes and plain foreign keys, matched by structure; column checks, matched by their derived name, column and definition | `GENERATED ALWAYS` identity, identity sequences with other options, sequences with other types or options or owned by a column, other constraints, unexpected or `NOT VALID` checks, checks with another definition, unique, partial, expression, covering or non-B-tree indexes, custom operator classes, collations or `NULLS` ordering, deferrable, `INCLUDE` or `NULLS NOT DISTINCT` unique keys, foreign keys with actions, `MATCH FULL` or deferrable checking, foreign keys from unmodeled tables, triggers, rules, RLS, inheritance, partitions, custom collations |
 

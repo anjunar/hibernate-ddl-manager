@@ -1,10 +1,12 @@
 package com.anjunar.hibernateddl.core
 
-/** Plans creation, nullable additions, new unique keys, indexes and foreign keys, changed
-  * column checks, explicit-ID renames and drops of columns, tables and sequences; all other
-  * changes fail closed. Foreign keys are added after every table exists; drops come last, so
-  * that nothing planned before them still needs what they delete. Whether a drop may run is
-  * the caller's decision.
+/** Plans creation, added columns, new unique keys, indexes and foreign keys, changed column
+  * checks, nullability changes, explicit-ID renames and drops of columns, tables and
+  * sequences; all other changes fail closed. A new required column in an existing table is
+  * added nullable and made required later. Foreign keys are added after every table exists,
+  * then columns become required, and drops come last, so that nothing planned before them
+  * still needs what they delete. Whether a drop may run, and how NULLs of a column that
+  * becomes required are filled, is the caller's decision.
   */
 object DiffEngine:
   def diff(
@@ -27,6 +29,7 @@ object DiffEngine:
     val operations = Vector.newBuilder[SchemaOperation]
     val addedKeys = Vector.newBuilder[(TableModel, ForeignKeyModel)]
     val droppedColumns = Vector.newBuilder[SchemaOperation]
+    val required = Vector.newBuilder[SchemaOperation]
     val droppedSequences = planSequences(previous, desired, errors, operations)
     val oldTables = previous.tables.map(t => t.id -> t).toMap
     val newTables = desired.tables.map(t => t.id -> t).toMap
@@ -66,8 +69,6 @@ object DiffEngine:
         val newColumn = newColumns(columnId)
         if oldColumn.dataType != newColumn.dataType then
           errors += s"Changing type of column '${columnId.value}' is unsupported; manual migration required"
-        if oldColumn.nullable != newColumn.nullable then
-          errors += s"Changing nullability of column '${columnId.value}' is unsupported; manual migration required"
         if oldColumn.identity != newColumn.identity then
           errors += s"Changing identity generation of column '${columnId.value}' is unsupported; manual migration required"
         if oldColumn.name != newColumn.name then
@@ -76,16 +77,24 @@ object DiffEngine:
               errors += s"Renaming column '${columnId.value}' collides with previous column '${occupant.id.value}'; dependent or swap renames require manual migration"
             case None =>
               operations += SchemaOperation.RenameColumn(id, newTable.name, columnId, oldColumn.name, newColumn.name)
+        // After the rename, whose new name it uses. Primary key and identity columns cannot
+        // become nullable in a valid model.
+        if oldColumn.nullable && !newColumn.nullable then
+          required += SchemaOperation.SetNotNull(id, newTable.name, columnId, newColumn.name)
+        else if !oldColumn.nullable && newColumn.nullable then
+          operations += SchemaOperation.DropNotNull(id, newTable.name, columnId, newColumn.name)
         if oldColumn.check != newColumn.check && oldColumn.dataType == newColumn.dataType then
           operations += SchemaOperation.ChangeCheck(id, newTable.name, columnId, newColumn.name, oldColumn.check, newColumn.check)
       }
       (newColumns.keySet -- oldColumns.keySet).toVector.sortBy(_.value).foreach { columnId =>
         val column = newColumns(columnId)
-        if !column.nullable then
-          errors += s"Adding non-null column '${columnId.value}' to existing table '${id.value}' requires an explicit backfill"
+        if column.identity then
+          errors += s"Adding identity column '${columnId.value}' to existing table '${id.value}' is unsupported; manual migration required"
         else if oldTable.columns.exists(_.name == column.name) then
           errors += s"Adding column '${columnId.value}' uses an occupied previous name in table '${id.value}'; manual migration required"
-        else operations += SchemaOperation.AddColumn(id, newTable.name, column)
+        else
+          operations += SchemaOperation.AddColumn(id, newTable.name, column.copy(nullable = true))
+          if !column.nullable then required += SchemaOperation.SetNotNull(id, newTable.name, columnId, column.name)
       }
 
       val oldUniqueKeys = oldTable.uniqueKeys.toSet
@@ -133,6 +142,7 @@ object DiffEngine:
         referenced.name, names(referenced, key.referencedColumns))
     }
 
+    operations ++= required.result()
     operations ++= droppedColumns.result()
     if droppedTables.nonEmpty then
       operations += SchemaOperation.DropTables(droppedTables.map(id => SchemaOperation.DroppedTable(id, oldTables(id).name)))

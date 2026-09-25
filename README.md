@@ -189,10 +189,55 @@ change is not planned has no effect. A dropped ID is retired for good; reusing i
 even with approvals. Drops run last and without `CASCADE`, so a view that depends on a
 dropped column makes the migration fail and roll back.
 
+### Required columns
+
+A new required column in an existing table is added nullable first; a column becomes
+required with `SET NOT NULL` after the executor has counted under the lock that no row holds
+NULL. Any NULL left makes the migration fail and roll back, so a new required column works
+in an empty table, and a column becomes required once its rows are filled. A required
+column becomes optional again with `DROP NOT NULL`; primary key and identity columns stay
+required.
+
+The values for existing rows come from a backfill that the application registers; the
+framework never invents one:
+
+```scala
+val backfills = Vector(
+  Backfill.fillNulls(
+    id = "user-display-name-v1",
+    target = SchemaId("7f3a9c21/4f5a6b7c"),
+    when = BackfillTrigger.BecomesRequired,
+    value = BackfillValue.coalesce(
+      BackfillValue.concat(BackfillValue.column(SchemaId("7f3a9c21/1a2b3c4d")), BackfillValue.literal(" "),
+        BackfillValue.column(SchemaId("7f3a9c21/2b3c4d5e"))),
+      BackfillValue.literal("Unknown"))
+  )
+)
+HibernateSchemaMigration.migrate(metadata, dataSource, backfills = backfills)
+```
+
+For the integrator, and for the explicit call as well, a `BackfillProvider` supplies rules
+through `META-INF/services/com.anjunar.hibernateddl.integration.BackfillProvider`; the
+explicit call adds its `backfills` to those, and an ID found twice is refused. Keep the rules
+of every release that a server may still skip.
+
+When the target column becomes required, the backfill runs
+`UPDATE … SET "display_name" = … WHERE "display_name" IS NULL` right before `SET NOT NULL`,
+with every constant as a JDBC parameter. Values are constants, other columns of the same
+row by stable ID, `coalesce` and `concat` (NULL if any part is NULL); a constant must fit the
+column without conversion or rounding, and a source column must have the target's type or
+be text for text. A backfill runs once: it is recorded with its definition's checksum in
+`__hibernate_ddl.backfill_history`, and the same ID with another definition blocks the start.
+A column that a new table creates required, or that adoption or a manual migration finds
+required, records the backfill without running it. Backfills for a release that a server
+skips still run, from columns the same migration drops only afterwards. A rule whose column
+does not become required stays pending and appears in `MigrationResult.pendingBackfills`.
+Backfills run inside the migration's transaction while its tables are locked exclusively;
+large tables and deployments without downtime need a separate, stepwise data migration.
+
 ### Changes the executor cannot plan
 
-Type, nullability and primary key changes, among others, need a data migration and are
-refused. The refusal names the target's fingerprint. Change the database by hand to exactly
+Type and primary key changes, among others, need a data migration and are refused. The refusal names the target's fingerprint. Change the database by hand to exactly
 the target schema, then start once with
 `ExecutionOptions(acceptManualMigration = Some("<fingerprint>"))`: the executor checks the
 database against the target under the lock, checks that every table or sequence the target

@@ -29,12 +29,22 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
   // One transaction lock per database, independent of the migrated schemas.
   private val AdvisoryLockKey = 0x4844444c4d475231L
   private val HistoryColumns = Vector("revision", "previous_fingerprint", "target_fingerprint", "model", "statements")
+  private val BackfillTable = "\"__hibernate_ddl\".\"backfill_history\""
+  private val BackfillColumns = Vector("backfill_id", "definition_format", "definition_checksum", "target_column", "revision",
+    "previous_fingerprint", "target_fingerprint", "result", "updated_rows")
+  private val BackfillResults = Map(BackfillResult.Executed -> "executed",
+    BackfillResult.NotRequiredOnCreation -> "not required on creation", BackfillResult.Adopted -> "adopted")
 
   override def render(
       operations: Vector[SchemaOperation]
   ): Either[Vector[String], Vector[String]] = PostgreSqlDialect.render(operations)
 
   override def validate(model: SchemaModel): Vector[String] = validateModel(model)
+
+  override def nullCount(table: QualifiedName, column: SqlIdentifier): String = PostgreSqlDialect.nullCount(table, column)
+
+  override def renderFill(fill: NullFill): Either[Vector[String], BoundStatement] =
+    PostgreSqlDialect.renderFill(fill).map(BoundStatement(_, _))
 
   override def acquireLock(connection: Connection, options: ExecutionOptions): Unit =
     if connection.getAutoCommit then
@@ -82,15 +92,36 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
          |  applied_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT pg_catalog.clock_timestamp()
          |)""".stripMargin
     )
+    checkLayout(connection, HistoryTable, HistoryColumns :+ "applied_at")
+    // Each backfill is recorded once, by the migration of one schema revision.
+    execute(connection,
+      s"""CREATE TABLE IF NOT EXISTS $BackfillTable (
+         |  backfill_id TEXT PRIMARY KEY,
+         |  definition_format INTEGER NOT NULL,
+         |  definition_checksum CHAR(64) NOT NULL,
+         |  target_column TEXT NOT NULL,
+         |  revision BIGINT NOT NULL REFERENCES $HistoryTable (revision),
+         |  previous_fingerprint CHAR(64) NOT NULL,
+         |  target_fingerprint CHAR(64) NOT NULL,
+         |  result TEXT NOT NULL CHECK (result IN ('executed', 'not required on creation', 'adopted')),
+         |  updated_rows BIGINT CHECK ((result = 'executed') = (updated_rows IS NOT NULL)),
+         |  applied_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT pg_catalog.clock_timestamp()
+         |)""".stripMargin
+    )
+    checkLayout(connection, BackfillTable, BackfillColumns :+ "applied_at")
+
+  /** A history table with another column layout was created by another version and is
+    * refused, never altered.
+    */
+  private def checkLayout(connection: Connection, table: String, expected: Vector[String]): Unit =
     val columns = query(connection,
       """SELECT a.attname
         |FROM pg_catalog.pg_attribute a
         |WHERE a.attrelid = pg_catalog.to_regclass(?) AND a.attnum > 0 AND NOT a.attisdropped
         |ORDER BY a.attnum""".stripMargin
-    )(_.setString(1, HistoryTable))(_.getString("attname"))
-    val expected = HistoryColumns :+ "applied_at"
+    )(_.setString(1, table))(_.getString("attname"))
     if columns != expected then
-      throw new SQLException(s"History table $HistoryTable has the columns ${columns.mkString(", ")}; " +
+      throw new SQLException(s"History table $table has the columns ${columns.mkString(", ")}; " +
         s"expected ${expected.mkString(", ")}. It was created by another version of Hibernate DDL Manager.")
 
   override def readHistory(connection: Connection): Vector[HistoryEntry] =
@@ -113,6 +144,37 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
         statement.setString(1, name.schema.get.value)
         statement.setString(2, name.name.value)
       }(_ => ()).nonEmpty
+    }
+
+  override def readBackfills(connection: Connection): Vector[BackfillRecord] =
+    query(connection, s"SELECT ${BackfillColumns.mkString(", ")} FROM $BackfillTable ORDER BY revision, backfill_id")(_ => ()) {
+      row =>
+        val result = row.getString("result")
+        BackfillRecord(row.getString("backfill_id"), row.getInt("definition_format"), row.getString("definition_checksum"),
+          SchemaId(row.getString("target_column")), row.getLong("revision"), row.getString("previous_fingerprint"),
+          row.getString("target_fingerprint"),
+          BackfillResults.collectFirst { case (value, name) if name == result => value }.getOrElse(
+            throw new SQLException(s"Backfill history has the unknown result '$result'.")),
+          Option(row.getObject("updated_rows")).map(_ => row.getLong("updated_rows")))
+    }
+
+  override def recordBackfill(connection: Connection, record: BackfillRecord): Unit =
+    Using.resource(connection.prepareStatement(
+      s"INSERT INTO $BackfillTable (${BackfillColumns.mkString(", ")}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )) { statement =>
+      statement.setString(1, record.id)
+      statement.setInt(2, record.format)
+      statement.setString(3, record.checksum)
+      statement.setString(4, record.target.value)
+      statement.setLong(5, record.revision)
+      statement.setString(6, record.previousFingerprint)
+      statement.setString(7, record.targetFingerprint)
+      statement.setString(8, BackfillResults(record.result))
+      record.updatedRows match
+        case Some(rows) => statement.setLong(9, rows)
+        case None => statement.setNull(9, java.sql.Types.BIGINT)
+      if statement.executeUpdate() != 1 then
+        throw new SQLException("Recording the backfill did not insert exactly one history entry.")
     }
 
   override def recordHistory(connection: Connection, entry: HistoryEntry): Unit =
