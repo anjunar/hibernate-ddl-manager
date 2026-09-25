@@ -302,6 +302,23 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     assertEquals(h.history.last.statements, Vector("drop column", "drop tables", "drop sequence"))
   }
 
+  test("a dropped ID is retired: it may never come back, not even with approvals") {
+    val bio = ColumnModel(SchemaId("account-bio"), SqlIdentifier("bio"), SqlType.Text)
+    val withBio = SchemaModel(Vector(account.copy(columns = Vector(name, bio))))
+    val h = new Harness
+    h.seed(withBio)
+    assertEquals(h.migrate(initial, ExecutionOptions(approvals = Set(Approval.Drop(bio.id)))).revision, 2L)
+    h.events.clear()
+    val note = ColumnModel(SchemaId("account-note"), SqlIdentifier("note"), SqlType.Text)
+    val reused = SchemaModel(Vector(account.copy(columns = Vector(name, note, bio.copy(name = SqlIdentifier("biography"))))))
+    val error = h.refused(reused, ExecutionOptions(approvals = Set(Approval.Revert(1))))
+    assert(error.getMessage.contains("Stable ID 'account-bio' was dropped after revision 1 and is retired"), error.getMessage)
+    val reverted = h.refused(withBio, ExecutionOptions(approvals = Set(Approval.Revert(1))))
+    assert(reverted.getMessage.contains("'account-bio' was dropped after revision 1"), reverted.getMessage)
+    assert(!h.events.exists(_.startsWith("validate:")), h.events)
+    assertEquals(h.migrate(SchemaModel(Vector(account.copy(columns = Vector(name, note))))).revision, 3L)
+  }
+
   test("renaming a sequence back to an earlier name is refused like an older server") {
     val sequence = SequenceModel(SchemaId("account-sequence"), QualifiedName(SqlIdentifier("account_seq")), 1, 50)
     val renamedSequence = sequence.copy(name = QualifiedName(SqlIdentifier("accounts_seq")))

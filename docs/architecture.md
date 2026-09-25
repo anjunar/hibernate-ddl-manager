@@ -124,6 +124,9 @@ there:
   takes the checks, keys and indexes over it. An entity's collection tables and sequence
   are objects of their own and need their own approvals. The refusal lists every missing
   approval; an approval whose change is not planned has no effect.
+- A dropped ID is retired: an ID that an earlier revision had and the latest does not may
+  never appear again, not even with approvals. This rejects an ID copied from the version
+  history of the code, which would attach the dropped object's identity to a new one.
 - Before any planning the executor checks the whole chain: revisions without gaps, every
   previous fingerprint equal to the target fingerprint of the row before, every stored
   model readable and matching its fingerprint. A modified history blocks the startup.
@@ -170,9 +173,6 @@ Tables that exist only in the database are left untouched.
    `getSessionFactoryBuilder.build()`. The executor needs a DataSource without JTA
    enlistment. `hibernate.hbm2ddl.auto=validate` works as an independent cross-check after
    the migration.
-3. **Retired IDs** can be read from the stored models in the history now that drops are
-   possible. An ID copied from the Git history can then be rejected instead of being reused
-   by accident.
 
 Possible later: data migrations and backfills, multi-phase deployments (expand/contract),
 further dialects and an export to Flyway or Liquibase as an alternative mode of operation.

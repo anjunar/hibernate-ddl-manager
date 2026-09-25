@@ -56,6 +56,8 @@ final class JdbcMigrationExecutor(
                 s"$revision; a server with an older schema must not start after a newer migration. If returning to " +
                 s"it is intended, approve it with Approval.Revert(${older.entry.revision})"))
           }
+          val reused = retired(history, target)
+          if reused.nonEmpty then refuse(reused)
           val existing = if history.isEmpty then backend.existingRelations(connection, target) else Vector.empty
           if existing.nonEmpty then adopt(connection, target, targetFingerprint, existing)
           else
@@ -148,6 +150,21 @@ final class JdbcMigrationExecutor(
       val model = SchemaModelJson.decode(entry.model).fold(error => corrupt(s"stored model is unreadable ($error)"), identity)
       if SchemaFingerprint.of(model) != entry.targetFingerprint then corrupt("stored model does not match its fingerprint")
       chain :+ Applied(entry, model)
+    }
+
+  /** A table, column or sequence that an earlier revision had and the latest does not was
+    * dropped. Its ID is retired: reusing it, for example copied from the version history of the
+    * code, would attach the old identity to a new object, so no approval permits it.
+    */
+  private def retired(history: Vector[Applied], target: SchemaModel): Vector[String] =
+    def ids(model: SchemaModel): Set[SchemaId] =
+      (model.tables.flatMap(table => table.id +: table.columns.map(_.id)) ++ model.sequences.map(_.id)).toSet
+    val latest = history.lastOption.fold(Set.empty[SchemaId])(applied => ids(applied.model))
+    (ids(target) -- latest).toVector.sortBy(_.value).flatMap { id =>
+      history.findLast(applied => ids(applied.model).contains(id)).map { applied =>
+        s"Stable ID '${id.value}' was dropped after revision ${applied.entry.revision} and is retired; " +
+          "a retired ID must never be reused, generate a new one"
+      }
     }
 
   private def plan(history: Vector[Applied], previous: SchemaModel, target: SchemaModel): Vector[String] =
