@@ -637,10 +637,29 @@ class PostgreSqlExecutorSuite extends TestPostgres:
       execute(ds, "INSERT INTO public.ticket (subject) VALUES ('first'); INSERT INTO public.ticket VALUES (100, 'explicit')")
       assertEquals(scalar(ds, "SELECT string_agg(id::text, ',' ORDER BY id) FROM public.ticket"), "1,100")
       assertEquals(executor.migrate(ds, tickets).status, MigrationStatus.AlreadyApplied)
+      execute(ds, "ALTER TABLE public.ticket ALTER COLUMN id SET MAXVALUE 2 SET CYCLE")
+      val cycling = intercept[MigrationException](executor.migrate(ds, tickets)).getMessage
+      assert(cycling.contains("identity column \"public\".\"ticket\".\"id\" generates with maximum 2; " +
+        s"expected ${Long.MaxValue}"), cycling)
+      assert(cycling.contains("generates with cycling true; expected false"), cycling)
+      execute(ds, "ALTER TABLE public.ticket ALTER COLUMN id SET MAXVALUE 9223372036854775807 SET NO CYCLE SET INCREMENT BY 5")
+      assert(intercept[MigrationException](executor.migrate(ds, tickets)).getMessage
+        .contains("generates with increment 5; expected 1"))
+      execute(ds, "ALTER TABLE public.ticket ALTER COLUMN id SET INCREMENT BY 1")
+      assertEquals(executor.migrate(ds, tickets).status, MigrationStatus.AlreadyApplied)
       execute(ds, "ALTER TABLE public.ticket ALTER COLUMN id SET GENERATED ALWAYS")
       assert(intercept[MigrationException](executor.migrate(ds, tickets)).getMessage.contains("GENERATED ALWAYS identity"))
       execute(ds, "ALTER TABLE public.ticket ALTER COLUMN id DROP IDENTITY")
       assert(intercept[MigrationException](executor.migrate(ds, tickets)).getMessage.contains("identity=false; expected true"))
+    }
+    // Smaller key types get identity sequences of their own type and maximum.
+    val small = SchemaModel(Vector(TableModel(SchemaId("SMALL"), QualifiedName(SqlIdentifier("small"), Some(SqlIdentifier("public"))),
+      Vector(key.copy(id = SchemaId("SMALL_ID"), dataType = SqlType.SmallInt),
+        key.copy(id = SchemaId("SMALL_NUMBER"), name = SqlIdentifier("number"), dataType = SqlType.Integer)),
+      Vector(SchemaId("SMALL_ID")))))
+    withDatabase { ds =>
+      assertEquals(executor.migrate(ds, small).status, MigrationStatus.Applied)
+      assertEquals(executor.migrate(ds, small).status, MigrationStatus.AlreadyApplied)
     }
   }
 
