@@ -42,6 +42,10 @@ class JdbcMigrationPreviewSuite extends munit.FunSuite:
       def inspect(actual: Connection, expected: SchemaModel): Inspection = { event("inspect"); Inspection(Vector.empty, Vector.empty) }
       def dataCheck(actual: Connection, query: DataQuery, count: Boolean): Long = { event("data"); 0 }
       def estimateRows(actual: Connection, table: QualifiedName): Option[Long] = { event("estimate"); None }
+      def tableSize(actual: Connection, table: QualifiedName): Option[Long] = { event("size"); None }
+      def typeChangeBlockers(actual: Connection, table: QualifiedName, column: SqlIdentifier): Vector[String] =
+        event("dependents")
+        Vector.empty
 
   test("a preview reads inside a read-only transaction that it rolls back, and never commits") {
     val h = new Harness

@@ -36,6 +36,8 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     private var pendingBackfills = Vector.empty[BackfillRecord]
     /** Names of relations that exist in the database outside any history. */
     var existing = Set.empty[String]
+    /** Objects outside the model that depend on every column whose type changes. */
+    var dependents = Vector.empty[String]
 
     def event(name: String): Unit =
       events += name
@@ -157,6 +159,7 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
           case _: SchemaOperation.DropSequence => "drop sequence"
           case _: SchemaOperation.SetNotNull => "set not null"
           case _: SchemaOperation.DropNotNull => "drop not null"
+          case _: SchemaOperation.ChangeColumnType => "change column type"
         })
       def nullCount(table: QualifiedName, column: SqlIdentifier): String = s"count nulls ${column.value}"
       def renderFill(fill: NullFill): Either[Vector[String], BoundStatement] =
@@ -182,6 +185,9 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
         val label = expected.tables.map(_.name.name.value).mkString(",")
         onConnection(actual, if lock == TableLock.Shared then s"validate-shared:$label" else s"validate:$label")
         if driftAt.contains(label) then Vector("physical schema drift") else Vector.empty
+      def typeChangeBlockers(actual: Connection, table: QualifiedName, column: SqlIdentifier): Vector[String] =
+        onConnection(actual, s"dependents:${column.value}")
+        dependents
       def recordHistory(actual: Connection, entry: HistoryEntry): Unit =
         onConnection(actual, "record-history")
         pending = Some(entry)
@@ -735,4 +741,36 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     val h = new Harness
     h.migrate(initial, ExecutionOptions(statementTimeoutMillis = 1))
     assert(h.events.contains("timeout:1:1"))
+  }
+
+  test("objects outside the model that depend on a retyped column stop the migration after the check and before any DDL") {
+    def sized(length: Int) = SchemaModel(Vector(account.copy(columns = Vector(name.copy(dataType = SqlType.Varchar(length))))))
+    val h = new Harness
+    h.seed(sized(10))
+    h.dependents = Vector("view public.names")
+    val error = intercept[MigrationException](h.migrate(sized(20)))
+    assertEquals(error.state, FailureState.RolledBack)
+    assert(error.getMessage.contains("Column 'account-name' (account.name) cannot change its type while view public.names " +
+      "depends on it"), error.getMessage)
+    assert(error.getMessage.contains("never uses CASCADE"), error.getMessage)
+    val checked = h.events.indexOf("dependents:name")
+    assert(checked > h.events.indexOf("validate:account"), h.events)
+    assert(!h.events.exists(_.startsWith("sql:")), h.events)
+    assert(!h.events.contains("record-history"), h.events)
+    h.dependents = Vector.empty
+    assertEquals(h.migrate(sized(20)).status, MigrationStatus.Applied)
+    assert(h.events.exists(_.endsWith(":change column type")), h.events)
+  }
+
+  test("a type change keeps the failure states: a failing commit leaves the outcome unknown, a failing step rolls back") {
+    def sized(length: Int) = SchemaModel(Vector(account.copy(columns = Vector(name.copy(dataType = SqlType.Varchar(length))))))
+    val commit = new Harness
+    commit.seed(sized(10))
+    commit.failAt = Set("commit")
+    assertEquals(intercept[MigrationException](commit.migrate(sized(20))).state, FailureState.OutcomeUnknown)
+    val statement = new Harness
+    statement.seed(sized(10))
+    statement.failAt = Set("sql:1:change column type")
+    assertEquals(intercept[MigrationException](statement.migrate(sized(20))).state, FailureState.RolledBack)
+    assert(!statement.events.contains("record-history"), statement.events)
   }

@@ -56,7 +56,9 @@ object PreviewDataChecks:
       after.columns.map { column =>
         val projection = fills.get(column.id) match
           case Some(backfill) =>
-            val readable = before.columns ++ after.columns.filter(c => absent.contains(c.id))
+            // Fills run after type changes: sources keep their current names but have their target types.
+            val retyped = before.columns.map(c => after.columns.find(_.id == c.id).fold(c)(t => c.copy(dataType = t.dataType)))
+            val readable = retyped ++ after.columns.filter(c => absent.contains(c.id))
             BackfillValidation.resolve(backfill, before.name, column, readable, fills.keySet - column.id, absent) match
               case Right(fill) => Projection.Filled(current.get(column.id).map(_.name), fill.value, column.dataType)
               case Left(_) => Projection.Absent(column.dataType)
@@ -109,7 +111,8 @@ object PreviewDataChecks:
         before.columns.find(_.id == column.id).forall(_.check != column.check) || filled.contains(column.id)
       }.map { column =>
         PlannedDataCheck(PreviewCheck.CheckHolds, s"Every row of ${table.display} satisfies the check of ${column.name.value}",
-          stepOf { case PlanStep.Statement(SchemaOperation.ChangeCheck(_, _, column.id, _, _, _), _, _, _) => true; case _ => false },
+          // The step that sets the check; a type change removes it in an earlier one.
+          stepOf { case PlanStep.Statement(SchemaOperation.ChangeCheck(_, _, column.id, _, _, Some(_)), _, _, _) => true; case _ => false },
           Some(column.id.value), DataQuery.Violations(table, projected(column.id), column.dataType, column.check.get),
           s"Rows of ${table.display} would violate the check of ${column.name.value}")
       }

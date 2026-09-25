@@ -262,11 +262,58 @@ class PostgreSqlPreviewSuite extends TestPostgres:
       val report = preview.preview(ds, SchemaModel(Vector(people(first))))
       val json = PreviewRendering.json(report)
       val text = PreviewRendering.text(report)
-      assert(json.startsWith("{\"format\":1,"), json)
+      assert(json.startsWith("{\"format\":2,"), json)
       assert(json.contains("\"outcome\":\"Blocked\""), json)
       (report.findings.map(_.code) ++ report.checks.map(_.code)).foreach { code =>
         assert(json.contains(s"\"$code\"") && text.contains(code), code)
       }
       assert(text.startsWith("Result: BLOCKED"), text)
+    }
+  }
+
+  test("a type change shows its rule, kept values, rewrite and rebuilt keys; dependents and data block it as the migration would") {
+    val sid = id.copy(id = SchemaId("S_ID"))
+    val code = ColumnModel(SchemaId("S_CODE"), SqlIdentifier("code"), SqlType.Varchar(10))
+    val level = ColumnModel(SchemaId("S_LEVEL"), SqlIdentifier("level"), SqlType.Integer, check = Some(ColumnCheck.Range(0, 3)))
+    def stock(columns: ColumnModel*) = SchemaModel(Vector(TableModel(SchemaId("S"), QualifiedName(SqlIdentifier("stock"), public),
+      sid +: columns.toVector, Vector(sid.id), uniqueKeys = Vector(UniqueKeyModel(Vector(code.id))),
+      indexes = Vector(IndexModel(Vector(IndexColumn(level.id, descending = true)))))))
+    def target(range: ColumnCheck) = stock(code.copy(dataType = SqlType.Varchar(20)),
+      level.copy(dataType = SqlType.BigInt, check = Some(range)))
+    withDatabase { ds =>
+      executor.migrate(ds, stock(code, level))
+      execute(ds, "INSERT INTO public.stock VALUES (1, 'a', 1), (2, 'b', 3)")
+      execute(ds, "CREATE VIEW public.codes AS SELECT code FROM public.stock")
+      val blocked = preview.preview(ds, target(ColumnCheck.Range(0, 2)), previewOptions = PreviewOptions(includeExactCounts = true))
+      assertEquals(blocked.outcome, PreviewOutcome.Blocked)
+      assertEquals(blocked.steps.map(_.description), Vector(
+        "Change the type of column public.stock.code from Varchar(10) to Varchar(20)",
+        "Remove the check of column public.stock.level",
+        "Change the type of column public.stock.level from Integer to BigInt",
+        "Set the check of column public.stock.level"))
+      assertEquals(blocked.steps(0).typeChange, Some(PreviewTypeChange("S_CODE", "Varchar(10)", "Varchar(20)",
+        "VARCHAR grows from 10 to 20 characters", valuesPreserved = true, "possible", Vector("unique key (code)"))))
+      assertEquals(blocked.steps(2).typeChange, Some(PreviewTypeChange("S_LEVEL", "Integer", "BigInt", "INTEGER grows to BIGINT",
+        valuesPreserved = true, "expected", Vector("index (level DESC)", "check Range(0,2)"))))
+      val dependents = blocked.checks.filter(_.code == PreviewCheck.NoDependents)
+      assertEquals(dependents.map(c => (c.subject, c.step, c.status)), Vector(
+        (Some("S_CODE"), Some(1), CheckStatus.Failed), (Some("S_LEVEL"), Some(3), CheckStatus.Passed)))
+      val refused = intercept[MigrationException](executor.migrate(ds, target(ColumnCheck.Range(0, 3))))
+      assertEquals(dependents.head.details, Vector(refused.getMessage.stripPrefix("Migration failed: ")))
+      // The target check runs over the values as they are; it is set in the last step.
+      val holds = check(blocked, PreviewCheck.CheckHolds)
+      assertEquals((holds.status, holds.step, holds.rows), (CheckStatus.Failed, Some(4), RowCount.Exact(1)))
+      val size = blocked.checks.find(c => c.code == PreviewCheck.RowEstimate && c.description.contains("public.stock")).get
+      assert(!size.required && size.details.exists(_.contains("KiB")), size)
+      assert(PreviewRendering.json(blocked).contains("\"typeChange\":{\"column\":\"S_CODE\""), PreviewRendering.json(blocked))
+      assert(PreviewRendering.text(blocked).contains("INTEGER grows to BIGINT; every value is kept; rewrite of the table " +
+        "and its indexes expected"), PreviewRendering.text(blocked))
+
+      execute(ds, "DROP VIEW public.codes")
+      val ready = preview.preview(ds, target(ColumnCheck.Range(0, 3)))
+      assertEquals(ready.outcome, PreviewOutcome.Ready, PreviewRendering.text(ready))
+      assertEquals(executor.migrate(ds, target(ColumnCheck.Range(0, 3))).status, MigrationStatus.Applied)
+      assertEquals(scalar(ds, "SELECT array_to_string(statements, ' | ') FROM __hibernate_ddl.schema_history WHERE revision = 2"),
+        ready.steps.map(_.sql).mkString(" | "))
     }
   }

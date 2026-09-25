@@ -56,6 +56,7 @@ object PreviewCheck:
   val NoDuplicates = "NO_DUPLICATES"
   val ReferencesResolve = "REFERENCES_RESOLVE"
   val CheckHolds = "CHECK_HOLDS"
+  val NoDependents = "NO_DEPENDENTS"
   val RowEstimate = "ROW_ESTIMATE"
 
 /** A plan problem, tied to the step and stable ID it concerns. */
@@ -71,7 +72,22 @@ final case class PreviewStep(
     parameterTypes: Vector[String],
     risk: Option[String],
     approval: Option[String],
-    approved: Boolean
+    approved: Boolean,
+    typeChange: Option[PreviewTypeChange] = None
+)
+
+/** What a type change does, apart from its SQL. Keeping the values follows from the rule; a
+  * rewrite of the table and its indexes is `possible` or `expected` and holds the locks longer.
+  * `affected` lists the unique keys, indexes and check the database rebuilds with the column.
+  */
+final case class PreviewTypeChange(
+    column: String,
+    from: String,
+    to: String,
+    rule: String,
+    valuesPreserved: Boolean,
+    rewrite: String,
+    affected: Vector[String]
 )
 
 final case class PreviewLock(table: String, mode: String)
@@ -102,7 +118,8 @@ final case class PreviewReport(
     else PreviewOutcome.Ready
 
 object PreviewReport:
-  val Format: Int = 1
+  /** Format 2 added `typeChange` to steps. */
+  val Format: Int = 2
 
   def approval(value: Approval): String = value match
     case Approval.Drop(id) => s"drop:${id.value}"
@@ -115,7 +132,7 @@ object PreviewReport:
       step match
         case PlanStep.Statement(operation, sql, approval, approved) =>
           PreviewStep(index + 1, "ddl", describe(operation), subjects(operation), sql, Vector.empty,
-            Some(operation.risk.toString), approval.map(this.approval), approved)
+            Some(operation.risk.toString), approval.map(this.approval), approved, typeChange(plan, operation))
         case PlanStep.Fill(backfill, column, statement) =>
           PreviewStep(index + 1, "fill", s"Fill the NULLs of column '${column.value}' with backfill '${backfill.id}'",
             Vector(column.value), statement.sql, statement.parameters.map(parameterType), None, None, true)
@@ -123,6 +140,26 @@ object PreviewReport:
           PreviewStep(index + 1, "null check", s"Check that no row of $column holds NULL", Vector(columnId.value), query,
             Vector.empty, None, None, true)
     }
+
+  private def typeChange(plan: MigrationPlan, operation: SchemaOperation): Option[PreviewTypeChange] = operation match
+    case SchemaOperation.ChangeColumnType(tableId, _, columnId, _, from, to) =>
+      val (rule, rewrite) = TypeChangeRules.classify(from, to) match
+        case TypeChange.Widening(rule, rewrite) => (rule, rewrite)
+        // Unreachable: a plan with any other change is refused before it has steps.
+        case _ => ("not a supported widening", TableRewrite.Expected)
+      val affected = plan.target.tables.find(_.id == tableId).toVector.flatMap { table =>
+        def names(ids: Vector[SchemaId]) = ids.map(id => table.columns.find(_.id == id).get.name.value).mkString("(", ", ", ")")
+        table.uniqueKeys.filter(_.columns.contains(columnId)).map(key => s"unique key ${names(key.columns)}") ++
+          table.indexes.filter(_.columns.exists(_.column == columnId)).map { index =>
+            "index " + index.columns.map { column =>
+              table.columns.find(_.id == column.column).get.name.value + (if column.descending then " DESC" else "")
+            }.mkString("(", ", ", ")")
+          } ++
+          table.columns.find(_.id == columnId).flatMap(_.check).map(check => s"check $check")
+      }
+      Some(PreviewTypeChange(columnId.value, from.toString, to.toString, rule, valuesPreserved = true,
+        rewrite.toString.toLowerCase, affected))
+    case _ => None
 
   private def parameterType(value: AnyRef): String = value match
     case _: String => "text"
@@ -144,6 +181,7 @@ object PreviewReport:
     case SchemaOperation.AddColumn(_, _, column) => Vector(column.id.value)
     case SchemaOperation.RenameTable(id, _, _) => Vector(id.value)
     case SchemaOperation.RenameColumn(_, _, id, _, _) => Vector(id.value)
+    case SchemaOperation.ChangeColumnType(_, _, id, _, _, _) => Vector(id.value)
     case SchemaOperation.AddUniqueKey(id, _, _) => Vector(id.value)
     case SchemaOperation.ChangeCheck(_, _, id, _, _, _) => Vector(id.value)
     case SchemaOperation.CreateIndex(id, _, _) => Vector(id.value)
@@ -161,6 +199,8 @@ object PreviewReport:
     case SchemaOperation.AddColumn(_, table, column) => s"Add column ${column.name.value} to ${table.display}"
     case SchemaOperation.RenameTable(_, from, to) => s"Rename table ${from.display} to ${to.name.value}"
     case SchemaOperation.RenameColumn(_, table, _, from, to) => s"Rename column ${table.display}.${from.value} to ${to.value}"
+    case SchemaOperation.ChangeColumnType(_, table, _, column, from, to) =>
+      s"Change the type of column ${table.display}.${column.value} from $from to $to"
     case SchemaOperation.AddUniqueKey(_, table, columns) => s"Add unique key (${columns.map(_.value).mkString(", ")}) to ${table.display}"
     case SchemaOperation.ChangeCheck(_, table, _, column, _, to) =>
       s"${if to.isEmpty then "Remove" else "Set"} the check of column ${table.display}.${column.value}"
@@ -191,6 +231,11 @@ object PreviewRendering:
         line(s"  ${step.number}. ${step.description}$approval")
         line(s"     ${step.sql}")
         if step.parameterTypes.nonEmpty then line(s"     parameters: ${step.parameterTypes.mkString(", ")}")
+        step.typeChange.foreach { change =>
+          line(s"     ${change.rule}; ${if change.valuesPreserved then "every value is kept" else "values change"}; " +
+            s"rewrite of the table and its indexes ${change.rewrite}")
+          if change.affected.nonEmpty then line(s"     rebuilt with the column: ${change.affected.mkString(", ")}")
+        }
       }
     line()
     line(s"Allowed risks: ${report.allowedRisks.mkString(", ")}")
@@ -256,7 +301,12 @@ object PreviewRendering:
       "steps" -> report.steps.map { step =>
         obj("number" -> step.number.toString, "kind" -> string(step.kind), "description" -> string(step.description),
           "subjects" -> strings(step.subjects), "sql" -> string(step.sql), "parameterTypes" -> strings(step.parameterTypes),
-          "risk" -> optional(step.risk), "approval" -> optional(step.approval), "approved" -> step.approved.toString)
+          "risk" -> optional(step.risk), "approval" -> optional(step.approval), "approved" -> step.approved.toString,
+          "typeChange" -> step.typeChange.fold("null") { change =>
+            obj("column" -> string(change.column), "from" -> string(change.from), "to" -> string(change.to),
+              "rule" -> string(change.rule), "valuesPreserved" -> change.valuesPreserved.toString,
+              "rewrite" -> string(change.rewrite), "affected" -> strings(change.affected))
+          })
       }.mkString("[", ",", "]"),
       "allowedRisks" -> strings(report.allowedRisks),
       "approvals" -> obj("required" -> strings(report.requiredApprovals), "present" -> strings(report.presentApprovals),

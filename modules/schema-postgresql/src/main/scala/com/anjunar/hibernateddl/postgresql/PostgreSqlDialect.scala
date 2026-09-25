@@ -76,6 +76,18 @@ object PostgreSqlDialect extends SchemaDialect:
         validateName(table, "table") ++
           validateIdentifier(from, "source column") ++
           validateIdentifier(to, "target column")
+      // The renderer follows the same closed list as the planner, even for an operation built by hand.
+      case SchemaOperation.ChangeColumnType(_, table, columnId, column, from, to) =>
+        validateName(table, "table") ++
+          validateIdentifier(column, "retyped column") ++
+          validateType(from, "The previous type") ++
+          validateType(to, "The new type") ++
+          (TypeChangeRules.classify(from, to) match
+            case TypeChange.Widening(_, _) => Vector.empty
+            case TypeChange.Unchanged => Vector(s"Column '${columnId.value}' already has type $to.")
+            case TypeChange.Unsupported(_, reason) =>
+              Vector(s"Changing column '${columnId.value}' from $from to $to is not a supported widening: the change $reason.")
+          )
       case SchemaOperation.SetNotNull(_, table, _, column) =>
         validateName(table, "table") ++ validateIdentifier(column, "required column")
       case SchemaOperation.DropNotNull(_, table, _, column) =>
@@ -104,7 +116,10 @@ object PostgreSqlDialect extends SchemaDialect:
       Option.when(table.indexes.exists(_.columns.isEmpty))(s"A $label index has no columns.").toVector
 
   private def validateColumn(column: ColumnModel, label: String): Vector[String] =
-    validateIdentifier(column.name, label) ++ column.check.toVector.flatMap(validateCheck(_, label)) ++ (column.dataType match
+    validateIdentifier(column.name, label) ++ column.check.toVector.flatMap(validateCheck(_, label)) ++
+      validateType(column.dataType, label)
+
+  private def validateType(dataType: SqlType, label: String): Vector[String] = dataType match
       case SqlType.Varchar(length) if length <= 0 || length > MaxCharacterLength =>
         Vector(s"$label has VARCHAR length $length; PostgreSQL supports 1 to $MaxCharacterLength.")
       case SqlType.Char(length) if length <= 0 || length > MaxCharacterLength =>
@@ -118,7 +133,6 @@ object PostgreSqlDialect extends SchemaDialect:
       case SqlType.TimestampWithTimeZone(precision) if precision < 0 || precision > MaxTimestampPrecision =>
         Vector(s"$label has TIMESTAMP precision $precision; PostgreSQL supports 0 to $MaxTimestampPrecision.")
       case _ => Vector.empty
-    )
 
   private def validateCheck(check: ColumnCheck, label: String): Vector[String] = check match
     case ColumnCheck.AllowedValues(values) =>
@@ -183,6 +197,9 @@ object PostgreSqlDialect extends SchemaDialect:
         s"ALTER TABLE ${qualified(from)} RENAME TO ${quoted(to.name)};"
       case SchemaOperation.RenameColumn(_, table, _, from, to) =>
         s"ALTER TABLE ${qualified(table)} RENAME COLUMN ${quoted(from)} TO ${quoted(to)};"
+      // No USING clause: each supported widening is an implicit cast that keeps every value.
+      case SchemaOperation.ChangeColumnType(_, table, _, column, _, to) =>
+        s"ALTER TABLE ${qualified(table)} ALTER COLUMN ${quoted(column)} TYPE ${renderType(to)};"
       case SchemaOperation.SetNotNull(_, table, _, column) =>
         s"ALTER TABLE ${qualified(table)} ALTER COLUMN ${quoted(column)} SET NOT NULL;"
       case SchemaOperation.DropNotNull(_, table, _, column) =>

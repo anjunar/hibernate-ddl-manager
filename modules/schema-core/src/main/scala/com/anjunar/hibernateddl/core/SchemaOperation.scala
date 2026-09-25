@@ -54,6 +54,21 @@ object SchemaOperation:
   ) extends SchemaOperation:
     val risk: RiskLevel = RiskLevel.Locking
 
+  /** Changes the type of an existing column along one of the widenings of [[TypeChangeRules]],
+    * which keep every value; name, nullability, unique keys and indexes stay. A check on the
+    * column is removed before and set again after, so that the database builds it for the new
+    * type.
+    */
+  final case class ChangeColumnType(
+      tableId: SchemaId,
+      table: QualifiedName,
+      columnId: SchemaId,
+      column: SqlIdentifier,
+      from: SqlType,
+      to: SqlType
+  ) extends SchemaOperation:
+    val risk: RiskLevel = RiskLevel.Locking
+
   final case class IndexedColumn(name: SqlIdentifier, descending: Boolean)
 
   final case class CreateIndex(

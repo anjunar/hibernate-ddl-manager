@@ -1,11 +1,13 @@
 # Arbeitspaket: Kontrollierte Typänderungen
 
-Status: Konzept zur Umsetzung, noch nicht implementiert.
+Status: umgesetzt. Die API- und Typnamen unten sind die verfügbaren; die
+Entscheidungen bei der Umsetzung stehen am Ende.
 
 Dieses Arbeitspaket ergänzt die [bestehende Architektur](architecture.md), das
 [Backfill-Paket](backfills-and-not-null.md) und die
 [Migrationsvorschau mit Vorabprüfungen](migration-preview-and-preflight.md).
-Die genannten neuen Typen und Operationen sind Entwurfsvorschläge.
+Umgesetzt sind `TypeChangeRules`, die Operation `ChangeColumnType` und die Prüfung
+abhängiger Objekte `typeChangeBlockers`.
 
 ## Ziel
 
@@ -297,49 +299,49 @@ zweite Liste erlaubter Typwechsel für die Vorschau.
 
 ## Abnahmekriterien
 
-- [ ] Die drei erlaubten Übergänge werden erkannt; identische Typen erzeugen
+- [x] Die drei erlaubten Übergänge werden erkannt; identische Typen erzeugen
   keine Typänderungsoperation.
-- [ ] Nicht erlaubte Richtungen, Scale-Änderungen und alle anderen Typfamilien
+- [x] Nicht erlaubte Richtungen, Scale-Änderungen und alle anderen Typfamilien
   werden mit Ausgangstyp, Zieltyp und konkretem Grund abgelehnt.
-- [ ] Die PostgreSQL-Grenzen für VARCHAR und NUMERIC werden eingehalten, auch
+- [x] Die PostgreSQL-Grenzen für VARCHAR und NUMERIC werden eingehalten, auch
   bei direkt konstruierten `ChangeColumnType`-Operationen.
-- [ ] Änderungen im Hibernate-Mapping erzeugen mit unveränderter Schema-ID den
+- [x] Änderungen im Hibernate-Mapping erzeugen mit unveränderter Schema-ID den
   erwarteten Zieltyp und einen Typwechsel, ohne Drop und Neuanlage der Spalte.
-- [ ] VARCHAR-Werte einschließlich Mehrbyte-Zeichen, Leerstrings und NULL bleiben
+- [x] VARCHAR-Werte einschließlich Mehrbyte-Zeichen, Leerstrings und NULL bleiben
   erhalten; anschließend können längere Werte bis zur neuen Grenze gespeichert werden.
-- [ ] INTEGER-Grenzwerte, negative Werte, `0`, positive Werte und NULL bleiben
+- [x] INTEGER-Grenzwerte, negative Werte, `0`, positive Werte und NULL bleiben
   erhalten; anschließend lassen sich Werte außerhalb des INTEGER-Bereichs speichern.
-- [ ] NUMERIC-Werte werden ohne Rundung oder Scale-Änderung übernommen; anschließend
+- [x] NUMERIC-Werte werden ohne Rundung oder Scale-Änderung übernommen; anschließend
   lassen sich größere Beträge mit derselben Zahl an Nachkommastellen speichern.
-- [ ] Die tatsächliche Nullbarkeit bleibt bei einem reinen Typwechsel unverändert.
-- [ ] Betroffene Primärschlüssel-, FK- und Identity-Spalten werden vor Änderungen
+- [x] Die tatsächliche Nullbarkeit bleibt bei einem reinen Typwechsel unverändert.
+- [x] Betroffene Primärschlüssel-, FK- und Identity-Spalten werden vor Änderungen
   an Anwendungstabellen abgelehnt; unbeteiligte Schlüssel derselben Tabelle
   verhindern einen erlaubten Typwechsel nicht.
-- [ ] Unterstützte Unique-Constraints, einfache und zusammengesetzte B-Tree-Indizes
+- [x] Unterstützte Unique-Constraints, einfache und zusammengesetzte B-Tree-Indizes
   bleiben korrekt und verwendbar. Indizes mit absteigender Sortierung werden berücksichtigt.
-- [ ] Modellierte CHECKs bleiben nach einem Typwechsel semantisch korrekt und
+- [x] Modellierte CHECKs bleiben nach einem Typwechsel semantisch korrekt und
   bestehen die genaue Backend-Prüfung. Gleichzeitige CHECK-Änderungen werden
   weder ausgelassen noch doppelt angelegt.
-- [ ] Kombinierte Tabellen- und Spaltenrenames verwenden in allen nachfolgenden
+- [x] Kombinierte Tabellen- und Spaltenrenames verwenden in allen nachfolgenden
   Anweisungen die richtigen Namen; gequotete Bezeichner funktionieren.
-- [ ] Bekannte nicht unterstützte Abhängigkeiten, etwa betroffene Views, werden
+- [x] Bekannte nicht unterstützte Abhängigkeiten, etwa betroffene Views, werden
   verständlich gemeldet. Es gibt kein automatisches `CASCADE`.
-- [ ] Ein Fehler nach einer Typänderung stellt bei bestätigtem Rollback den alten
+- [x] Ein Fehler nach einer Typänderung stellt bei bestätigtem Rollback den alten
   Typ, Daten, Constraints und bisherigen Historienstand wieder her.
-- [ ] Wiederholte und parallele Serverstarts führen die Änderung nur einmal
+- [x] Wiederholte und parallele Serverstarts führen die Änderung nur einmal
   erfolgreich aus; unbekannte Commit-Ausgänge und Verbindungsfehler behalten die
   korrekten Fehlerzustände.
-- [ ] Alte gespeicherte Modelle und Fingerprints bleiben kompatibel; nur das
+- [x] Alte gespeicherte Modelle und Fingerprints bleiben kompatibel; nur das
   tatsächlich geänderte Zielmodell erhält einen neuen Fingerprint.
-- [ ] Direkte erlaubte Versionssprünge funktionieren. Revert- oder Drop-Freigaben
+- [x] Direkte erlaubte Versionssprünge funktionieren. Revert- oder Drop-Freigaben
   ermöglichen keine nicht unterstützte Verkleinerung.
-- [ ] Nach Umsetzung des Backfill-Pakets funktioniert Vergrößern → Befüllen →
+- [x] Nach Umsetzung des Backfill-Pakets funktioniert Vergrößern → Befüllen →
   Pflichtfeld einschließlich Constraints in einer Transaktion; Fehler rollen
   alle beteiligten Änderungen gemeinsam zurück.
-- [ ] Nach Umsetzung der Vorschau erscheinen dieselben Entscheidungen und
+- [x] Nach Umsetzung der Vorschau erscheinen dieselben Entscheidungen und
   Schritte wie im Executor. Werterhaltung, Sperren, mögliche Umbauten und
   unvollständige Prüfungen werden getrennt dargestellt.
-- [ ] Vorhandene Tests bleiben gültig, neue PostgreSQL-Integrationstests prüfen
+- [x] Vorhandene Tests bleiben gültig, neue PostgreSQL-Integrationstests prüfen
   echte Daten und Constraints, und der vollständige Projektcheck `sbt check` besteht.
 
 ## Folgearbeiten und Betriebsgrenzen
@@ -358,3 +360,39 @@ Ein größerer Datenbanktyp garantiert außerdem nicht die Kompatibilität alter
 Anwendungsversionen. Sobald Werte außerhalb des bisherigen Bereichs geschrieben
 werden, können alte Anwendungen sie möglicherweise nicht mehr verarbeiten.
 Koordinierte parallele Serverversionen sind deshalb kein Versprechen dieses Pakets.
+
+## Entscheidungen bei der Umsetzung
+
+- `TypeChangeRules.classify` liefert `Unchanged`, `Widening(rule, rewrite)` oder
+  `Unsupported(rejection, reason)` mit den Ablehnungsgründen `Narrowing`, `ScaleChange`
+  und `OtherTypes`. Planer und Renderer verwenden dieselbe Funktion; eine Freigabe
+  (`Drop`, `Revert`, `RenameBack`) ändert daran nichts. Auch naheliegende Casts wie
+  `SMALLINT` → `INTEGER` oder `VARCHAR` → `TEXT` bleiben bewusst außerhalb der Liste.
+- Der Aufwand steht getrennt von der Werterhaltung: `INTEGER` → `BIGINT` ist
+  `TableRewrite.Expected`, die beiden anderen Übergänge `TableRewrite.Possible`, weil
+  PostgreSQL das Neuschreiben überspringen kann, es aber nicht zusagt.
+- Primärschlüssel-, Fremdschlüssel- und Identity-Spalten werden anhand beider Modelle
+  abgelehnt; betrachtet werden beide Seiten jedes Fremdschlüssels in allen Tabellen.
+- Reihenfolge je Spalte: Umbenennung, dann CHECK entfernen, Typ ändern, Ziel-CHECK
+  setzen. Der Ziel-CHECK entsteht damit genau einmal und **vor** einem Backfill, nicht
+  erst danach wie in Schritt 7 oben. Das Ergebnis ist dasselbe, weil ein CHECK NULL
+  zulässt und der Backfill ohnehin nur gültige Werte schreiben darf; es entspricht der
+  bestehenden Behandlung von CHECK-Änderungen, Unique-Keys und Indizes, die ebenfalls
+  vor den Backfills stehen. Backfills laufen weiterhin nach allen Typänderungen.
+- Abhängige Objekte werden unter der Migrationssperre nach der Prüfung des
+  Ausgangszustands und vor der ersten DDL über `pg_depend` gesucht: Views, materialisierte
+  Views, Rules, Trigger, Policies und SQL-Funktionsrümpfe (`BEGIN ATOMIC`). Die
+  Beschreibungen werden aus den Katalogen gebaut, weil `pg_describe_object` der
+  Sprache des Servers folgt. Andere Abhängigkeiten, etwa Publikationen, lässt PostgreSQL
+  bei Bedarf selbst scheitern; die Transaktion wird dann vollständig zurückgerollt.
+- Die Vorschau zeigt je Typänderung `PreviewTypeChange` mit Regel, Werterhaltung,
+  Umbauerwartung und den mit der Spalte neu aufgebauten Unique-Keys, Indizes und dem
+  CHECK. `NO_DEPENDENTS` ist eine erforderliche Prüfung, die Tabellengröße eine optionale
+  `ROW_ESTIMATE`-Prüfung (Größe gemessen, Zeilen geschätzt). Das JSON-Format des
+  Berichts ist dafür auf 2 gestiegen.
+- Ein unverändert bleibender CHECK auf einer verbreiterten Spalte braucht keine
+  Datenprüfung, weil alle Werte erhalten bleiben; ein geänderter CHECK wird wie bisher
+  geprüft und verweist auf den Schritt, der ihn setzt.
+- Die Vorschau löst Backfill-Quellen jetzt mit ihren Zieltypen auf, wie der Planer:
+  Backfills laufen nach den Typänderungen, die Quellen werden aber unter ihren
+  aktuellen Namen gelesen.

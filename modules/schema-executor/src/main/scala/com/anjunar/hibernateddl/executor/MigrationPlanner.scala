@@ -348,6 +348,22 @@ object MigrationPlanner:
       }
     }
 
+  /** Each type change of a plan with the table and column names the database has before the
+    * migration, where objects that depend on the column are looked up.
+    */
+  def typeChanges(plan: MigrationPlan): Vector[(SchemaOperation.ChangeColumnType, QualifiedName, SqlIdentifier)] =
+    plan.operations.collect { case change: SchemaOperation.ChangeColumnType => change }.flatMap { change =>
+      plan.previous.tables.find(_.id == change.tableId).flatMap { table =>
+        table.columns.find(_.id == change.columnId).map(column => (change, table.name, column.name))
+      }
+    }
+
+  /** Why objects outside the model keep a column from changing its type. */
+  def blockedTypeChange(column: SchemaId, table: QualifiedName, name: SqlIdentifier, blockers: Vector[String]): String =
+    s"Column '${column.value}' (${table.display}.${name.value}) cannot change its type while ${blockers.mkString(", ")} " +
+      s"${if blockers.size == 1 then "depends" else "depend"} on it; change or drop the dependent object first, " +
+      "the migration never uses CASCADE"
+
   /** Required columns of the target that were missing or nullable before. */
   def newlyRequired(previous: SchemaModel, target: SchemaModel): Set[SchemaId] =
     val before = previous.tables.flatMap(_.columns).map(column => column.id -> column.nullable).toMap

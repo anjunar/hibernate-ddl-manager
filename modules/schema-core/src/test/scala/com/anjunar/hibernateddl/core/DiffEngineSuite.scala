@@ -319,3 +319,108 @@ class DiffEngineSuite extends munit.FunSuite:
     assertEquals(SchemaOperation.RenameColumn(customer.id, customer.name, customer.columns.head.id,
       SqlIdentifier("name"), SqlIdentifier("renamed")).risk, RiskLevel.Locking)
   }
+
+  private val retypedTable = table("retyped", "retyped",
+    column("r-name", "name"),
+    column("r-count", "visits").copy(dataType = SqlType.Integer),
+    column("r-balance", "balance").copy(dataType = SqlType.Numeric(10, 2), nullable = false))
+
+  private def retype(changes: (String, SqlType)*): TableModel =
+    retypedTable.copy(columns = retypedTable.columns.map { column =>
+      changes.collectFirst { case (id, dataType) if id == column.id.value => column.copy(dataType = dataType) }.getOrElse(column)
+    })
+
+  test("the three widenings change the column type in place, without dropping or adding a column") {
+    val before = SchemaModel(Vector(retypedTable))
+    val after = SchemaModel(Vector(retype("r-name" -> SqlType.Varchar(255), "r-count" -> SqlType.BigInt,
+      "r-balance" -> SqlType.Numeric(14, 2))))
+    def change(id: String, name: String, from: SqlType, to: SqlType) =
+      SchemaOperation.ChangeColumnType(retypedTable.id, retypedTable.name, SchemaId(id), SqlIdentifier(name), from, to)
+    assertEquals(DiffEngine.diff(before, after), Right(Vector(
+      change("r-balance", "balance", SqlType.Numeric(10, 2), SqlType.Numeric(14, 2)),
+      change("r-count", "visits", SqlType.Integer, SqlType.BigInt),
+      change("r-name", "name", SqlType.Varchar(100), SqlType.Varchar(255))
+    )))
+    assertEquals(DiffEngine.diff(before, before), Right(Vector.empty))
+    assertEquals(change("r-name", "name", SqlType.Varchar(100), SqlType.Varchar(255)).risk, RiskLevel.Locking)
+  }
+
+  test("a version jump is judged directly between the stored and the current type") {
+    val before = SchemaModel(Vector(retypedTable))
+    assertEquals(DiffEngine.diff(before, SchemaModel(Vector(retype("r-name" -> SqlType.Varchar(500))))).map(_.size), Right(1))
+  }
+
+  test("refused type changes name both types and the concrete reason") {
+    val before = SchemaModel(Vector(retypedTable))
+    Vector(
+      Vector("r-name" -> SqlType.Varchar(50)) -> "from Varchar(100) to Varchar(50) is unsupported: the change shortens VARCHAR",
+      Vector("r-count" -> SqlType.SmallInt) -> "from Integer to SmallInt is unsupported: the change is not a supported widening",
+      Vector("r-balance" -> SqlType.Numeric(14, 4)) -> "the change changes the NUMERIC scale from 2 to 4",
+      Vector("r-name" -> SqlType.Uuid) -> "from Varchar(100) to Uuid is unsupported"
+    ).foreach { (changes, reason) =>
+      val diagnostics = errors(DiffEngine.diff(before, SchemaModel(Vector(retype(changes*)))))
+      assert(diagnostics.exists(message => message.startsWith("Changing type of column") && message.contains(reason)), diagnostics)
+    }
+    val narrowed = SchemaModel(Vector(retype("r-count" -> SqlType.BigInt)))
+    assert(errors(DiffEngine.diff(narrowed, before)).exists(_.contains("narrows BIGINT to INTEGER")))
+  }
+
+  test("columns of primary keys, foreign keys on either side and identities keep their type; other columns may change") {
+    val id = column("p-id", "id").copy(dataType = SqlType.Integer, nullable = false)
+    val code = column("p-code", "code")
+    val parent = table("parent", "parent", id, code).copy(primaryKey = Vector(id.id))
+    val parentId = column("c-parent", "parent_id").copy(dataType = SqlType.Integer)
+    val counter = column("c-counter", "counter").copy(dataType = SqlType.Integer, nullable = false, identity = true)
+    val child = table("child", "child", parentId, counter)
+      .copy(foreignKeys = Vector(ForeignKeyModel(Vector(parentId.id), parent.id, Vector(id.id))))
+    val before = SchemaModel(Vector(parent, child))
+    def widened(dataType: SqlType, columnIds: SchemaId*) = SchemaModel(Vector(parent, child).map { t =>
+      t.copy(columns = t.columns.map(c => if columnIds.contains(c.id) then c.copy(dataType = dataType) else c))
+    })
+    // Both sides of a foreign key must keep equal types, so the key and its reference widen together.
+    val keyErrors = errors(DiffEngine.diff(before, widened(SqlType.BigInt, id.id, parentId.id)))
+    assert(keyErrors.exists(e => e.contains("'p-id'") && e.contains("belongs to a primary key and the column belongs to a " +
+      "foreign key or is referenced by one")), keyErrors)
+    assert(keyErrors.exists(e => e.contains("'c-parent'") && e.contains("belongs to a foreign key")), keyErrors)
+    assert(errors(DiffEngine.diff(before, widened(SqlType.BigInt, counter.id))).exists(_.contains("identity column")))
+    // A key in only one of the models counts as well: here the foreign key is new in the target.
+    val unreferenced = SchemaModel(Vector(parent.copy(primaryKey = Vector.empty), child.copy(foreignKeys = Vector.empty)))
+    val newKey = errors(DiffEngine.diff(unreferenced, widened(SqlType.BigInt, id.id, parentId.id)))
+    assert(newKey.exists(e => e.contains("'c-parent'") && e.contains("belongs to a foreign key")), newKey)
+    assertEquals(DiffEngine.diff(before, widened(SqlType.Varchar(200), code.id)), Right(Vector(
+      SchemaOperation.ChangeColumnType(parent.id, parent.name, code.id, code.name, SqlType.Varchar(100), SqlType.Varchar(200)))))
+  }
+
+  test("a type change removes the column's check first and sets the target check once afterwards") {
+    val level = column("r-count", "visits").copy(dataType = SqlType.Integer, check = Some(ColumnCheck.Range(0, 3)))
+    val before = SchemaModel(Vector(retypedTable.copy(columns = Vector(level))))
+    def after(check: Option[ColumnCheck]) = SchemaModel(Vector(retypedTable.copy(columns = Vector(
+      level.copy(dataType = SqlType.BigInt, check = check)))))
+    def checkChange(from: Option[ColumnCheck], to: Option[ColumnCheck]) =
+      SchemaOperation.ChangeCheck(retypedTable.id, retypedTable.name, level.id, level.name, from, to)
+    val retype = SchemaOperation.ChangeColumnType(retypedTable.id, retypedTable.name, level.id, level.name,
+      SqlType.Integer, SqlType.BigInt)
+    val same = level.check
+    val wider = Some(ColumnCheck.Range(0, 5000000000L))
+    assertEquals(DiffEngine.diff(before, after(same)), Right(Vector(checkChange(same, None), retype, checkChange(None, same))))
+    assertEquals(DiffEngine.diff(before, after(wider)), Right(Vector(checkChange(same, None), retype, checkChange(None, wider))))
+    assertEquals(DiffEngine.diff(before, after(None)), Right(Vector(checkChange(same, None), retype)))
+    val unchecked = SchemaModel(Vector(retypedTable.copy(columns = Vector(level.copy(check = None)))))
+    assertEquals(DiffEngine.diff(unchecked, after(wider)), Right(Vector(retype, checkChange(None, wider))))
+  }
+
+  test("renames come first, so the type change uses the new table and column names") {
+    val before = SchemaModel(Vector(retypedTable))
+    val renamed = retype("r-name" -> SqlType.Varchar(255))
+    val newName = QualifiedName(SqlIdentifier("Renamed \"Table\""))
+    val after = SchemaModel(Vector(renamed.copy(name = newName, columns = renamed.columns.map { c =>
+      if c.id.value == "r-name" then c.copy(name = SqlIdentifier("Display \"Name\"")) else c
+    })))
+    assertEquals(DiffEngine.diff(before, after), Right(Vector(
+      SchemaOperation.RenameTable(retypedTable.id, retypedTable.name, newName),
+      SchemaOperation.RenameColumn(retypedTable.id, newName, SchemaId("r-name"), SqlIdentifier("name"),
+        SqlIdentifier("Display \"Name\"")),
+      SchemaOperation.ChangeColumnType(retypedTable.id, newName, SchemaId("r-name"), SqlIdentifier("Display \"Name\""),
+        SqlType.Varchar(100), SqlType.Varchar(255))
+    )))
+  }

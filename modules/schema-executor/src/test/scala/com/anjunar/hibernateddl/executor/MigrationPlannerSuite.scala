@@ -81,3 +81,45 @@ class MigrationPlannerSuite extends munit.FunSuite:
     }, Vector("fill name-v1", "check account-name", "SetNotNull"))
     assertEquals(result.pending, Vector.empty)
   }
+
+  test("no approval turns a narrowing into a supported type change, not even returning to an earlier revision") {
+    def named(dataType: SqlType) = SchemaModel(Vector(account.copy(columns = Vector(name.copy(dataType = dataType), bio))))
+    val narrow = named(SqlType.Varchar(100))
+    val all = Set[Approval](Approval.Revert(1), Approval.Drop(name.id), Approval.RenameBack(name.id))
+    val result = plan(narrow, history(narrow, named(SqlType.Varchar(255))), ExecutionOptions(approvals = all))
+    assert(!result.executable)
+    assertEquals(result.steps, Vector.empty)
+    assert(result.problems.exists(p => p.code == PlanProblem.UnsupportedChange && p.message.contains("shortens VARCHAR")),
+      result.problems)
+  }
+
+  test("a type change runs after the renames, and its column is found under the names it has before the migration") {
+    val wide = name.copy(name = SqlIdentifier("display_name"), dataType = SqlType.Varchar(255))
+    val before = SchemaModel(Vector(account.copy(columns = Vector(name.copy(dataType = SqlType.Varchar(100)), bio))))
+    val renamed = account.copy(name = QualifiedName(SqlIdentifier("accounts")), columns = Vector(wide, bio))
+    val result = plan(SchemaModel(Vector(renamed)), history(before))
+    assert(result.executable)
+    assertEquals(result.operations.map(_.getClass.getSimpleName), Vector("RenameTable", "RenameColumn", "ChangeColumnType"))
+    assertEquals(MigrationPlanner.typeChanges(result).map((change, table, column) => (change.columnId, table, column)),
+      Vector((name.id, account.name, name.name)))
+  }
+
+  test("planner and preview resolve a backfill from a retyped source with the source's target type") {
+    val source = ColumnModel(SchemaId("account-visits"), SqlIdentifier("visits"), SqlType.Integer)
+    val copy = ColumnModel(SchemaId("account-total"), SqlIdentifier("total"), SqlType.Integer)
+    val before = SchemaModel(Vector(account.copy(columns = Vector(name, source, copy))))
+    val after = SchemaModel(Vector(account.copy(columns = Vector(name, source.copy(dataType = SqlType.BigInt),
+      copy.copy(dataType = SqlType.BigInt, nullable = false)))))
+    val backfill = Backfill.fillNulls("total-v1", copy.id, BackfillTrigger.BecomesRequired, BackfillValue.column(source.id))
+    val result = plan(after, history(before), backfills = Vector(backfill))
+    assert(result.executable, result.problems)
+    val fill = result.steps.indexWhere(_.isInstanceOf[PlanStep.Fill])
+    assert(fill > result.steps.lastIndexWhere {
+      case PlanStep.Statement(_: SchemaOperation.ChangeColumnType, _, _, _) => true
+      case _ => false
+    }, result.steps)
+    // Before, the preview read the source as INTEGER, which cannot fill BIGINT, and projected NULL.
+    val nulls = PreviewDataChecks.planned(result).find(_.code == PreviewCheck.NoNulls).get
+    assertEquals(nulls.query, DataQuery.Nulls(account.name,
+      Projection.Filled(Some(copy.name), FillValue.Column(source.name), SqlType.BigInt)))
+  }

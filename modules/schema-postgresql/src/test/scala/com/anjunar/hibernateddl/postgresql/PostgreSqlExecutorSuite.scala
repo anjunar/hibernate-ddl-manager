@@ -824,17 +824,17 @@ class PostgreSqlExecutorSuite extends TestPostgres:
   }
 
   test("an operator migrates a refused change by hand and the executor verifies and records it") {
-    val widened = SchemaModel(Vector(users.copy(columns = Vector(login.copy(dataType = SqlType.Varchar(200))))))
+    val shortened = SchemaModel(Vector(users.copy(columns = Vector(login.copy(dataType = SqlType.Varchar(50))))))
     val manual = new JdbcMigrationExecutor(PostgreSqlMigrationBackend,
-      ExecutionOptions(acceptManualMigration = Some(SchemaFingerprint.of(widened))))
+      ExecutionOptions(acceptManualMigration = Some(SchemaFingerprint.of(shortened))))
     withDatabase { ds =>
       fixture(ds)
-      val refused = intercept[MigrationException](executor.migrate(ds, widened))
+      val refused = intercept[MigrationException](executor.migrate(ds, shortened))
       assert(refused.getMessage.contains("Changing type of column 'USER_LOGIN'"), refused.getMessage)
-      assert(intercept[MigrationException](manual.migrate(ds, widened)).getMessage.contains("does not match database"))
-      execute(ds, "ALTER TABLE public.users ALTER COLUMN username TYPE varchar(200)")
-      assertEquals(manual.migrate(ds, widened), MigrationResult(2, MigrationStatus.ManuallyMigrated, 0))
-      assertEquals(executor.migrate(ds, widened), MigrationResult(2, MigrationStatus.AlreadyApplied, 0))
+      assert(intercept[MigrationException](manual.migrate(ds, shortened)).getMessage.contains("does not match database"))
+      execute(ds, "ALTER TABLE public.users ALTER COLUMN username TYPE varchar(50)")
+      assertEquals(manual.migrate(ds, shortened), MigrationResult(2, MigrationStatus.ManuallyMigrated, 0))
+      assertEquals(executor.migrate(ds, shortened), MigrationResult(2, MigrationStatus.AlreadyApplied, 0))
       assertEquals(scalar(ds, "SELECT cardinality(statements) FROM __hibernate_ddl.schema_history WHERE revision = 2"), "0")
       assertEquals(scalar(ds, "SELECT username FROM public.users"), "patrick")
     }

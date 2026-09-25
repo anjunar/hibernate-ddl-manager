@@ -325,3 +325,25 @@ class HibernateSchemaSourceSuite extends munit.FunSuite:
   test("fresh IDs have the required format") {
     assert(Vector.fill(20)(HibernateSchemaSource.newId()).forall(_.matches("[0-9a-f]{8}")))
   }
+
+  test("a wider mapping keeps every schema ID, so the diff changes column types in place instead of dropping columns") {
+    val before = read(classOf[MembershipBefore]).fold(e => fail(e.mkString("\n")), identity)
+    val after = read(classOf[MembershipAfter]).fold(e => fail(e.mkString("\n")), identity)
+    val operations = DiffEngine.diff(before, after).fold(e => fail(e.mkString("\n")), identity)
+    def id(property: String) = SchemaId(s"a7b8c9d0/$property")
+    assertEquals(operations.collect { case change: SchemaOperation.ChangeColumnType => (change.columnId, change.from, change.to) },
+      Vector(
+        (id("1b2c3d4e"), SqlType.Varchar(100), SqlType.Varchar(255)),
+        (id("2c3d4e5f"), SqlType.Integer, SqlType.BigInt),
+        (id("3d4e5f60"), SqlType.Numeric(10, 2), SqlType.Numeric(14, 2)),
+        (id("4e5f6071"), SqlType.Varchar(20), SqlType.Varchar(40)),
+        (id("5f607182"), SqlType.Varchar(10), SqlType.Varchar(20)),
+        (id("60718293"), SqlType.Integer, SqlType.BigInt)
+      ))
+    // Only the enum check is rebuilt around its type change; nothing is dropped, added or renamed.
+    assertEquals(operations.map(_.getClass.getSimpleName).distinct.sorted, Vector("ChangeCheck", "ChangeColumnType"))
+    val narrowed = read(classOf[MembershipNarrowed]).fold(e => fail(e.mkString("\n")), identity)
+    val refused = DiffEngine.diff(before, narrowed).swap.getOrElse(fail("Expected refused changes"))
+    assert(refused.exists(_.contains("shortens VARCHAR from 100 to 50")), refused)
+    assert(refused.exists(_.contains("changes the NUMERIC scale from 2 to 4")), refused)
+  }

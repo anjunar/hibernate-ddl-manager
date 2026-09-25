@@ -1,8 +1,11 @@
 package com.anjunar.hibernateddl.core
 
 /** Plans creation, added columns, new unique keys, indexes and foreign keys, changed column
-  * checks, nullability changes, explicit-ID renames and drops of columns, tables and
-  * sequences; all other changes fail closed. A new required column in an existing table is
+  * checks, nullability changes, the widenings of [[TypeChangeRules]] on columns outside keys
+  * and identities, explicit-ID renames and drops of columns, tables and sequences; all other
+  * changes fail closed. A column's steps follow its rename, so they use its new name; a type
+  * change removes the column's check first and sets the target check after it, and backfills
+  * run after every type change. A new required column in an existing table is
   * added nullable and made required later. Foreign keys are added after every table exists,
   * then columns become required, and drops come last, so that nothing planned before them
   * still needs what they delete. Whether a drop may run, and how NULLs of a column that
@@ -35,6 +38,9 @@ object DiffEngine:
     val newTables = desired.tables.map(t => t.id -> t).toMap
     val oldLocations = locations(previous)
     val newLocations = locations(desired)
+    // Columns on either side of a foreign key in either model; their types stay.
+    val referencing = (previous.tables ++ desired.tables)
+      .flatMap(_.foreignKeys.flatMap(key => key.columns ++ key.referencedColumns)).toSet
 
     (oldLocations.keySet intersect newLocations.keySet).foreach { id =>
       if oldLocations(id) != newLocations(id) then
@@ -67,8 +73,6 @@ object DiffEngine:
       (oldColumns.keySet intersect newColumns.keySet).toVector.sortBy(_.value).foreach { columnId =>
         val oldColumn = oldColumns(columnId)
         val newColumn = newColumns(columnId)
-        if oldColumn.dataType != newColumn.dataType then
-          errors += s"Changing type of column '${columnId.value}' is unsupported; manual migration required"
         if oldColumn.identity != newColumn.identity then
           errors += s"Changing identity generation of column '${columnId.value}' is unsupported; manual migration required"
         if oldColumn.name != newColumn.name then
@@ -83,8 +87,28 @@ object DiffEngine:
           required += SchemaOperation.SetNotNull(id, newTable.name, columnId, newColumn.name)
         else if !oldColumn.nullable && newColumn.nullable then
           operations += SchemaOperation.DropNotNull(id, newTable.name, columnId, newColumn.name)
-        if oldColumn.check != newColumn.check && oldColumn.dataType == newColumn.dataType then
-          operations += SchemaOperation.ChangeCheck(id, newTable.name, columnId, newColumn.name, oldColumn.check, newColumn.check)
+        def changeCheck(from: Option[ColumnCheck], to: Option[ColumnCheck]) =
+          if from != to then operations += SchemaOperation.ChangeCheck(id, newTable.name, columnId, newColumn.name, from, to)
+        def refuseType(reason: String) = errors += s"Changing type of column '${columnId.value}' from ${oldColumn.dataType} " +
+          s"to ${newColumn.dataType} is unsupported: $reason; manual migration required"
+        TypeChangeRules.classify(oldColumn.dataType, newColumn.dataType) match
+          case TypeChange.Unchanged => changeCheck(oldColumn.check, newColumn.check)
+          case TypeChange.Unsupported(_, reason) => refuseType(s"the change $reason")
+          case TypeChange.Widening(_, _) =>
+            val keys = Vector(
+              Option.when(oldTable.primaryKey.contains(columnId) || newTable.primaryKey.contains(columnId))(
+                "the column belongs to a primary key"),
+              Option.when(referencing.contains(columnId))("the column belongs to a foreign key or is referenced by one"),
+              Option.when(oldColumn.identity || newColumn.identity)(
+                "the column is an identity column, whose sequence depends on its type")
+            ).flatten
+            if keys.nonEmpty then refuseType(keys.mkString(" and "))
+            else
+              // The target check, if any, is built for the new type exactly once.
+              changeCheck(oldColumn.check, None)
+              operations += SchemaOperation.ChangeColumnType(id, newTable.name, columnId, newColumn.name,
+                oldColumn.dataType, newColumn.dataType)
+              changeCheck(None, newColumn.check)
       }
       (newColumns.keySet -- oldColumns.keySet).toVector.sortBy(_.value).foreach { columnId =>
         val column = newColumns(columnId)

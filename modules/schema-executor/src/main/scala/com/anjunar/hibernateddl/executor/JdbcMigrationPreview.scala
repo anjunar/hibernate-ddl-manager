@@ -192,6 +192,36 @@ final class JdbcMigrationPreview(
               if taken.isEmpty then CheckStatus.Passed else CheckStatus.Failed, true,
               details = taken.map(name => s"${name.display} is taken"))
           }
+        typeChangeChecks(connection, plan, checks)
+
+  /** Objects outside the model that keep a column from changing its type block the migration;
+    * the size of each retyped table tells how much a rewrite may have to copy.
+    */
+  private def typeChangeChecks(connection: Connection, plan: MigrationPlan, checks: Checks): Unit =
+    val changes = MigrationPlanner.typeChanges(plan)
+    changes.foreach { (change, table, column) =>
+      val step = plan.steps.indexWhere {
+        case PlanStep.Statement(operation, _, _, _) => operation == change
+        case _ => false
+      } + 1
+      val description = s"No object outside the model keeps ${table.display}.${column.value} from changing its type"
+      checks.run(PreviewCheck.NoDependents, description, required = true, Some(step), Some(change.columnId.value)) {
+        val blockers = backend.typeChangeBlockers(connection, table, column)
+        PreviewCheck(PreviewCheck.NoDependents, description, if blockers.isEmpty then CheckStatus.Passed else CheckStatus.Failed,
+          true, Some(step), Some(change.columnId.value),
+          Option.when(blockers.nonEmpty)(MigrationPlanner.blockedTypeChange(change.columnId, table, column, blockers)).toVector)
+      }
+    }
+    changes.map(_._2).distinct.foreach { table =>
+      val description = s"Size of ${table.display}, whose column types change"
+      checks.run(PreviewCheck.RowEstimate, description, required = false) {
+        val size = backend.tableSize(connection, table)
+        PreviewCheck(PreviewCheck.RowEstimate, description, CheckStatus.Passed, false,
+          details = size.map(bytes => s"About ${bytes / 1024} KiB with indexes and out-of-line storage (measured now); " +
+            "no duration is predicted").toVector,
+          rows = backend.estimateRows(connection, table).fold(RowCount.Unknown)(RowCount.Estimate(_)))
+      }
+    }
 
   /** Data checks come with the plan's steps; see [[PreviewDataChecks]]. Each table a backfill
     * fills also gets an optional, estimated row count.
