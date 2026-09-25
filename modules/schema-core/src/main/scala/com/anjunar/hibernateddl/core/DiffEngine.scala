@@ -24,6 +24,7 @@ object DiffEngine:
     val errors = Vector.newBuilder[String]
     val operations = Vector.newBuilder[SchemaOperation]
     val addedKeys = Vector.newBuilder[(TableModel, ForeignKeyModel)]
+    planSequences(previous, desired, errors, operations)
     val oldTables = previous.tables.map(t => t.id -> t).toMap
     val newTables = desired.tables.map(t => t.id -> t).toMap
     val oldLocations = locations(previous)
@@ -63,6 +64,8 @@ object DiffEngine:
           errors += s"Changing type of column '${columnId.value}' is unsupported; manual migration required"
         if oldColumn.nullable != newColumn.nullable then
           errors += s"Changing nullability of column '${columnId.value}' is unsupported; manual migration required"
+        if oldColumn.identity != newColumn.identity then
+          errors += s"Changing identity generation of column '${columnId.value}' is unsupported; manual migration required"
         if oldColumn.name != newColumn.name then
           oldTable.columns.find(c => c.id != columnId && c.name == newColumn.name) match
             case Some(occupant) =>
@@ -110,9 +113,9 @@ object DiffEngine:
 
     (newTables.keySet -- oldTables.keySet).toVector.sortBy(_.value).foreach { id =>
       val table = newTables(id)
-      previous.tables.find(_.name == table.name) match
+      previousRelation(previous, table.name, id) match
         case Some(occupant) =>
-          errors += s"Creating table '${id.value}' uses the previous name of table '${occupant.id.value}'; manual migration required"
+          errors += s"Creating table '${id.value}' uses the previous name of '${occupant.value}'; manual migration required"
         case None =>
           operations += SchemaOperation.CreateTable(table.copy(foreignKeys = Vector.empty, indexes = Vector.empty))
           operations ++= createIndexes(table, table.indexes)
@@ -137,9 +140,44 @@ object DiffEngine:
       })
     }
 
+  /** Sequences are created or renamed before any table; changing or dropping one is refused. */
+  private def planSequences(
+      previous: SchemaModel,
+      desired: SchemaModel,
+      errors: collection.mutable.Growable[String],
+      operations: collection.mutable.Growable[SchemaOperation]
+  ): Unit =
+    val oldSequences = previous.sequences.map(s => s.id -> s).toMap
+    (oldSequences.keySet -- desired.sequences.map(_.id)).toVector.sortBy(_.value).foreach { id =>
+      errors += s"Dropping sequence '${id.value}' is unsupported; manual migration required"
+    }
+    desired.sequences.sortBy(_.id.value).foreach { sequence =>
+      oldSequences.get(sequence.id) match
+        case None =>
+          previousRelation(previous, sequence.name, sequence.id) match
+            case Some(occupant) =>
+              errors += s"Creating sequence '${sequence.id.value}' uses the previous name of '${occupant.value}'; manual migration required"
+            case None => operations += SchemaOperation.CreateSequence(sequence)
+        case Some(old) =>
+          if old.start != sequence.start || old.increment != sequence.increment then
+            errors += s"Changing start or increment of sequence '${sequence.id.value}' is unsupported; manual migration required"
+          if old.name.schema != sequence.name.schema || old.name.catalog != sequence.name.catalog then
+            errors += s"Moving sequence '${sequence.id.value}' between schemas or catalogs is unsupported; manual migration required"
+          else if old.name != sequence.name then
+            previousRelation(previous, sequence.name, sequence.id) match
+              case Some(occupant) =>
+                errors += s"Renaming sequence '${sequence.id.value}' collides with previous '${occupant.value}'; manual migration required"
+              case None => operations += SchemaOperation.RenameSequence(sequence.id, old.name, sequence.name)
+    }
+
+  /** The previous table or sequence other than `self` that had this name. */
+  private def previousRelation(previous: SchemaModel, name: QualifiedName, self: SchemaId): Option[SchemaId] =
+    (previous.tables.map(t => t.id -> t.name) ++ previous.sequences.map(s => s.id -> s.name))
+      .collectFirst { case (id, relation) if id != self && relation == name => id }
+
   private def locations(model: SchemaModel): Map[SchemaId, String] =
-    model.tables.flatMap { table =>
+    (model.tables.flatMap { table =>
       (table.id -> "table") +: table.columns.map { column =>
         column.id -> s"column in table '${table.id.value}'"
       }
-    }.toMap
+    } ++ model.sequences.map(_.id -> "sequence")).toMap

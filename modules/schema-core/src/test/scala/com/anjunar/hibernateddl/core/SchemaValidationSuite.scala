@@ -22,7 +22,7 @@ class SchemaValidationSuite extends munit.FunSuite:
 
   test("table physical names are unique and columns are unique within each table") {
     val second = table.copy(id = SchemaId("second"), columns = Vector.empty)
-    assert(SchemaValidation.validate(SchemaModel(Vector(table, second))).exists(_.contains("Duplicate physical table name")))
+    assert(SchemaValidation.validate(SchemaModel(Vector(table, second))).exists(_.contains("Duplicate physical table or sequence name")))
     val duplicateColumn = table.copy(columns = table.columns :+ table.columns.head.copy(id = SchemaId("second-column")))
     assert(SchemaValidation.validate(SchemaModel(Vector(duplicateColumn))).exists(_.contains("Duplicate physical column name")))
   }
@@ -121,6 +121,21 @@ class SchemaValidationSuite extends munit.FunSuite:
     assert(errors(SqlType.Text, ColumnCheck.Range(0, 1)).exists(_.contains("not an integer type")))
     assert(errors(SqlType.SmallInt, ColumnCheck.Range(2, 1)).exists(_.contains("empty range")))
     assert(errors(SqlType.SmallInt, ColumnCheck.Range(0, 40000)).exists(_.contains("exceeds the column type's range")))
+  }
+
+  test("identity columns are non-null integers; sequences ascend from 1 or later and share the table name space") {
+    val key = table.columns.head.copy(dataType = SqlType.BigInt, nullable = false, identity = true)
+    def errors(model: SchemaModel) = SchemaValidation.validate(model)
+    assertEquals(errors(SchemaModel(Vector(table.copy(columns = Vector(key))))), Vector.empty)
+    assert(errors(SchemaModel(Vector(table.copy(columns = Vector(key.copy(nullable = true)))))).exists(_.contains("must not be nullable")))
+    assert(errors(SchemaModel(Vector(table.copy(columns = Vector(key.copy(dataType = SqlType.Text)))))).exists(_.contains("integer type")))
+    val sequence = SequenceModel(SchemaId("sequence"), QualifiedName(SqlIdentifier("customer_seq")), 1, 50)
+    assertEquals(errors(SchemaModel(Vector(table), Vector(sequence))), Vector.empty)
+    assert(errors(SchemaModel(Vector(table), Vector(sequence.copy(increment = 0)))).exists(_.contains("ascending sequence")))
+    assert(errors(SchemaModel(Vector(table), Vector(sequence.copy(start = 0)))).exists(_.contains("ascending sequence")))
+    assert(errors(SchemaModel(Vector(table), Vector(sequence.copy(name = table.name))))
+      .exists(_.contains("Duplicate physical table or sequence name")))
+    assert(errors(SchemaModel(Vector(table), Vector(sequence.copy(id = table.id)))).exists(_.contains("Duplicate stable ID")))
   }
 
   test("TIMESTAMP precisions must not be negative") {

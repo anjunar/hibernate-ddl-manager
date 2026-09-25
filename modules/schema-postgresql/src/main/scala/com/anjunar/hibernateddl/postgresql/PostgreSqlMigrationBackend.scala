@@ -10,7 +10,7 @@ import scala.util.Using
   *
   * The initial execution envelope is deliberately narrow: explicitly qualified,
   * permanent ordinary tables containing only the modeled native types, nullability,
-  * a non-deferrable primary key, plain unique constraints, plain B-tree indexes and
+  * identity columns (BY DEFAULT), unowned bigint sequences, a non-deferrable primary key, plain unique constraints, plain B-tree indexes and
   * plain foreign keys (no actions, MATCH SIMPLE, not deferrable). Defaults, identities,
   * generated columns, custom collations, inheritance, partitions, other constraints,
   * other indexes, triggers, rules and RLS require a richer schema model before
@@ -128,26 +128,66 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
       tables.foreach { table =>
         execute(connection, s"LOCK TABLE ONLY ${qualified(table.name)} IN ACCESS EXCLUSIVE MODE")
       }
-      tables.flatMap(table => inspectTable(connection, table, expected)).distinct.sorted
+      // Sequences cannot be locked; the advisory lock already keeps other migrations out.
+      (tables.flatMap(table => inspectTable(connection, table, expected)) ++
+        expected.sequences.flatMap(inspectSequence(connection, _))).distinct.sorted
 
   private def validateModel(model: SchemaModel): Vector[String] =
     val dialectErrors = model.tables.flatMap { table =>
       PostgreSqlDialect.validateTable(table).map(message => s"Table '${table.id.value}': $message")
     }
     // The history stores models as jsonb, which cannot hold NUL.
-    val idErrors = model.tables.flatMap(table => table.id +: table.columns.map(_.id))
+    val idErrors = (model.tables.flatMap(table => table.id +: table.columns.map(_.id)) ++ model.sequences.map(_.id))
       .filter(_.value.contains('\u0000')).map(id => s"Stable ID '${id.value.replace('\u0000', '?')}' must not contain NUL.")
-    val namespaceErrors = model.tables.flatMap { table =>
+    val sequenceErrors = model.sequences.flatMap { sequence =>
+      PostgreSqlDialect.render(Vector(SchemaOperation.CreateSequence(sequence))).left.toOption.toVector.flatten
+        .map(message => s"Sequence '${sequence.id.value}': $message")
+    }
+    val relations = model.tables.map(t => ("Table", t.id, t.name)) ++ model.sequences.map(s => ("Sequence", s.id, s.name))
+    val namespaceErrors = relations.flatMap { (kind, id, name) =>
       Vector(
-        Option.when(table.name.schema.isEmpty)(
-          s"Table '${table.id.value}' must have an explicit schema for execution."
-        ),
-        Option.when(table.name.schema.exists(_.value == HistorySchema))(
-          s"Table '${table.id.value}' uses the reserved history schema '$HistorySchema'."
+        Option.when(name.schema.isEmpty)(s"$kind '${id.value}' must have an explicit schema for execution."),
+        Option.when(name.schema.exists(_.value == HistorySchema))(
+          s"$kind '${id.value}' uses the reserved history schema '$HistorySchema'."
         )
       ).flatten
     }
-    (SchemaValidation.validate(model) ++ dialectErrors ++ idErrors ++ namespaceErrors).distinct.sorted
+    (SchemaValidation.validate(model) ++ dialectErrors ++ sequenceErrors ++ idErrors ++ namespaceErrors).distinct.sorted
+
+  /** A sequence must be an unowned bigint sequence with the modeled start and increment and
+    * PostgreSQL's defaults otherwise: minimum 1, maximum 2^63 - 1, cache 1 and no cycling.
+    */
+  private def inspectSequence(connection: Connection, expected: SequenceModel): Vector[String] =
+    val display = qualified(expected.name)
+    query(connection,
+      """SELECT c.relkind, CAST(CAST(s.seqtypid AS pg_catalog.regtype) AS pg_catalog.text) AS type_name,
+        |       s.seqstart, s.seqincrement, s.seqmin, s.seqmax, s.seqcache, s.seqcycle,
+        |       EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
+        |               WHERE d.classid = CAST('pg_catalog.pg_class' AS pg_catalog.regclass) AND d.objid = c.oid
+        |                 AND d.refobjsubid > 0 AND d.deptype IN ('a', 'i')) AS owned
+        |FROM pg_catalog.pg_class c
+        |JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        |LEFT JOIN pg_catalog.pg_sequence s ON s.seqrelid = c.oid
+        |WHERE n.nspname = ? AND c.relname = ?""".stripMargin
+    ) { statement =>
+      statement.setString(1, expected.name.schema.get.value)
+      statement.setString(2, expected.name.name.value)
+    } { row =>
+      if row.getString("relkind") != "S" then Vector(s"Database drift: $display is not a sequence.")
+      else
+        def drift(attribute: String, actual: Any, wanted: Any) =
+          Option.when(actual != wanted)(s"Database drift: sequence $display has $attribute $actual; expected $wanted.")
+        Vector(
+          drift("type", row.getString("type_name"), "bigint"),
+          drift("start", row.getLong("seqstart"), expected.start),
+          drift("increment", row.getLong("seqincrement"), expected.increment),
+          drift("minimum", row.getLong("seqmin"), 1L),
+          drift("maximum", row.getLong("seqmax"), Long.MaxValue),
+          drift("cache", row.getLong("seqcache"), 1L),
+          drift("cycling", row.getBoolean("seqcycle"), false),
+          Option.when(row.getBoolean("owned"))(s"Sequence $display has unsupported ownership by a column.")
+        ).flatten
+    }.headOption.getOrElse(Vector(s"Database drift: sequence $display does not exist."))
 
   private def inspectTable(connection: Connection, expected: TableModel, model: SchemaModel): Vector[String] =
     val display = qualified(expected.name)
@@ -211,6 +251,8 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
               errors += s"Database drift: column $columnDisplay type is ${databaseColumn.typeDescription}; expected ${column.dataType}."
             if databaseColumn.nullable != column.nullable then
               errors += s"Database drift: column $columnDisplay nullable=${databaseColumn.nullable}; expected ${column.nullable}."
+            if (databaseColumn.identity == "d") != column.identity then
+              errors += s"Database drift: column $columnDisplay identity=${databaseColumn.identity == "d"}; expected ${column.identity}."
             databaseColumn.features.foreach { feature =>
               errors += s"Column $columnDisplay has unsupported $feature."
             }
@@ -439,6 +481,7 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
       dataType: Option[SqlType],
       typeDescription: String,
       nullable: Boolean,
+      identity: String,
       features: Vector[String]
   )
 
@@ -481,12 +524,12 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
         case _ => None
       val features = Vector(
         Option.when(row.getBoolean("atthasdef"))("default or generation expression"),
-        Option.when(row.getString("attidentity").nonEmpty)("identity generation"),
+        Option.when(row.getString("attidentity") == "a")("GENERATED ALWAYS identity"),
         Option.when(row.getString("attgenerated").nonEmpty)("generated expression"),
         Option.when(row.getLong("attcollation") != row.getLong("typcollation"))("custom collation")
       ).flatten
       DatabaseColumn(row.getString("attname"), dataType,
-        s"$typeSchema.$typeName (typmod=$typmod)", !row.getBoolean("attnotnull"), features)
+        s"$typeSchema.$typeName (typmod=$typmod)", !row.getBoolean("attnotnull"), row.getString("attidentity"), features)
     }
 
   /** Primary key columns in key order; INCLUDE columns are listed too and therefore never match. */

@@ -38,7 +38,8 @@ final case class ColumnModel(
     name: SqlIdentifier,
     dataType: SqlType,
     nullable: Boolean = true,
-    check: Option[ColumnCheck] = None
+    check: Option[ColumnCheck] = None,
+    identity: Boolean = false
 )
 
 /** A foreign key references the primary key of a table in the same model. Columns and
@@ -76,19 +77,30 @@ final case class TableModel(
     indexes: Vector[IndexModel] = Vector.empty
 )
 
-final case class SchemaModel(tables: Vector[TableModel])
+/** An ascending bigint sequence, as Hibernate uses for generated keys. Only the start and the
+  * increment are modeled; everything else keeps the database's defaults.
+  */
+final case class SequenceModel(id: SchemaId, name: QualifiedName, start: Long = 1, increment: Long = 1)
+
+/** Tables and sequences share one name space, as relations do in PostgreSQL. */
+final case class SchemaModel(tables: Vector[TableModel], sequences: Vector[SequenceModel] = Vector.empty)
 
 /** Validation is independent of any particular database dialect. */
 object SchemaValidation:
   def validate(model: SchemaModel): Vector[String] =
     val errors = Vector.newBuilder[String]
-    val ids = model.tables.flatMap(table => table.id +: table.columns.map(_.id))
+    val ids = model.tables.flatMap(table => table.id +: table.columns.map(_.id)) ++ model.sequences.map(_.id)
     ids.groupBy(identity).foreach { (id, occurrences) =>
       if occurrences.size > 1 then errors += s"Duplicate stable ID '${id.value}'"
     }
-    model.tables.groupBy(_.name).foreach { (name, tables) =>
-      if tables.size > 1 then
-        errors += s"Duplicate physical table name '${displayName(name)}'"
+    (model.tables.map(_.name) ++ model.sequences.map(_.name)).groupBy(identity).foreach { (name, relations) =>
+      if relations.size > 1 then
+        errors += s"Duplicate physical table or sequence name '${displayName(name)}'"
+    }
+    model.sequences.foreach { sequence =>
+      if sequence.increment <= 0 || sequence.start < 1 then
+        errors += s"Sequence '${sequence.id.value}' starts at ${sequence.start} with increment ${sequence.increment}; " +
+          "expected an ascending sequence starting at 1 or later"
     }
     model.tables.foreach { table =>
       table.columns.groupBy(_.name).foreach { (name, columns) =>
@@ -97,6 +109,10 @@ object SchemaValidation:
       }
       table.columns.foreach { column =>
         column.check.foreach(check => errors ++= validateCheck(column, check))
+        if column.identity then
+          if !Set[SqlType](SqlType.SmallInt, SqlType.Integer, SqlType.BigInt).contains(column.dataType) then
+            errors += s"Identity column '${column.id.value}' has type ${column.dataType}; expected an integer type"
+          if column.nullable then errors += s"Identity column '${column.id.value}' must not be nullable"
         column.dataType match
           case SqlType.Varchar(length) if length <= 0 =>
             errors += s"Column '${column.id.value}' has invalid VARCHAR length $length; expected a positive length"

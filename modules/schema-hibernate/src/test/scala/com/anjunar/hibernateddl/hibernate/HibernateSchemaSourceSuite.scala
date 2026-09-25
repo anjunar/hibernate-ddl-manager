@@ -177,7 +177,6 @@ class HibernateSchemaSourceSuite extends munit.FunSuite:
     assert(diagnostics.exists(_.contains("of entity Unsupported has ON DELETE CASCADE; unsupported")), diagnostics)
     assert(diagnostics.exists(_.contains("Unsupported.tags is a map collection")), diagnostics)
     assert(diagnostics.exists(_.contains("of entity Unsupported has options 'WHERE code IS NOT NULL'; unsupported")), diagnostics)
-    assert(errors(classOf[Generated]).exists(_.startsWith("Sequence")))
   }
 
   test("generated UUID keys and timestamps with and without time zone are mapped") {
@@ -193,6 +192,23 @@ class HibernateSchemaSourceSuite extends munit.FunSuite:
         "deliveredat" -> (SqlType.Timestamp(3), true)
       )
     )
+  }
+
+  test("generated keys become key sequences or identity columns") {
+    val model = read(classOf[Generated], classOf[Ticket], classOf[Voucher]).toOption.get
+    assertEquals(model.sequences.toSet, Set(
+      SequenceModel(SchemaId("cccccccc/0a1b2c3d/sequence"), QualifiedName(SqlIdentifier("generated_seq"), Some(SqlIdentifier("public"))), 1, 50),
+      SequenceModel(SchemaId("f6071829/0a1b2c3d/sequence"), QualifiedName(SqlIdentifier("voucher_numbers"), Some(SqlIdentifier("public"))), 100, 10)
+    ))
+    val ticketKey = model.tables.find(_.id == SchemaId("e5f60718")).get.columns.head
+    assertEquals((ticketKey.dataType, ticketKey.nullable, ticketKey.identity), (SqlType.BigInt, false, true))
+    assert(model.tables.filterNot(_.id == SchemaId("e5f60718")).flatMap(_.columns).forall(!_.identity))
+    assertEquals(SchemaValidation.validate(model), Vector.empty)
+  }
+
+  test("a sequence shared by several entity keys is reported") {
+    assert(errors(classOf[Voucher], classOf[Coupon]).exists(_.contains(
+      "Sequence voucher_numbers generates the keys of entities Coupon, Voucher; give each entity its own sequence")))
   }
 
   test("fresh IDs have the required format") {

@@ -588,10 +588,11 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
     }
   }
 
-  test("Hibernate entities with associations, collections, enums, keys and indexes migrate and verify end to end") {
+  test("Hibernate entities with associations, collections, enums, keys, indexes and generated keys migrate and verify end to end") {
     import com.anjunar.hibernateddl.hibernate.*
     val model = TestMetadata.read(classOf[Article], classOf[Label], classOf[Invoice], classOf[LegacyCustomer],
-      classOf[Account], classOf[Shipment], classOf[Measurement], classOf[Letter], classOf[Purchase])
+      classOf[Account], classOf[Shipment], classOf[Measurement], classOf[Letter], classOf[Purchase],
+      classOf[Generated], classOf[Ticket], classOf[Voucher])
       .fold(errors => fail(errors.mkString("\n")), identity)
     withDatabase { ds =>
       val result = executor.migrate(ds, model)
@@ -602,7 +603,59 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
         "INSERT INTO public.article_statuses VALUES (1, 'Sent')")
       intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.article_label VALUES (1, 8)"))
       intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.article_statuses VALUES (1, 'Lost')"))
+      assertEquals(scalar(ds, "SELECT nextval('public.voucher_numbers') || ',' || nextval('public.generated_seq')"), "100,1")
+      execute(ds, "INSERT INTO public.ticket DEFAULT VALUES")
+      assertEquals(scalar(ds, "SELECT id FROM public.ticket"), "1")
       assertEquals(executor.migrate(ds, model), MigrationResult(1, MigrationStatus.AlreadyApplied, 0))
+    }
+  }
+
+  private val keySequence = SequenceModel(SchemaId("USER_SEQUENCE"), QualifiedName(SqlIdentifier("users_SEQ"), Some(SqlIdentifier("public"))), 1, 50)
+  private val sequenced = SchemaModel(Vector(users), Vector(keySequence))
+
+  test("sequences are created, renamed with their current value and verified on restart") {
+    withDatabase { ds =>
+      assertEquals(executor.migrate(ds, sequenced), MigrationResult(1, MigrationStatus.Applied, 2))
+      assertEquals(scalar(ds, "SELECT nextval('public.\"users_SEQ\"') || ',' || nextval('public.\"users_SEQ\"')"), "1,51")
+      val renamedSequence = SchemaModel(Vector(users), Vector(keySequence.copy(name = keySequence.name.copy(name = SqlIdentifier("accounts_SEQ")))))
+      assertEquals(executor.migrate(ds, renamedSequence), MigrationResult(2, MigrationStatus.Applied, 1))
+      assertEquals(scalar(ds, "SELECT nextval('public.\"accounts_SEQ\"')"), "101")
+      assertEquals(executor.migrate(ds, renamedSequence).status, MigrationStatus.AlreadyApplied)
+    }
+  }
+
+  test("a missing, changed, cycling or column-owned sequence blocks the start") {
+    Vector(
+      "DROP SEQUENCE public.\"users_SEQ\"" -> "sequence \"public\".\"users_SEQ\" does not exist",
+      "ALTER SEQUENCE public.\"users_SEQ\" INCREMENT BY 1" -> "has increment 1; expected 50",
+      "ALTER SEQUENCE public.\"users_SEQ\" CYCLE" -> "has cycling true; expected false",
+      "ALTER SEQUENCE public.\"users_SEQ\" AS integer" -> "has type integer; expected bigint",
+      "ALTER SEQUENCE public.\"users_SEQ\" OWNED BY public.users.username" -> "unsupported ownership by a column",
+      "DROP SEQUENCE public.\"users_SEQ\"; CREATE TABLE public.\"users_SEQ\" (x int)" -> "is not a sequence"
+    ).foreach { (change, message) =>
+      withDatabase { ds =>
+        executor.migrate(ds, sequenced)
+        execute(ds, change)
+        val error = intercept[MigrationException](executor.migrate(ds, sequenced))
+        assert(error.getMessage.contains(message), s"$change: ${error.getMessage}")
+      }
+    }
+  }
+
+  test("identity columns generate keys, keep explicit values and are verified") {
+    val key = ColumnModel(SchemaId("TICKET_ID"), SqlIdentifier("id"), SqlType.BigInt, nullable = false, identity = true)
+    val subject = ColumnModel(SchemaId("TICKET_SUBJECT"), SqlIdentifier("subject"), SqlType.Text)
+    val tickets = SchemaModel(Vector(TableModel(SchemaId("TICKET"), QualifiedName(SqlIdentifier("ticket"), Some(SqlIdentifier("public"))),
+      Vector(key, subject), Vector(key.id))))
+    withDatabase { ds =>
+      assertEquals(executor.migrate(ds, tickets).status, MigrationStatus.Applied)
+      execute(ds, "INSERT INTO public.ticket (subject) VALUES ('first'); INSERT INTO public.ticket VALUES (100, 'explicit')")
+      assertEquals(scalar(ds, "SELECT string_agg(id::text, ',' ORDER BY id) FROM public.ticket"), "1,100")
+      assertEquals(executor.migrate(ds, tickets).status, MigrationStatus.AlreadyApplied)
+      execute(ds, "ALTER TABLE public.ticket ALTER COLUMN id SET GENERATED ALWAYS")
+      assert(intercept[MigrationException](executor.migrate(ds, tickets)).getMessage.contains("GENERATED ALWAYS identity"))
+      execute(ds, "ALTER TABLE public.ticket ALTER COLUMN id DROP IDENTITY")
+      assert(intercept[MigrationException](executor.migrate(ds, tickets)).getMessage.contains("identity=false; expected true"))
     }
   }
 

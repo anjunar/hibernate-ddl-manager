@@ -133,6 +133,10 @@ final class JdbcMigrationExecutor(
         earlier(table => table.id == tableId && table.columns.exists(c => c.id == columnId && c.name == to)).map { revision =>
           s"Renaming column '${columnId.value}' back to its name from revision $revision is what an older server would do; manual migration required"
         }
+      case SchemaOperation.RenameSequence(id, _, to) =>
+        history.find(_.model.sequences.exists(s => s.id == id && s.name == to)).map(_.entry.revision).map { revision =>
+          s"Renaming sequence '${id.value}' back to its name from revision $revision is what an older server would do; manual migration required"
+        }
       case _ => None
     }
     if reverted.nonEmpty then refuse(reverted)
