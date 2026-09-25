@@ -84,21 +84,45 @@ suggestion.
 
 ## Migrating the database at server startup
 
-```scala
-val target = HibernateSchemaSource.read(metadata) match
-  case Right(model) => model
-  case Left(errors) => throw IllegalStateException(errors.mkString("\n"))
+With `schema-integration` on the classpath, one Hibernate setting is enough:
 
-val executor = JdbcMigrationExecutor(
-  PostgreSqlMigrationBackend,
-  ExecutionOptions(lockTimeoutMillis = 5000, statementTimeoutMillis = 30000)
-)
-executor.migrate(dataSource, target)
+```properties
+hibernate.ddl_manager.enabled=true
+hibernate.hbm2ddl.auto=validate
+```
+
+While Hibernate builds the SessionFactory, and before its own schema validation, the
+integrator reads the entities, migrates the database through one connection of Hibernate's
+ConnectionProvider and gives the connection back. Any problem throws a
+`MigrationException`, so the SessionFactory and the server do not start. Hibernate's own
+schema management may at most validate: `hibernate.hbm2ddl.auto` and
+`jakarta.persistence.schema-generation.database.action` must be unset, `none` or
+`validate`. Further settings:
+
+| Setting | Meaning |
+| --- | --- |
+| `hibernate.ddl_manager.adopt_existing_schema` | `true` adopts a matching database without history |
+| `hibernate.ddl_manager.approvals` | Comma-separated `drop:<id>`, `rename-back:<id>`, `revert:<revision>` |
+| `hibernate.ddl_manager.accept_manual_migration` | Fingerprint of a target migrated by hand |
+| `hibernate.ddl_manager.lock_timeout_millis` | Default 5000 |
+| `hibernate.ddl_manager.statement_timeout_millis` | Default 30000 |
+
+An unknown `hibernate.ddl_manager.*` setting is an error, so a typo cannot switch off a
+safeguard. With JTA or multi-tenancy the integrator refuses to run; there, and wherever
+the server controls the bootstrap itself, call the migration explicitly between building
+the metadata and building the SessionFactory, with a DataSource whose connections are not
+enlisted in JTA:
+
+```scala
+val metadata = MetadataSources(registry).addAnnotatedClass(classOf[Customer]).buildMetadata()
+HibernateSchemaMigration.migrate(metadata, dataSource, ExecutionOptions(lockTimeoutMillis = 5000))
+val sessionFactory = metadata.buildSessionFactory()
 ```
 
 `migrate` runs synchronously. On any `MigrationStatus` the server may continue; a
-`MigrationException` must abort the startup. The executor needs a DataSource without JTA
-enlistment, and `hibernate.hbm2ddl.auto` must not be `update`.
+`MigrationException` must abort the startup. Settings in the registry refine the options
+passed in. `JdbcMigrationExecutor` with `PostgreSqlMigrationBackend` is the same step
+without Hibernate, for a `SchemaModel` from any source.
 
 There are no migration IDs, checked-in snapshots or hand-maintained revisions. Every
 migration stores its target model as JSON in `__hibernate_ddl.schema_history`, and the next
@@ -158,6 +182,7 @@ accept a later change by accident.
 | `schemaHibernate` | `@SchemaId` and `HibernateSchemaSource` |
 | `schemaExecutor` | Transaction, planning against the stored model, history |
 | `schemaPostgresql` | SQL, catalog checks, locking and history for PostgreSQL |
+| `schemaIntegration` | `HibernateSchemaMigration` and the opt-in Hibernate integrator |
 | `schemaCli` | Demo |
 
 Package root: `com.anjunar.hibernateddl`. The core depends neither on Hibernate nor on a

@@ -24,7 +24,19 @@ flowchart TD
 
 Everything between lock and commit runs in one transaction on one connection. Any error
 aborts the server startup; Hibernate builds the SessionFactory only after a successful
-migration. `hibernate.hbm2ddl.auto` must not be `update` for the managed tables.
+migration.
+
+`HibernateSchemaMigration.migrate(metadata, dataSource, options)` runs this flow between
+`buildMetadata()` and `buildSessionFactory()`. With `hibernate.ddl_manager.enabled=true`
+the `SchemaMigrationIntegrator`, registered through `META-INF/services`, does the same while
+Hibernate builds the SessionFactory: integrators run before Hibernate's schema management,
+so `hibernate.hbm2ddl.auto=validate` becomes an independent check of the migrated schema.
+It borrows one connection from Hibernate's ConnectionProvider, rolls back and enables
+auto-commit on it if needed, and restores it before giving it back. It refuses JTA and
+multi-tenancy, where the server must call the explicit API with a suitable DataSource.
+Both paths refuse a non-PostgreSQL dialect and any Hibernate schema action other than
+`none` or `validate`, because Hibernate must not change the managed schema itself.
+`hibernate.ddl_manager.*` settings map onto the execution options; unknown ones are errors.
 
 ## Stable identity with `@SchemaId`
 
@@ -150,6 +162,7 @@ there:
 | `schema-hibernate` | `@SchemaId` and `HibernateSchemaSource` (boot metadata → model), pinned to Hibernate 7.4.10 |
 | `schema-executor` | Transaction, planning against the stored model, fingerprints, JSON format and history verification, failure states |
 | `schema-postgresql` | SQL renderer, catalog checks, locking and history for PostgreSQL 14+ |
+| `schema-integration` | `HibernateSchemaMigration`, the opt-in `SchemaMigrationIntegrator` and the `hibernate.ddl_manager.*` settings |
 | `schema-cli` | Demo without a database connection |
 
 ## Current scope
@@ -175,10 +188,6 @@ Tables that exist only in the database are left untouched.
    types also need a name in the history's JSON format. Foreign key columns get no index
    automatically; declare one with `@Index` where deletes on the referenced table must be
    fast.
-2. **Server integration.** The entry point is between `MetadataBuilder.build()` and
-   `getSessionFactoryBuilder.build()`. The executor needs a DataSource without JTA
-   enlistment. `hibernate.hbm2ddl.auto=validate` works as an independent cross-check after
-   the migration.
 
 Possible later: data migrations and backfills, multi-phase deployments (expand/contract),
 further dialects and an export to Flyway or Liquibase as an alternative mode of operation.
