@@ -218,7 +218,6 @@ object PostgreSqlDialect extends SchemaDialect:
     case SqlType.DoublePrecision => "double precision"
     case SqlType.Date => "date"
     case SqlType.Binary => "bytea"
-    case SqlType.LargeObject => "oid"
 
   private def qualified(name: QualifiedName): String =
     (name.schema.toVector :+ name.name).map(quoted).mkString(".")

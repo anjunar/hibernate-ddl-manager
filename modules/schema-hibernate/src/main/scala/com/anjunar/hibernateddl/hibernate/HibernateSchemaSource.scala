@@ -445,8 +445,6 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
         case "double precision" | "float8" | "float" => Some(SqlType.DoublePrecision)
         case "date" => Some(SqlType.Date)
         case "bytea" => Some(SqlType.Binary)
-        // Hibernate stores @Lob values as PostgreSQL large objects, referenced by their oid.
-        case "oid" => Some(SqlType.LargeObject)
         case FloatType(digits) => digits.toIntOption.collect {
           case bits if bits >= 1 && bits <= 24 => SqlType.Real
           case bits if bits >= 25 && bits <= 53 => SqlType.DoublePrecision
