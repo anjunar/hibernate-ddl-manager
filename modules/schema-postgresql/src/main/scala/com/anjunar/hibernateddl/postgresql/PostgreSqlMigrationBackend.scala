@@ -36,6 +36,8 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
 
   override def validate(model: SchemaModel): Vector[String] = validateModel(model)
 
+  override def nullCount(table: QualifiedName, column: SqlIdentifier): String = PostgreSqlDialect.nullCount(table, column)
+
   override def acquireLock(connection: Connection, options: ExecutionOptions): Unit =
     if connection.getAutoCommit then
       throw new SQLException("PostgreSQL migration execution requires an active transaction.")

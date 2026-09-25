@@ -74,13 +74,15 @@ class PostgreSqlExecutorSuite extends TestPostgres:
     }
   }
 
-  test("adding a non-null column to existing rows is refused before DDL") {
+  test("a required column for existing rows without a backfill rolls back together with its addition") {
     withDatabase { ds =>
       fixture(ds)
       val required = ColumnModel(SchemaId("USER_BIO"), SqlIdentifier("biography"), SqlType.Text, false)
       val unsafe = SchemaModel(Vector(users.copy(columns = users.columns :+ required)))
       assert(intercept[MigrationException](executor.migrate(ds, unsafe)).getMessage.contains("backfill"))
       assertEquals(scalar(ds, "SELECT username FROM public.users"), "patrick")
+      assertEquals(scalar(ds, "SELECT to_regclass('public.users') IS NOT NULL AND NOT EXISTS (SELECT 1 FROM pg_attribute " +
+        "WHERE attrelid = 'public.users'::regclass AND attname = 'biography')"), "t")
       assertEquals(revisions(ds), "1")
     }
   }
@@ -174,6 +176,33 @@ class PostgreSqlExecutorSuite extends TestPostgres:
       }
       assertEquals(scalar(ds, "SELECT count(*) FROM public.users"), "3")
       assertEquals(impatient.migrate(ds, target).status, MigrationStatus.Applied)
+    }
+  }
+
+  test("a column becomes required when no row holds NULL, and optional again") {
+    val nick = ColumnModel(SchemaId("USER_NICK"), SqlIdentifier("nick"), SqlType.Text)
+    def withNick(nullable: Boolean) = SchemaModel(Vector(users.copy(columns = Vector(login, nick.copy(nullable = nullable)))))
+    def nickColumns(ds: DataSource) =
+      scalar(ds, "SELECT count(*) FROM pg_attribute WHERE attrelid = 'public.users'::regclass AND attname = 'nick'")
+    withDatabase { ds =>
+      fixture(ds)
+      val refused = intercept[MigrationException](executor.migrate(ds, withNick(false)))
+      assertEquals(refused.state, FailureState.RolledBack)
+      assert(refused.getMessage.contains("Column 'USER_NICK' (public.users.nick) becomes required, but 1 row holds NULL"),
+        refused.getMessage)
+      assertEquals(nickColumns(ds), "0")
+      assertEquals(executor.migrate(ds, withNick(true)).revision, 2L)
+      execute(ds, "UPDATE public.users SET nick = 'pat'")
+      assertEquals(executor.migrate(ds, withNick(false)), MigrationResult(3, MigrationStatus.Applied, 1))
+      intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.users VALUES ('ada', NULL)"))
+      val loosen = new JdbcMigrationExecutor(PostgreSqlMigrationBackend, ExecutionOptions(approvals = Set(Approval.Revert(2))))
+      assertEquals(loosen.migrate(ds, withNick(true)), MigrationResult(4, MigrationStatus.Applied, 1))
+      execute(ds, "INSERT INTO public.users VALUES ('ada', NULL)")
+    }
+    withDatabase { ds =>
+      assertEquals(executor.migrate(ds, initial).status, MigrationStatus.Applied)
+      assertEquals(executor.migrate(ds, withNick(false)), MigrationResult(2, MigrationStatus.Applied, 2))
+      assertEquals(scalar(ds, "SELECT attnotnull FROM pg_attribute WHERE attrelid = 'public.users'::regclass AND attname = 'nick'"), "t")
     }
   }
 

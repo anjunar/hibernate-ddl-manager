@@ -90,4 +90,6 @@ trait TransactionalMigrationBackend extends SchemaDialect:
   /** The model's tables and sequences whose names are taken by any relation in the database. */
   def existingRelations(connection: Connection, model: SchemaModel): Vector[QualifiedName]
   def lockAndValidate(connection: Connection, expected: SchemaModel, lock: TableLock): Vector[String]
+  /** A query whose single row and column counts the rows in which the column is NULL. */
+  def nullCount(table: QualifiedName, column: SqlIdentifier): String
   def recordHistory(connection: Connection, entry: HistoryEntry): Unit

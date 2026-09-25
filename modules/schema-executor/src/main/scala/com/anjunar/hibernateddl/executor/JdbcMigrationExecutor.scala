@@ -69,10 +69,11 @@ final class JdbcMigrationExecutor(
           else if options.acceptManualMigration.nonEmpty then
             acceptManual(connection, history, target, targetFingerprint)
           else
-            val statements = plan(history, previous, target, targetFingerprint)
+            val steps = plan(history, previous, target, targetFingerprint)
             validateDatabase(connection, previous, "Previous schema")
-            statements.foreach(sql => execute(connection, sql))
+            steps.foreach(step => run(connection, step))
             validateDatabase(connection, target, "Target schema")
+            val statements = steps.collect { case Step.Statement(sql) => sql }
             backend.recordHistory(connection, HistoryEntry(revision + 1, previousFingerprint, targetFingerprint,
               SchemaModelJson.encode(target), statements))
             MigrationResult(revision + 1, MigrationStatus.Applied, statements.size)
@@ -235,12 +236,19 @@ final class JdbcMigrationExecutor(
       }
     }
 
+  /** One step of a migration: a DDL statement, or a check that a column has no NULL left
+    * before it becomes required.
+    */
+  private enum Step:
+    case Statement(sql: String)
+    case NoNulls(columnId: SchemaId, column: String, query: String)
+
   private def plan(
       history: Vector[Applied],
       previous: SchemaModel,
       target: SchemaModel,
       targetFingerprint: String
-  ): Vector[String] =
+  ): Vector[Step] =
     val operations = DiffEngine.diff(previous, target).fold(errors => refuse(errors :+
       ("To migrate by hand instead, change the database to exactly the target schema and start once with " +
         s"acceptManualMigration = \"$targetFingerprint\"")), identity)
@@ -276,9 +284,14 @@ final class JdbcMigrationExecutor(
     val rejectedRisks = operations.map(_.risk).filterNot(options.allowedRisks.contains).distinct
     if rejectedRisks.nonEmpty then refuse(Vector(s"Migration risks are not allowed: ${rejectedRisks.mkString(", ")}"))
     val statements = backend.render(operations).fold(refuse, identity)
-    if statements.exists(sql => sql == null || sql.trim.isEmpty) || (operations.nonEmpty && statements.isEmpty) then
-      refuse(Vector("Backend returned an empty SQL statement or omitted the migration SQL"))
-    statements
+    if statements.exists(sql => sql == null || sql.trim.isEmpty) || statements.size != operations.size then
+      refuse(Vector("Backend must render exactly one non-empty SQL statement per operation"))
+    operations.zip(statements).flatMap {
+      case (SchemaOperation.SetNotNull(_, table, columnId, column), sql) =>
+        Vector(Step.NoNulls(columnId, s"${table.display}.${column.value}", backend.nullCount(table, column)),
+          Step.Statement(sql))
+      case (_, sql) => Vector(Step.Statement(sql))
+    }
 
   private def refuse(messages: Vector[String]): Nothing =
     throw new IllegalStateException(messages.mkString("; "))
@@ -292,13 +305,28 @@ final class JdbcMigrationExecutor(
     val errors = backend.lockAndValidate(connection, model, lock)
     if errors.nonEmpty then throw new IllegalStateException(s"$label does not match database: ${errors.mkString("; ")}")
 
-  private def execute(connection: Connection, sql: String): Unit =
+  private def run(connection: Connection, step: Step): Unit = step match
+    case Step.Statement(sql) => withStatement(connection)(_.execute(sql): Unit)
+    case Step.NoNulls(columnId, column, query) =>
+      val nulls = withStatement(connection) { statement =>
+        val rows = statement.executeQuery(query)
+        try
+          if !rows.next() then throw new IllegalStateException(s"Counting NULLs of $column returned no row")
+          rows.getLong(1)
+        finally rows.close()
+      }
+      if nulls > 0 then
+        val rows = if nulls == 1 then "1 row holds" else s"$nulls rows hold"
+        refuse(Vector(s"Column '${columnId.value}' ($column) becomes required, but $rows NULL; " +
+          "register a backfill for it or fill the rows before the migration"))
+
+  /** Runs one statement with the statement timeout and closes it without masking a failure. */
+  private def withStatement[A](connection: Connection)(body: java.sql.Statement => A): A =
     val statement = connection.createStatement()
     var primaryFailure: Throwable = null
     try
       statement.setQueryTimeout(((options.statementTimeoutMillis.toLong + 999) / 1000).toInt)
-      statement.execute(sql)
-      ()
+      body(statement)
     catch
       case NonFatal(error) =>
         primaryFailure = error
