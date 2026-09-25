@@ -8,11 +8,11 @@ import scala.util.control.NoStackTrace
   * start plans against the model applied last. Writing escapes every non-ASCII character, so
   * the text survives any transport unchanged. Reading is strict: an unknown format version, a
   * missing or unknown field and an unknown type are errors, never skipped. Format 2 added
-  * foreign keys, format 3 unique keys, format 4 indexes and format 5 column checks; the
-  * earlier formats are still read.
+  * foreign keys, format 3 unique keys, format 4 indexes, format 5 column checks and format 6
+  * identity columns and sequences; the earlier formats are still read.
   */
 object SchemaModelJson:
-  val FormatVersion = 5
+  val FormatVersion = 6
   private val VarcharType = """varchar\((\d+)\)""".r
   private val TimestampType = """timestamp\((\d+)\)""".r
   private val TimestampWithTimeZoneType = """timestamp\((\d+)\) with time zone""".r
@@ -45,7 +45,7 @@ object SchemaModelJson:
       val columns = table.columns.map { column =>
         s"""{"id":${string(column.id.value)},"name":${string(column.name.value)},""" +
           s""""type":${string(typeName(column.dataType))},"nullable":${column.nullable},""" +
-          s""""check":${column.check.fold("null")(check)}}"""
+          s""""check":${column.check.fold("null")(check)},"identity":${column.identity}}"""
       }
       s"""{"id":${string(table.id.value)},"catalog":${optional(table.name.catalog)},""" +
         s""""schema":${optional(table.name.schema)},"name":${string(table.name.name.value)},""" +
@@ -54,7 +54,12 @@ object SchemaModelJson:
         s""""uniqueKeys":${list(table.uniqueKeys.map(key => s"""{"columns":${ids(key.columns)}}"""))},""" +
         s""""indexes":${list(table.indexes.map(index => s"""{"columns":${list(index.columns.map(indexColumn))}}"""))}}"""
     }
-    s"""{"format":$FormatVersion,"tables":${list(tables)}}"""
+    val sequences = model.sequences.map { sequence =>
+      s"""{"id":${string(sequence.id.value)},"catalog":${optional(sequence.name.catalog)},""" +
+        s""""schema":${optional(sequence.name.schema)},"name":${string(sequence.name.name.value)},""" +
+        s""""start":${sequence.start},"increment":${sequence.increment}}"""
+    }
+    s"""{"format":$FormatVersion,"tables":${list(tables)},"sequences":${list(sequences)}}"""
 
   def decode(json: String): Either[String, SchemaModel] =
     try Right(readModel(new Parser(json).document()))
@@ -99,8 +104,28 @@ object SchemaModelJson:
         case Some(Json.Num(version)) => invalid(s"Model format $version is unsupported; expected format 1 to $FormatVersion")
         case _ => invalid("Model format is missing")
       case _ => 0
-    val model = fields(json, "Model", Set("format", "tables"))
-    SchemaModel(array(model("tables"), "Model tables").map(readTable(_, format)))
+    val model = fields(json, "Model", Set("format", "tables") ++ Option.when(format >= 6)("sequences"))
+    SchemaModel(
+      array(model("tables"), "Model tables").map(readTable(_, format)),
+      model.get("sequences").fold(Vector.empty)(sequences => array(sequences, "Model sequences").map(readSequence))
+    )
+
+  private def readSequence(json: Json): SequenceModel =
+    val sequence = fields(json, "Sequence", Set("id", "catalog", "schema", "name", "start", "increment"))
+    val id = string(sequence("id"), "Sequence id")
+    def number(field: String) = sequence(field) match
+      case Json.Num(value) if value.isValidLong => value.toLong
+      case _ => invalid(s"Sequence '$id' $field must be an integer in the 64-bit range")
+    SequenceModel(
+      SchemaId(id),
+      QualifiedName(
+        SqlIdentifier(string(sequence("name"), s"Sequence '$id' name")),
+        optional(sequence("schema"), s"Sequence '$id' schema").map(SqlIdentifier(_)),
+        optional(sequence("catalog"), s"Sequence '$id' catalog").map(SqlIdentifier(_))
+      ),
+      number("start"),
+      number("increment")
+    )
 
   private def readTable(json: Json, format: Int): TableModel =
     val common = Set("id", "catalog", "schema", "name", "columns", "primaryKey")
@@ -150,7 +175,7 @@ object SchemaModelJson:
 
   private def readColumn(json: Json, tableId: String, format: Int): ColumnModel =
     val column = fields(json, s"Column in table '$tableId'",
-      Set("id", "name", "type", "nullable") ++ Option.when(format >= 5)("check"))
+      Set("id", "name", "type", "nullable") ++ Option.when(format >= 5)("check") ++ Option.when(format >= 6)("identity"))
     val id = string(column("id"), s"Column id in table '$tableId'")
     val dataType = string(column("type"), s"Column '$id' type") match
       case "integer" => SqlType.Integer
@@ -186,7 +211,11 @@ object SchemaModelJson:
           ColumnCheck.Range(bound("min"), bound("max"))
         case _ => invalid(s"Column '$id' check must have either values or min and max")
     }
-    ColumnModel(SchemaId(id), SqlIdentifier(string(column("name"), s"Column '$id' name")), dataType, nullable, check)
+    val identity = column.get("identity").fold(false) {
+      case Json.Bool(value) => value
+      case _ => invalid(s"Column '$id' identity must be true or false")
+    }
+    ColumnModel(SchemaId(id), SqlIdentifier(string(column("name"), s"Column '$id' name")), dataType, nullable, check, identity)
 
   private def number(digits: String, label: String): Int =
     digits.toIntOption.getOrElse(invalid(s"$label $digits is out of range"))
