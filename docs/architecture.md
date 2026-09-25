@@ -46,6 +46,8 @@ multi-tenancy, where the server must call the explicit API with a suitable DataS
 Both paths refuse a non-PostgreSQL dialect and any Hibernate schema action other than
 `none` or `validate`, because Hibernate must not change the managed schema itself.
 `hibernate.ddl_manager.*` settings map onto the execution options; unknown ones are errors.
+Both paths pass the backfills of every `BackfillProvider` found through Hibernate's class
+loader service to the executor; the explicit call can add more.
 
 ## Stable identity with `@SchemaId`
 
@@ -199,7 +201,7 @@ there:
 | `schema-hibernate` | `@SchemaId` and `HibernateSchemaSource` (boot metadata → model), pinned to Hibernate 7.4.10 |
 | `schema-executor` | Transaction, planning against the stored model, fingerprints, JSON format and history verification, failure states |
 | `schema-postgresql` | SQL renderer, catalog checks, locking and history for PostgreSQL 14+ |
-| `schema-integration` | `HibernateSchemaMigration`, the opt-in `SchemaMigrationIntegrator` and the `hibernate.ddl_manager.*` settings |
+| `schema-integration` | `HibernateSchemaMigration`, the opt-in `SchemaMigrationIntegrator`, the `hibernate.ddl_manager.*` settings and the `BackfillProvider` SPI |
 | `schema-cli` | Demo without a database connection |
 
 ## Scope of 1.0

@@ -1,11 +1,11 @@
 # Arbeitspaket: Backfills und nachträgliche Pflichtfelder
 
-Status: Konzept zur Umsetzung, noch nicht implementiert.
+Status: umgesetzt. Die API- und Typnamen unten sind die verfügbaren; die
+Entscheidungen bei der Umsetzung stehen am Ende.
 
 Dieses Arbeitspaket beschreibt Backfills beim Serverstart als Teil einer
 Schemaänderung. Es basiert auf dem im Chat besprochenen Konzept und ergänzt die
-[bestehende Architektur](architecture.md). Die nachfolgenden API- und Typnamen
-sind Entwurfsvorschläge, keine bereits verfügbaren Funktionen.
+[bestehende Architektur](architecture.md).
 
 ## Ziel
 
@@ -269,40 +269,40 @@ bei den vorhandenen Dialekt-, Backend- und CLI-Schnittstellen berücksichtigt we
 
 ## Abnahmekriterien
 
-- [ ] Eine neue Pflichtspalte in einer gefüllten Tabelle wird befüllt und ist
+- [x] Eine neue Pflichtspalte in einer gefüllten Tabelle wird befüllt und ist
   anschließend tatsächlich `NOT NULL`.
-- [ ] Dieselbe Änderung ohne notwendige Befüllungsregel scheitert ohne teilweise
+- [x] Dieselbe Änderung ohne notwendige Befüllungsregel scheitert ohne teilweise
   übernommenes Schema oder neue erfolgreiche Historieneinträge.
-- [ ] Leere Tabellen und vorhandene Spalten ohne NULL-Werte benötigen keine
+- [x] Leere Tabellen und vorhandene Spalten ohne NULL-Werte benötigen keine
   Ersatzwerte.
-- [ ] Beim Verschärfen einer bestehenden Spalte bleiben vorhandene Werte erhalten;
+- [x] Beim Verschärfen einer bestehenden Spalte bleiben vorhandene Werte erhalten;
   ausschließlich NULL-Zeilen werden befüllt.
-- [ ] NULL in Quellausdrücken, `Coalesce` und die definierte `Concat`-Semantik werden
+- [x] NULL in Quellausdrücken, `Coalesce` und die definierte `Concat`-Semantik werden
   geprüft. Verbleibende NULL-Werte verhindern `NOT NULL` und den Commit.
-- [ ] Typfehler, unbekannte IDs, falsche Tabellenzuordnung, doppelte IDs und
+- [x] Typfehler, unbekannte IDs, falsche Tabellenzuordnung, doppelte IDs und
   konkurrierende Regeln werden vor Änderungen an Anwendungstabellen abgelehnt.
-- [ ] Parameterwerte mit Sonderzeichen und gequotete Bezeichner funktionieren ohne
+- [x] Parameterwerte mit Sonderzeichen und gequotete Bezeichner funktionieren ohne
   Einbettung von Werten in SQL-Text.
-- [ ] CHECK-, Unique- und FK-Verletzungen sowie ein Fehler nach dem UPDATE rollen
+- [x] CHECK-, Unique- und FK-Verletzungen sowie ein Fehler nach dem UPDATE rollen
   DDL, Datenänderungen und beide Historien gemeinsam zurück.
-- [ ] Ein wiederholter Serverstart führt einen abgeschlossenen Backfill nicht
+- [x] Ein wiederholter Serverstart führt einen abgeschlossenen Backfill nicht
   erneut aus. Eine geänderte Definition wird auch bei gleichem Schema abgelehnt.
-- [ ] Zwei parallele Serverstarts verwenden die vorhandene Migrationssperre;
+- [x] Zwei parallele Serverstarts verwenden die vorhandene Migrationssperre;
   derselbe Backfill wird nur einmal erfolgreich dokumentiert.
-- [ ] Wiederanläufe nach Rollback oder unbekanntem Commit-Ausgang sowie Fehler bei
+- [x] Wiederanläufe nach Rollback oder unbekanntem Commit-Ausgang sowie Fehler bei
   der Verbindungswiederherstellung behalten korrekte Fehlerzustände.
-- [ ] Neuanlage, Übernahme und manuell migrierte Zielzustände werden korrekt
+- [x] Neuanlage, Übernahme und manuell migrierte Zielzustände werden korrekt
   unterschieden und nicht als ausgeführte Datenbefüllung ausgegeben.
-- [ ] Unterstützte Versionssprünge und Renames funktionieren. Quellspalten werden
+- [x] Unterstützte Versionssprünge und Renames funktionieren. Quellspalten werden
   erst nach ihrer Nutzung gelöscht; nicht unterstützte Abhängigkeiten werden
   vorab erklärt und abgelehnt.
-- [ ] `NOT NULL` kann für normale Spalten entfernt werden; unzulässige Lockerungen
+- [x] `NOT NULL` kann für normale Spalten entfernt werden; unzulässige Lockerungen
   bei Primärschlüssel- und Identity-Spalten werden abgelehnt.
-- [ ] Vorhandene Schemahistorien bleiben lesbar und behalten ihre Fingerprints.
+- [x] Vorhandene Schemahistorien bleiben lesbar und behalten ihre Fingerprints.
   Bestehende API-Aufrufe ohne Backfills funktionieren weiterhin.
-- [ ] Beide Integrationswege liefern dieselben Regeln an den Executor. Fehler
+- [x] Beide Integrationswege liefern dieselben Regeln an den Executor. Fehler
   verhindern einen regulären Abschluss des Hibernate-Bootstraps.
-- [ ] Die Dokumentation beschreibt Registrierung, Beispiele, Wiederanläufe,
+- [x] Die Dokumentation beschreibt Registrierung, Beispiele, Wiederanläufe,
   Versionssprünge und die Betriebsgrenzen. Die relevanten Tests und der bestehende
   Projektcheck `sbt check` bestehen.
 
@@ -330,3 +330,22 @@ Für große Tabellen und unterbrechungsfreie Deployments ist ein separates
 Arbeitspaket erforderlich: Schema zunächst kompatibel erweitern, Daten in
 fortsetzbaren Schritten befüllen, die schreibenden Anwendungen umstellen und erst
 anschließend die Pflichtfeldbedingungen durchsetzen.
+
+## Entscheidungen bei der Umsetzung
+
+- Quellspalten müssen den Typ der Zielspalte haben; Text (`varchar`, `text`) darf
+  Text füllen, ein zu langer Wert lässt die Migration scheitern statt zu kürzen.
+  `Concat` verbindet nur `varchar`- und `text`-Werte. Konstanten müssen ohne
+  Umwandlung oder Rundung passen (Länge, Wertebereich, Nachkommastellen,
+  Sekundenbruchteile). Large-Object-Spalten sind weder Ziel noch Quelle.
+- Eine noch nicht dokumentierte Regel, deren Spalte in diesem Start nicht zum
+  Pflichtfeld wird, bleibt offen und wird in `MigrationResult.pendingBackfills`
+  gemeldet, auch bei unverändertem Schema; sie ist kein Fehler, weil ältere Regeln
+  für übersprungene Releases weiter mitgeliefert werden.
+- Übernahme und manuelle Migration dokumentieren eine offene Regel als
+  „übernommen“, wenn ihre Spalte im Zielzustand erstmals Pflichtfeld ist.
+- Die Regeln aller `BackfillProvider` gelten für beide Startwege; der explizite
+  Aufruf ergänzt sie um seinen Parameter `backfills`. Eine doppelte ID ist ein Fehler.
+- Das Hinzufügen einer Identity-Spalte zu einer bestehenden Tabelle bleibt
+  abgelehnt. Die CLI-Demo zeigt weiterhin nur eine Umbenennung ohne Datenbank.
+
