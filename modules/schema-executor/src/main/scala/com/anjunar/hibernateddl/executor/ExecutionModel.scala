@@ -32,7 +32,7 @@ enum Approval:
   case RenameBack(id: SchemaId)
   /** Migrate to a target equal to the model of this earlier revision. */
   case Revert(revision: Long)
-  /** Drop the unique key with this [[UniqueKeyRef.signature]] while its columns remain, so
+  /** Drop the unique key with this [[com.anjunar.hibernateddl.core.UniqueKeyRef.signature]] while its columns remain, so
     * that they may hold duplicates. Neither a drop nor a revert approval permits this.
     */
   case DropUniqueKey(signature: String)
@@ -156,7 +156,7 @@ trait CatalogLookups:
     * from changing; each described for a message. Neither a migration nor a preview removes them.
     */
   def typeChangeBlockers(connection: Connection, table: QualifiedName, column: SqlIdentifier): Vector[String]
-  /** The SQL of an operation that [[SchemaOperation.boundAtExecution]], naming the one database
+  /** The SQL of an operation that [[com.anjunar.hibernateddl.core.SchemaOperation.boundAtExecution]], naming the one database
     * object that matches its definition, or why there is none: no match, several, or an object
     * that depends on it, such as a foreign key.
     */
