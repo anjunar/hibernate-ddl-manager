@@ -49,6 +49,8 @@ lazy val schemaIntegration = (project in file("modules/schema-integration"))
   .settings(commonSettings)
   .settings(
     name := "schema-integration",
+    // Hibernate reads and writes JSON columns through Jackson.
+    libraryDependencies += "com.fasterxml.jackson.core" % "jackson-databind" % "2.22.3" % Test,
     Test / fork := true,
     Test / parallelExecution := false
   )

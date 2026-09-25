@@ -117,6 +117,31 @@ class SchemaMigrationIntegrationSuite extends TestPostgres:
     }
   }
 
+  test("Hibernate writes and reads JSON columns, also an embeddable stored as one document") {
+    withDatabase { ds =>
+      withSessionFactory(ds, Seq(classOf[Settings]), enabled, validate) { factory =>
+        factory.inTransaction { session =>
+          val settings = new Settings
+          settings.id = 1L
+          settings.values = java.util.Map.of("size", Integer.valueOf(3))
+          settings.tags = java.util.List.of("a", "b")
+          settings.raw = "{\"free\": true}"
+          settings.preferences = new Preferences
+          settings.preferences.theme = "dark"
+          session.persist(settings)
+        }
+        factory.inTransaction { session =>
+          val settings = session.find(classOf[Settings], 1L)
+          assertEquals(settings.values.get("size"), Integer.valueOf(3))
+          assertEquals(settings.tags, java.util.List.of("a", "b"))
+          assertEquals(settings.preferences.theme, "dark")
+        }
+      }
+      assertEquals(scalar(ds, "SELECT concat_ws(' ', tags ->> 1, raw ->> 'free', pg_typeof(preferences)) FROM public.settings"),
+        "b true jsonb")
+    }
+  }
+
   test("settings carry approvals: removing an entity drops its table and sequence only when approved") {
     withDatabase { ds =>
       withSessionFactory(ds, entities, enabled)(_ => ())
