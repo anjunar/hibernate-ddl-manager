@@ -14,6 +14,11 @@ import scala.util.control.NonFatal
   * and dropping a table, column or sequence deletes data: each is refused unless the options
   * carry an explicit [[Approval]] for it.
   *
+  * A column that becomes required gets its NULLs filled by the one registered [[Backfill]]
+  * that targets it and is not recorded yet; what is left must be no NULL at all. Each backfill
+  * is recorded once, with its definition's checksum, and never runs again; a recorded one with
+  * another definition blocks the start, even when the schema is already applied.
+  *
   * A successful return permits startup. Any exception must prevent server startup.
   * Once the transaction has ended with a known outcome, the connection gets back the
   * auto-commit mode and isolation level it arrived with, so a pool never hands it on
@@ -28,8 +33,8 @@ final class JdbcMigrationExecutor(
   private val EmptyModel = SchemaModel(Vector.empty)
   private val EmptyFingerprint = SchemaFingerprint.of(EmptyModel)
 
-  def migrate(dataSource: DataSource, target: SchemaModel): MigrationResult =
-    val targetFingerprint = prepare(target)
+  def migrate(dataSource: DataSource, target: SchemaModel, backfills: Vector[Backfill] = Vector.empty): MigrationResult =
+    val targetFingerprint = prepare(target, backfills)
     var connection: Connection = null
     var isolation = Connection.TRANSACTION_NONE
     var transactionStarted = false
@@ -47,35 +52,7 @@ final class JdbcMigrationExecutor(
       connection.setTransactionIsolation(Connection.TRANSACTION_READ_COMMITTED)
       backend.acquireLock(connection, options)
       backend.initializeHistory(connection)
-      val history = verified(backend.readHistory(connection))
-      val revision = history.lastOption.fold(0L)(_.entry.revision)
-      val previous = history.lastOption.fold(EmptyModel)(_.model)
-      val previousFingerprint = history.lastOption.fold(EmptyFingerprint)(_.entry.targetFingerprint)
-      val result =
-        if targetFingerprint == previousFingerprint then
-          validateDatabase(connection, target, "Applied schema", TableLock.Shared)
-          MigrationResult(revision, MigrationStatus.AlreadyApplied, 0)
-        else
-          history.find(_.entry.targetFingerprint == targetFingerprint).foreach { older =>
-            if !options.approvals.contains(Approval.Revert(older.entry.revision)) then
-              refuse(Vector(s"Target schema equals revision ${older.entry.revision}, but the database is at revision " +
-                s"$revision; a server with an older schema must not start after a newer migration. If returning to " +
-                s"it is intended, approve it with Approval.Revert(${older.entry.revision})"))
-          }
-          val reused = retired(history, target)
-          if reused.nonEmpty then refuse(reused)
-          val existing = if history.isEmpty then backend.existingRelations(connection, target) else Vector.empty
-          if existing.nonEmpty then adopt(connection, target, targetFingerprint, existing)
-          else if options.acceptManualMigration.nonEmpty then
-            acceptManual(connection, history, target, targetFingerprint)
-          else
-            val statements = plan(history, previous, target, targetFingerprint)
-            validateDatabase(connection, previous, "Previous schema")
-            statements.foreach(sql => execute(connection, sql))
-            validateDatabase(connection, target, "Target schema")
-            backend.recordHistory(connection, HistoryEntry(revision + 1, previousFingerprint, targetFingerprint,
-              SchemaModelJson.encode(target), statements))
-            MigrationResult(revision + 1, MigrationStatus.Applied, statements.size)
+      val result = migrateLocked(connection, target, targetFingerprint, backfills)
       commitAttempted = true
       connection.commit()
       committed = true
@@ -118,6 +95,99 @@ final class JdbcMigrationExecutor(
           case NonFatal(closeError) =>
             if primaryFailure != null then primaryFailure.addSuppressed(closeError)
 
+  /** Everything between the lock and the commit. */
+  private def migrateLocked(
+      connection: Connection,
+      target: SchemaModel,
+      targetFingerprint: String,
+      backfills: Vector[Backfill]
+  ): MigrationResult =
+    val history = verified(backend.readHistory(connection))
+    val records = verifiedBackfills(history, backend.readBackfills(connection), backfills)
+    val pending = backfills.filterNot(backfill => records.exists(_.id == backfill.id))
+    val revision = history.lastOption.fold(0L)(_.entry.revision)
+    val previous = history.lastOption.fold(EmptyModel)(_.model)
+    val previousFingerprint = history.lastOption.fold(EmptyFingerprint)(_.entry.targetFingerprint)
+    if targetFingerprint == previousFingerprint then
+      validateDatabase(connection, target, "Applied schema", TableLock.Shared)
+      MigrationResult(revision, MigrationStatus.AlreadyApplied, 0, pendingBackfills = pending.map(_.id))
+    else
+      history.find(_.entry.targetFingerprint == targetFingerprint).foreach { older =>
+        if !options.approvals.contains(Approval.Revert(older.entry.revision)) then
+          refuse(Vector(s"Target schema equals revision ${older.entry.revision}, but the database is at revision " +
+            s"$revision; a server with an older schema must not start after a newer migration. If returning to " +
+            s"it is intended, approve it with Approval.Revert(${older.entry.revision})"))
+      }
+      val reused = retired(history, target)
+      if reused.nonEmpty then refuse(reused)
+      val existing = if history.isEmpty then backend.existingRelations(connection, target) else Vector.empty
+      if existing.nonEmpty then adopt(connection, target, targetFingerprint, existing, pending)
+      else if options.acceptManualMigration.nonEmpty then
+        acceptManual(connection, history, target, targetFingerprint, pending)
+      else
+        val planned = plan(history, previous, target, targetFingerprint, records, pending)
+        validateDatabase(connection, previous, "Previous schema")
+        val filled = planned.steps.flatMap(step => run(connection, step))
+        validateDatabase(connection, target, "Target schema")
+        val statements = planned.steps.collect {
+          case Step.Statement(sql) => sql
+          case Step.Fill(_, statement) => statement.sql
+        }
+        backend.recordHistory(connection, HistoryEntry(revision + 1, previousFingerprint, targetFingerprint,
+          SchemaModelJson.encode(target), statements))
+        val outcomes = filled.map((backfill, rows) => (backfill, BackfillResult.Executed, Some(rows))) ++
+          planned.created.map(backfill => (backfill, BackfillResult.NotRequiredOnCreation, None))
+        MigrationResult(revision + 1, MigrationStatus.Applied, statements.size,
+          recordBackfills(connection, outcomes, revision + 1, previousFingerprint, targetFingerprint),
+          pending.map(_.id).filterNot(id => outcomes.exists(_._1.id == id)))
+
+  /** Checks every recorded backfill against the schema history and each registered backfill
+    * against its record: a recorded ID must keep its definition.
+    */
+  private def verifiedBackfills(
+      history: Vector[Applied],
+      records: Vector[BackfillRecord],
+      backfills: Vector[Backfill]
+  ): Vector[BackfillRecord] =
+    records.foreach { record =>
+      def corrupt(reason: String): Nothing = throw new IllegalStateException(
+        s"Backfill history is inconsistent at backfill '${record.id}': $reason; refusing to migrate")
+      if record.format != BackfillChecksum.Format then
+        corrupt(s"its definition format ${record.format} is unknown to this version")
+      val applied = if record.revision < 1 || record.revision > history.size then None else Some(history(record.revision.toInt - 1))
+      if !applied.exists(a => a.entry.previousFingerprint == record.previousFingerprint &&
+          a.entry.targetFingerprint == record.targetFingerprint) then
+        corrupt(s"revision ${record.revision} with its fingerprints is not in the schema history")
+      if record.updatedRows.nonEmpty != (record.result == BackfillResult.Executed) then
+        corrupt("only an executed backfill has a count of updated rows")
+    }
+    val changed = backfills.flatMap { backfill =>
+      records.find(_.id == backfill.id).filter(_.checksum != BackfillChecksum.of(backfill)).map { record =>
+        s"Backfill '${backfill.id}' was recorded in revision ${record.revision} with another definition; " +
+          "a changed rule needs a new ID"
+      }
+    }
+    if changed.nonEmpty then refuse(changed)
+    records
+
+  private def recordBackfills(
+      connection: Connection,
+      outcomes: Vector[(Backfill, BackfillResult, Option[Long])],
+      revision: Long,
+      previousFingerprint: String,
+      targetFingerprint: String
+  ): Vector[BackfillOutcome] =
+    outcomes.sortBy(_._1.id).map { (backfill, result, rows) =>
+      backend.recordBackfill(connection, BackfillRecord(backfill.id, BackfillChecksum.Format, BackfillChecksum.of(backfill),
+        backfill.target, revision, previousFingerprint, targetFingerprint, result, rows))
+      BackfillOutcome(backfill.id, result, rows)
+    }
+
+  /** Required columns of the target that were missing or nullable before. */
+  private def newlyRequired(previous: SchemaModel, target: SchemaModel): Set[SchemaId] =
+    val before = previous.tables.flatMap(_.columns).map(column => column.id -> column.nullable).toMap
+    target.tables.flatMap(_.columns).filter(column => !column.nullable && before.getOrElse(column.id, true)).map(_.id).toSet
+
   /** Gives the connection back the auto-commit mode and isolation level it arrived with; only
     * after the transaction ended, so nothing pending can be committed. Returns the failure.
     */
@@ -134,7 +204,7 @@ final class JdbcMigrationExecutor(
     catch case NonFatal(abortError) => failure.addSuppressed(abortError)
 
   /** Checks everything that does not depend on the database and returns the target fingerprint. */
-  private def prepare(target: SchemaModel): String =
+  private def prepare(target: SchemaModel, backfills: Vector[Backfill]): String =
     try
       val errors = Vector.newBuilder[String]
       val maximumTimeoutMillis = 24 * 60 * 60 * 1000
@@ -143,6 +213,7 @@ final class JdbcMigrationExecutor(
       if options.statementTimeoutMillis <= 0 || options.statementTimeoutMillis > maximumTimeoutMillis then
         errors += "Statement timeout must be greater than zero and at most 24 hours"
       errors ++= (SchemaValidation.validate(target) ++ backend.validate(target)).distinct.map("Target schema: " + _)
+      errors ++= BackfillValidation.validate(backfills)
       val messages = errors.result()
       if messages.nonEmpty then throw new MigrationException(messages.mkString("; "), FailureState.NotStarted)
       SchemaFingerprint.of(target)
@@ -161,7 +232,8 @@ final class JdbcMigrationExecutor(
       connection: Connection,
       target: SchemaModel,
       targetFingerprint: String,
-      existing: Vector[QualifiedName]
+      existing: Vector[QualifiedName],
+      pending: Vector[Backfill]
   ): MigrationResult =
     def show(names: Vector[QualifiedName]) = names.map(_.display).distinct.sorted.mkString(", ")
     if !options.adoptExistingSchema then
@@ -173,7 +245,26 @@ final class JdbcMigrationExecutor(
     validateDatabase(connection, target, "Adopted schema")
     backend.recordHistory(connection, HistoryEntry(1, EmptyFingerprint, targetFingerprint,
       SchemaModelJson.encode(target), Vector.empty))
-    MigrationResult(1, MigrationStatus.Adopted, 0)
+    adopted(connection, EmptyModel, target, pending, 1, EmptyFingerprint, targetFingerprint, MigrationStatus.Adopted)
+
+  /** Records the pending backfills whose columns the database already has as required: the
+    * backfill did not run, the database was found that way.
+    */
+  private def adopted(
+      connection: Connection,
+      previous: SchemaModel,
+      target: SchemaModel,
+      pending: Vector[Backfill],
+      revision: Long,
+      previousFingerprint: String,
+      targetFingerprint: String,
+      status: MigrationStatus
+  ): MigrationResult =
+    val required = newlyRequired(previous, target)
+    val (found, left) = pending.partition(backfill => required.contains(backfill.target))
+    val outcomes = recordBackfills(connection, found.map((_, BackfillResult.Adopted, None)), revision, previousFingerprint,
+      targetFingerprint)
+    MigrationResult(revision, status, 0, outcomes, left.map(_.id))
 
   /** Decodes every stored model and checks that the entries form one unbroken chain. */
   private def verified(entries: Vector[HistoryEntry]): Vector[Applied] =
@@ -197,7 +288,8 @@ final class JdbcMigrationExecutor(
       connection: Connection,
       history: Vector[Applied],
       target: SchemaModel,
-      targetFingerprint: String
+      targetFingerprint: String,
+      pending: Vector[Backfill]
   ): MigrationResult =
     val accepted = options.acceptManualMigration.get
     if accepted != targetFingerprint then
@@ -218,7 +310,8 @@ final class JdbcMigrationExecutor(
     val latest = history.last.entry
     backend.recordHistory(connection, HistoryEntry(latest.revision + 1, latest.targetFingerprint, targetFingerprint,
       SchemaModelJson.encode(target), Vector.empty))
-    MigrationResult(latest.revision + 1, MigrationStatus.ManuallyMigrated, 0)
+    adopted(connection, previous, target, pending, latest.revision + 1, latest.targetFingerprint, targetFingerprint,
+      MigrationStatus.ManuallyMigrated)
 
   /** A table, column or sequence that an earlier revision had and the latest does not was
     * dropped. Its ID is retired: reusing it, for example copied from the version history of the
@@ -235,12 +328,25 @@ final class JdbcMigrationExecutor(
       }
     }
 
+  /** One step of a migration: a DDL statement, a backfill filling a column's NULLs, or a check
+    * that a column has no NULL left before it becomes required.
+    */
+  private enum Step:
+    case Statement(sql: String)
+    case Fill(backfill: Backfill, statement: BoundStatement)
+    case NoNulls(columnId: SchemaId, column: String, query: String, hint: String)
+
+  /** The steps, and the pending backfills whose columns new tables create required. */
+  private final case class Planned(steps: Vector[Step], created: Vector[Backfill])
+
   private def plan(
       history: Vector[Applied],
       previous: SchemaModel,
       target: SchemaModel,
-      targetFingerprint: String
-  ): Vector[String] =
+      targetFingerprint: String,
+      records: Vector[BackfillRecord],
+      pending: Vector[Backfill]
+  ): Planned =
     val operations = DiffEngine.diff(previous, target).fold(errors => refuse(errors :+
       ("To migrate by hand instead, change the database to exactly the target schema and start once with " +
         s"acceptManualMigration = \"$targetFingerprint\"")), identity)
@@ -276,9 +382,56 @@ final class JdbcMigrationExecutor(
     val rejectedRisks = operations.map(_.risk).filterNot(options.allowedRisks.contains).distinct
     if rejectedRisks.nonEmpty then refuse(Vector(s"Migration risks are not allowed: ${rejectedRisks.mkString(", ")}"))
     val statements = backend.render(operations).fold(refuse, identity)
-    if statements.exists(sql => sql == null || sql.trim.isEmpty) || (operations.nonEmpty && statements.isEmpty) then
-      refuse(Vector("Backend returned an empty SQL statement or omitted the migration SQL"))
-    statements
+    if statements.exists(sql => sql == null || sql.trim.isEmpty) || statements.size != operations.size then
+      refuse(Vector("Backend must render exactly one non-empty SQL statement per operation"))
+    val fills = planFills(previous, target, operations, pending)
+    val created = operations.collect { case SchemaOperation.CreateTable(table) => table.columns.filterNot(_.nullable).map(_.id) }
+      .flatten.toSet
+    val steps = operations.zip(statements).flatMap {
+      case (SchemaOperation.SetNotNull(_, table, columnId, column), sql) =>
+        val fill = fills.get(columnId)
+        val hint = fill.map((backfill, _) => s"backfill '${backfill.id}' left them NULL")
+          .orElse(records.find(_.target == columnId).map(record => s"backfill '${record.id}' was recorded in revision " +
+            s"${record.revision} and does not run again; a new rule for it needs a new ID"))
+          .getOrElse("register a backfill for it or fill the rows before the migration")
+        fill.toVector.map(Step.Fill(_, _)) ++ Vector(Step.NoNulls(columnId, s"${table.display}.${column.value}", backend.nullCount(table, column),
+          hint), Step.Statement(sql))
+      case (_, sql) => Vector(Step.Statement(sql))
+    }
+    Planned(steps, pending.filter(backfill => created.contains(backfill.target)))
+
+  /** Resolves the one pending backfill for each column that becomes required in an existing
+    * table. The columns it may read are the target table's, plus the previous ones that are
+    * dropped only after the fill.
+    */
+  private def planFills(
+      previous: SchemaModel,
+      target: SchemaModel,
+      operations: Vector[SchemaOperation],
+      pending: Vector[Backfill]
+  ): Map[SchemaId, (Backfill, BoundStatement)] =
+    val required = operations.collect { case operation: SchemaOperation.SetNotNull => operation.columnId -> operation }.toMap
+    val applicable = pending.filter(backfill => required.contains(backfill.target))
+    val conflicts = applicable.groupBy(_.target).toVector.sortBy(_._1.value).collect {
+      case (column, rules) if rules.size > 1 =>
+        s"Backfills ${rules.map(rule => s"'${rule.id}'").sorted.mkString(", ")} all fill column '${column.value}'; " +
+          "only one may apply"
+    }
+    if conflicts.nonEmpty then refuse(conflicts)
+    val filled = applicable.map(_.target).toSet
+    val resolved = applicable.map { backfill =>
+      val operation = required(backfill.target)
+      val table = target.tables.find(_.id == operation.tableId).get
+      val earlier = previous.tables.find(_.id == operation.tableId).toVector.flatMap(_.columns)
+        .filterNot(column => table.columns.exists(_.id == column.id))
+      val column = table.columns.find(_.id == backfill.target).get
+      BackfillValidation.resolve(backfill, table.name, column, table.columns ++ earlier, filled - backfill.target)
+        .flatMap(backend.renderFill)
+        .map(statement => backfill.target -> (backfill, statement))
+    }
+    val errors = resolved.flatMap(_.left.toOption).flatten
+    if errors.nonEmpty then refuse(errors)
+    resolved.flatMap(_.toOption).toMap
 
   private def refuse(messages: Vector[String]): Nothing =
     throw new IllegalStateException(messages.mkString("; "))
@@ -292,13 +445,37 @@ final class JdbcMigrationExecutor(
     val errors = backend.lockAndValidate(connection, model, lock)
     if errors.nonEmpty then throw new IllegalStateException(s"$label does not match database: ${errors.mkString("; ")}")
 
-  private def execute(connection: Connection, sql: String): Unit =
-    val statement = connection.createStatement()
+  /** Runs a step and returns the backfill it executed with the number of rows it filled. */
+  private def run(connection: Connection, step: Step): Option[(Backfill, Long)] = step match
+    case Step.Statement(sql) =>
+      withStatement(connection.createStatement())(_.execute(sql))
+      None
+    case Step.Fill(backfill, bound) =>
+      val rows = withStatement(connection.prepareStatement(bound.sql)) { statement =>
+        bound.parameters.zipWithIndex.foreach((value, index) => statement.setObject(index + 1, value))
+        statement.executeUpdate()
+      }
+      Some(backfill -> rows.toLong)
+    case Step.NoNulls(columnId, column, query, hint) =>
+      val nulls = withStatement(connection.createStatement()) { statement =>
+        val rows = statement.executeQuery(query)
+        try
+          if !rows.next() then throw new IllegalStateException(s"Counting NULLs of $column returned no row")
+          rows.getLong(1)
+        finally rows.close()
+      }
+      if nulls > 0 then
+        val rows = if nulls == 1 then "1 row holds" else s"$nulls rows hold"
+        refuse(Vector(s"Column '${columnId.value}' ($column) becomes required, but $rows NULL; $hint"))
+      None
+
+  /** Runs one statement with the statement timeout and closes it without masking a failure. */
+  private def withStatement[S <: java.sql.Statement, A](open: => S)(body: S => A): A =
+    val statement = open
     var primaryFailure: Throwable = null
     try
       statement.setQueryTimeout(((options.statementTimeoutMillis.toLong + 999) / 1000).toInt)
-      statement.execute(sql)
-      ()
+      body(statement)
     catch
       case NonFatal(error) =>
         primaryFailure = error

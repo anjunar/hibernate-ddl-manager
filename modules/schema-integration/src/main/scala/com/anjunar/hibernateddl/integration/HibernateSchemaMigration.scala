@@ -1,9 +1,11 @@
 package com.anjunar.hibernateddl.integration
 
+import com.anjunar.hibernateddl.core.Backfill
 import com.anjunar.hibernateddl.executor.*
 import com.anjunar.hibernateddl.hibernate.HibernateSchemaSource
 import com.anjunar.hibernateddl.postgresql.PostgreSqlMigrationBackend
 import org.hibernate.boot.Metadata
+import org.hibernate.boot.registry.classloading.spi.ClassLoaderService
 import org.hibernate.boot.spi.MetadataImplementor
 import org.hibernate.dialect.PostgreSQLDialect
 import org.hibernate.engine.config.spi.ConfigurationService
@@ -19,18 +21,36 @@ import scala.util.control.NonFatal
   * The metadata must use a PostgreSQL dialect, and Hibernate's own schema management may at
   * most validate: `hibernate.hbm2ddl.auto` and
   * `jakarta.persistence.schema-generation.database.action` must be unset, `none` or `validate`.
-  * The `hibernate.ddl_manager.*` settings of [[MigrationSettings]] refine `options`.
+  * The `hibernate.ddl_manager.*` settings of [[MigrationSettings]] refine `options`. The
+  * backfills are those of every [[BackfillProvider]] plus `backfills`; an ID found twice is
+  * refused.
   */
 object HibernateSchemaMigration:
   private val SchemaActions = Vector("hibernate.hbm2ddl.auto", "jakarta.persistence.schema-generation.database.action")
 
-  def migrate(metadata: Metadata, dataSource: DataSource, options: ExecutionOptions = ExecutionOptions()): MigrationResult =
+  def migrate(
+      metadata: Metadata,
+      dataSource: DataSource,
+      options: ExecutionOptions = ExecutionOptions(),
+      backfills: Vector[Backfill] = Vector.empty
+  ): MigrationResult =
     val settings = configuration(metadata)
     val executionOptions = MigrationSettings.options(settings, options).fold(refuse, identity)
     val errors = checkSetup(metadata, settings)
     if errors.nonEmpty then refuse(errors)
     val target = HibernateSchemaSource.read(metadata).fold(errors => refuse(errors.map("Entity mapping: " + _)), identity)
-    JdbcMigrationExecutor(PostgreSqlMigrationBackend, executionOptions).migrate(dataSource, target)
+    JdbcMigrationExecutor(PostgreSqlMigrationBackend, executionOptions).migrate(dataSource, target,
+      provided(metadata) ++ backfills)
+
+  /** The backfills of every provider on the application's class path. */
+  private[integration] def provided(metadata: Metadata): Vector[Backfill] =
+    val registry = metadata match
+      case implementor: MetadataImplementor => implementor.getMetadataBuildingOptions.getServiceRegistry
+      case other => refuse(Vector(s"Unsupported metadata implementation ${other.getClass.getName}"))
+    try
+      registry.requireService(classOf[ClassLoaderService]).loadJavaServices(classOf[BackfillProvider]).asScala.toVector
+        .sortBy(_.getClass.getName).flatMap(_.backfills)
+    catch case NonFatal(error) => refuse(Vector(s"Loading the backfill providers failed: ${error.getMessage}"))
 
   private[integration] def configuration(metadata: Metadata): Map[String, Any] =
     metadata match

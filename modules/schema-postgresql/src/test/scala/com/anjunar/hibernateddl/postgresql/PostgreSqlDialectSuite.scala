@@ -37,6 +37,19 @@ class PostgreSqlDialectSuite extends munit.FunSuite:
     )
   }
 
+  test("nullability changes render per column; NULLs are counted") {
+    val orders = name("order", Some("sales"))
+    assertEquals(PostgreSqlDialect.render(Vector(
+      SetNotNull(tableId, orders, columnId, SqlIdentifier("state\"code")),
+      DropNotNull(tableId, orders, columnId, SqlIdentifier("note"))
+    )), Right(Vector(
+      "ALTER TABLE \"sales\".\"order\" ALTER COLUMN \"state\"\"code\" SET NOT NULL;",
+      "ALTER TABLE \"sales\".\"order\" ALTER COLUMN \"note\" DROP NOT NULL;"
+    )))
+    assertEquals(PostgreSqlDialect.nullCount(orders, SqlIdentifier("note")),
+      "SELECT count(*) FROM \"sales\".\"order\" WHERE \"note\" IS NULL")
+  }
+
   test("drops render without CASCADE; all tables go in one statement") {
     val orders = name("order", Some("sales"))
     assertEquals(PostgreSqlDialect.render(Vector(

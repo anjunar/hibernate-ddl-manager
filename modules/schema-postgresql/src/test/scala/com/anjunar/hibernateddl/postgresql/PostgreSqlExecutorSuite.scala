@@ -74,13 +74,15 @@ class PostgreSqlExecutorSuite extends TestPostgres:
     }
   }
 
-  test("adding a non-null column to existing rows is refused before DDL") {
+  test("a required column for existing rows without a backfill rolls back together with its addition") {
     withDatabase { ds =>
       fixture(ds)
       val required = ColumnModel(SchemaId("USER_BIO"), SqlIdentifier("biography"), SqlType.Text, false)
       val unsafe = SchemaModel(Vector(users.copy(columns = users.columns :+ required)))
       assert(intercept[MigrationException](executor.migrate(ds, unsafe)).getMessage.contains("backfill"))
       assertEquals(scalar(ds, "SELECT username FROM public.users"), "patrick")
+      assertEquals(scalar(ds, "SELECT to_regclass('public.users') IS NOT NULL AND NOT EXISTS (SELECT 1 FROM pg_attribute " +
+        "WHERE attrelid = 'public.users'::regclass AND attname = 'biography')"), "t")
       assertEquals(revisions(ds), "1")
     }
   }
@@ -174,6 +176,33 @@ class PostgreSqlExecutorSuite extends TestPostgres:
       }
       assertEquals(scalar(ds, "SELECT count(*) FROM public.users"), "3")
       assertEquals(impatient.migrate(ds, target).status, MigrationStatus.Applied)
+    }
+  }
+
+  test("a column becomes required when no row holds NULL, and optional again") {
+    val nick = ColumnModel(SchemaId("USER_NICK"), SqlIdentifier("nick"), SqlType.Text)
+    def withNick(nullable: Boolean) = SchemaModel(Vector(users.copy(columns = Vector(login, nick.copy(nullable = nullable)))))
+    def nickColumns(ds: DataSource) =
+      scalar(ds, "SELECT count(*) FROM pg_attribute WHERE attrelid = 'public.users'::regclass AND attname = 'nick'")
+    withDatabase { ds =>
+      fixture(ds)
+      val refused = intercept[MigrationException](executor.migrate(ds, withNick(false)))
+      assertEquals(refused.state, FailureState.RolledBack)
+      assert(refused.getMessage.contains("Column 'USER_NICK' (public.users.nick) becomes required, but 1 row holds NULL"),
+        refused.getMessage)
+      assertEquals(nickColumns(ds), "0")
+      assertEquals(executor.migrate(ds, withNick(true)).revision, 2L)
+      execute(ds, "UPDATE public.users SET nick = 'pat'")
+      assertEquals(executor.migrate(ds, withNick(false)), MigrationResult(3, MigrationStatus.Applied, 1))
+      intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.users VALUES ('ada', NULL)"))
+      val loosen = new JdbcMigrationExecutor(PostgreSqlMigrationBackend, ExecutionOptions(approvals = Set(Approval.Revert(2))))
+      assertEquals(loosen.migrate(ds, withNick(true)), MigrationResult(4, MigrationStatus.Applied, 1))
+      execute(ds, "INSERT INTO public.users VALUES ('ada', NULL)")
+    }
+    withDatabase { ds =>
+      assertEquals(executor.migrate(ds, initial).status, MigrationStatus.Applied)
+      assertEquals(executor.migrate(ds, withNick(false)), MigrationResult(2, MigrationStatus.Applied, 2))
+      assertEquals(scalar(ds, "SELECT attnotnull FROM pg_attribute WHERE attrelid = 'public.users'::regclass AND attname = 'nick'"), "t")
     }
   }
 
@@ -824,6 +853,137 @@ class PostgreSqlExecutorSuite extends TestPostgres:
       assert(copied.getMessage.contains("public.users of the previous schema still exist"), copied.getMessage)
       execute(ds, "DROP TABLE public.users")
       assertEquals(manual(target).migrate(ds, target), MigrationResult(2, MigrationStatus.ManuallyMigrated, 0))
+    }
+  }
+
+  private val public = Some(SqlIdentifier("public"))
+  private val personId = ColumnModel(SchemaId("PEOPLE_ID"), SqlIdentifier("id"), SqlType.BigInt, false)
+  private val firstName = ColumnModel(SchemaId("PEOPLE_FIRST"), SqlIdentifier("first_name"), SqlType.Varchar(100))
+  private val lastName = ColumnModel(SchemaId("PEOPLE_LAST"), SqlIdentifier("last_name"), SqlType.Varchar(100))
+  private val display = ColumnModel(SchemaId("PEOPLE_DISPLAY"), SqlIdentifier("Display Name"), SqlType.Varchar(255), false)
+  private def people(columns: ColumnModel*) = SchemaModel(Vector(TableModel(SchemaId("PEOPLE"),
+    QualifiedName(SqlIdentifier("people"), public), personId +: columns.toVector, Vector(personId.id))))
+  private val strange = "O'Brien; DROP TABLE people --"
+  private val displayRule = Backfill.fillNulls("people-display-v1", display.id, BackfillTrigger.BecomesRequired,
+    BackfillValue.coalesce(
+      BackfillValue.concat(BackfillValue.column(firstName.id), BackfillValue.literal(" "), BackfillValue.column(lastName.id)),
+      BackfillValue.column(firstName.id),
+      BackfillValue.literal(strange)))
+  private def withPeople[A](body: DataSource => A): A =
+    withDatabase { ds =>
+      assertEquals(executor.migrate(ds, people(firstName, lastName)).status, MigrationStatus.Applied)
+      execute(ds, "INSERT INTO public.people VALUES (1, 'Ada', 'Lovelace'), (2, 'Grace', NULL), (3, NULL, NULL)")
+      body(ds)
+    }
+  private def displays(ds: DataSource) =
+    scalar(ds, "SELECT string_agg(\"Display Name\", '|' ORDER BY id) FROM public.people")
+
+  test("a backfill fills a new required column from other columns and bound constants, then is recorded once") {
+    withPeople { ds =>
+      val target = people(firstName, lastName, display)
+      val result = executor.migrate(ds, target, Vector(displayRule))
+      assertEquals(result, MigrationResult(2, MigrationStatus.Applied, 3,
+        Vector(BackfillOutcome("people-display-v1", BackfillResult.Executed, Some(3L)))))
+      assertEquals(displays(ds), s"Ada Lovelace|Grace|$strange")
+      assertEquals(scalar(ds, "SELECT attnotnull FROM pg_attribute WHERE attrelid = 'public.people'::regclass " +
+        "AND attname = 'Display Name'"), "t")
+      assertEquals(scalar(ds, "SELECT concat_ws(' ', backfill_id, result, updated_rows, revision, target_column) " +
+        "FROM __hibernate_ddl.backfill_history"), "people-display-v1 executed 3 2 PEOPLE_DISPLAY")
+      assertEquals(scalar(ds, "SELECT statements[2] FROM __hibernate_ddl.schema_history WHERE revision = 2"),
+        "UPDATE \"public\".\"people\" SET \"Display Name\" = COALESCE((\"first_name\" || CAST(? AS text) || " +
+          "\"last_name\"), \"first_name\", CAST(? AS varchar(255))) WHERE \"Display Name\" IS NULL")
+      assertEquals(executor.migrate(ds, target, Vector(displayRule)).status, MigrationStatus.AlreadyApplied)
+      val changed = Backfill.fillNulls("people-display-v1", display.id, BackfillTrigger.BecomesRequired,
+        BackfillValue.literal("Unknown"))
+      assert(intercept[MigrationException](executor.migrate(ds, target, Vector(changed))).getMessage
+        .contains("was recorded in revision 2 with another definition"))
+    }
+  }
+
+  test("a column that becomes required keeps its values; only NULL rows are filled") {
+    withPeople { ds =>
+      val rule = Backfill.fillNulls("people-first-v1", firstName.id, BackfillTrigger.BecomesRequired, BackfillValue.literal("?"))
+      assertEquals(executor.migrate(ds, people(firstName.copy(nullable = false), lastName), Vector(rule)).backfills,
+        Vector(BackfillOutcome("people-first-v1", BackfillResult.Executed, Some(1L))))
+      assertEquals(scalar(ds, "SELECT string_agg(first_name, '|' ORDER BY id) FROM public.people"), "Ada|Grace|?")
+    }
+  }
+
+  test("a server that skipped releases fills from columns that the same migration drops afterwards") {
+    withPeople { ds =>
+      val v3 = people(display)
+      val drops = new JdbcMigrationExecutor(PostgreSqlMigrationBackend,
+        ExecutionOptions(approvals = Set(Approval.Drop(firstName.id), Approval.Drop(lastName.id))))
+      assertEquals(drops.migrate(ds, v3, Vector(displayRule)).backfills.map(_.updatedRows), Vector(Some(3L)))
+      assertEquals(displays(ds), s"Ada Lovelace|Grace|$strange")
+      assertEquals(scalar(ds, "SELECT count(*) FROM pg_attribute WHERE attrelid = 'public.people'::regclass AND attnum > 0 " +
+        "AND NOT attisdropped"), "2")
+    }
+  }
+
+  test("a backfill reads a source column under the name a rename in the same migration gives it") {
+    withPeople { ds =>
+      val renamedFirst = firstName.copy(name = SqlIdentifier("given_name"))
+      assertEquals(executor.migrate(ds, people(renamedFirst, lastName, display), Vector(displayRule)).backfills.size, 1)
+      assertEquals(displays(ds), s"Ada Lovelace|Grace|$strange")
+      assertEquals(scalar(ds, "SELECT string_agg(given_name, '|' ORDER BY id) FROM public.people"), "Ada|Grace")
+    }
+  }
+
+  test("unique, check and foreign key violations of the filled values roll back the schema, the data and both histories") {
+    val unique = people(firstName, lastName, display).tables.head
+    val teamId = ColumnModel(SchemaId("TEAM_ID"), SqlIdentifier("id"), SqlType.BigInt, false)
+    val teams = TableModel(SchemaId("TEAM"), QualifiedName(SqlIdentifier("teams"), public), Vector(teamId), Vector(teamId.id))
+    val team = ColumnModel(SchemaId("PEOPLE_TEAM"), SqlIdentifier("team_id"), SqlType.BigInt, false)
+    val member = people(firstName, lastName, team).tables.head
+      .copy(foreignKeys = Vector(ForeignKeyModel(Vector(team.id), teams.id, teams.primaryKey)))
+    Vector(
+      SchemaModel(Vector(unique.copy(uniqueKeys = Vector(UniqueKeyModel(Vector(display.id)))))) ->
+        Backfill.fillNulls("people-display-v1", display.id, BackfillTrigger.BecomesRequired, BackfillValue.literal("same")),
+      people(firstName, lastName, display.copy(check = Some(ColumnCheck.AllowedValues(Vector("A", "B"))))) ->
+        Backfill.fillNulls("people-display-v1", display.id, BackfillTrigger.BecomesRequired, BackfillValue.literal("C")),
+      SchemaModel(Vector(member, teams)) ->
+        Backfill.fillNulls("people-team-v1", team.id, BackfillTrigger.BecomesRequired, BackfillValue.literal(99L))
+    ).foreach { (target, rule) =>
+      withPeople { ds =>
+        assertEquals(intercept[MigrationException](executor.migrate(ds, target, Vector(rule))).state, FailureState.RolledBack)
+        assertEquals(revisions(ds), "1")
+        assertEquals(scalar(ds, "SELECT count(*) FROM __hibernate_ddl.backfill_history"), "0")
+        assertEquals(scalar(ds, "SELECT count(*) FROM pg_attribute WHERE attrelid = 'public.people'::regclass " +
+          "AND attname IN ('Display Name', 'team_id')"), "0")
+      }
+    }
+  }
+
+  test("two concurrent server starts record a backfill exactly once; a new table records it as not required") {
+    withPeople { ds =>
+      val pool = Executors.newFixedThreadPool(2)
+      val start = new CountDownLatch(1)
+      try
+        val runs = Vector.fill(2)(pool.submit(new Callable[MigrationResult]:
+          def call(): MigrationResult =
+            start.await()
+            executor.migrate(ds, people(firstName, lastName, display), Vector(displayRule))
+        ))
+        start.countDown()
+        assertEquals(runs.map(_.get(15, TimeUnit.SECONDS).status).toSet,
+          Set(MigrationStatus.Applied, MigrationStatus.AlreadyApplied))
+        assertEquals(scalar(ds, "SELECT count(*) FROM __hibernate_ddl.backfill_history"), "1")
+      finally
+        pool.shutdownNow()
+        pool.awaitTermination(5, TimeUnit.SECONDS)
+    }
+    withDatabase { ds =>
+      assertEquals(executor.migrate(ds, people(firstName, lastName, display), Vector(displayRule)).backfills,
+        Vector(BackfillOutcome("people-display-v1", BackfillResult.NotRequiredOnCreation, None)))
+      assertEquals(scalar(ds, "SELECT result FROM __hibernate_ddl.backfill_history"), "not required on creation")
+    }
+  }
+
+  test("a backfill history table with another layout is refused, never altered") {
+    withDatabase { ds =>
+      execute(ds, "CREATE SCHEMA __hibernate_ddl; CREATE TABLE __hibernate_ddl.backfill_history (id text)")
+      assert(intercept[MigrationException](executor.migrate(ds, initial)).getMessage.contains("another version"))
     }
   }
 
