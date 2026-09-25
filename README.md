@@ -20,14 +20,16 @@ ALTER TABLE "public"."customer" RENAME COLUMN "nick_name" TO "alias";
 ```
 
 An ID consists of eight random hex digits, is assigned once and never changed. The
-[architecture](docs/architecture.md) describes the design, the rules and the open points.
+[architecture](docs/architecture.md) describes the design, the rules and the exact scope.
 
-Status: prototype for PostgreSQL 14+, not yet a production-ready migration tool. Entities
-with the common basic types, enums, generated keys (UUIDs, sequences, identity columns),
-inheritance (all three strategies), `@ManyToOne`, `@OneToOne` and `@ManyToMany` associations,
-element collections (sets, lists, ordered lists and maps), secondary tables, unique
-constraints and indexes can be mapped; `@Lob`, JSON columns and collections inside
-embeddables cannot.
+Status: 1.0 for PostgreSQL 14+ and Hibernate ORM 7.4, with a deliberately narrow scope.
+Entities with the common basic types, enums, generated keys (UUIDs, sequences, identity
+columns), inheritance (all three strategies), `@ManyToOne`, `@OneToOne` and `@ManyToMany`
+associations, element collections (sets, lists, ordered lists and maps), secondary tables,
+unique constraints and indexes can be mapped. The executor creates, renames, adds and, with
+explicit approval, drops; it adopts a matching database without history and accepts changes
+migrated by hand. Everything else, such as `@Lob`, JSON columns, collections inside
+embeddables or type changes, is refused with a message, never guessed.
 
 ## Getting started
 
@@ -118,6 +120,8 @@ the metadata and building the SessionFactory, with a DataSource whose connection
 enlisted in JTA:
 
 ```scala
+import com.anjunar.hibernateddl.integration.HibernateSchemaMigration
+
 val metadata = MetadataSources(registry).addAnnotatedClass(classOf[Customer]).buildMetadata()
 HibernateSchemaMigration.migrate(metadata, dataSource, ExecutionOptions(lockTimeoutMillis = 5000))
 val sessionFactory = metadata.buildSessionFactory()
