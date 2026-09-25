@@ -10,8 +10,8 @@ import org.hibernate.annotations.OnDeleteAction
 import org.hibernate.id.enhanced.SequenceStyleGenerator
 import org.hibernate.boot.model.relational.SqlStringGenerationContext
 import org.hibernate.boot.model.relational.internal.SqlStringGenerationContextImpl
-import org.hibernate.mapping.{Collection as CollectionMapping, Column, Component, GeneratorSettings, JoinedSubclass,
-  PersistentClass, Property, RootClass, SingleTableSubclass, Table, UnionSubclass}
+import org.hibernate.mapping.{Collection as CollectionMapping, Column, Component, GeneratorSettings, IdentifierCollection,
+  IndexedCollection, JoinedSubclass, PersistentClass, Property, RootClass, SingleTableSubclass, Table, UnionSubclass}
 
 import java.lang.reflect.AnnotatedElement
 import java.util.HexFormat
@@ -47,11 +47,13 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
   private val NumericType = """(?:numeric|decimal)\((\d+)(?:,\s*(\d+))?\)""".r
   // PostgreSQL maps float(1) to float(24) to real and float(25) to float(53) to double precision.
   private val FloatType = """float\((\d+)\)""".r
-  // The two CHECK forms Hibernate generates for enums. Hibernate does not escape quotes in the
-  // values, so a value containing one does not match and is reported instead of misread.
+  // The CHECK forms Hibernate generates for enums and for list order columns. Hibernate does not
+  // escape quotes in the values, so a value containing one does not match and is reported
+  // instead of misread.
   private val ColumnReference = """("(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_$]*)"""
   private val AllowedValuesCheck = s"""(?is)\\s*$ColumnReference\\s+in\\s*\\(\\s*('[^']*'(?:\\s*,\\s*'[^']*')*)\\s*\\)\\s*""".r
   private val RangeCheck = s"""(?is)\\s*$ColumnReference\\s+between\\s+(-?\\d+)\\s+and\\s+(-?\\d+)\\s*""".r
+  private val MinimumCheck = s"""(?is)\\s*$ColumnReference\\s*>=\\s*(-?\\d+)\\s*""".r
   private val Literal = """'([^']*)'""".r
 
   override def read(metadata: Metadata): Either[Vector[String], SchemaModel] =
@@ -255,10 +257,12 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
           .flatMap(sub => properties(sub.getProperties.asScala, sub))
         mapTable(label, s"entity $label", table, entityIds(entity), own ++ sharing)
 
-    /** A set or unordered list of basic values, embeddables or entities (many-to-many) in its own
-      * table. The table's ID is `entity/property`, the owner key column's `entity/property/key`,
-      * a basic or entity element's `entity/property/element` and an embeddable element's
-      * columns `entity/property/embedded-property`.
+    /** A set, list, map or array of basic values, embeddables or entities (many-to-many) in its
+      * own table. The table's ID is `entity/property`, the owner key column's
+      * `entity/property/key`, a basic or entity element's `entity/property/element` and an
+      * embeddable element's columns `entity/property/embedded-property`. A list's order column
+      * or a map's key column is `entity/property/index`, an embeddable map key's columns
+      * `entity/property/index/embedded-property`.
       */
     private def readCollection(collection: CollectionMapping, entityIds: Map[PersistentClass, Option[String]]): Option[Mapped] =
       val owner = collection.getOwner
@@ -268,10 +272,8 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
           None
         case Some(property) =>
           val label = s"${entityLabel(owner)}.${property.getName}"
-          val kind = collection match
-            case _: org.hibernate.mapping.Set | _: org.hibernate.mapping.Bag => None
-            case other => Some(other.getClass.getSimpleName.toLowerCase(Locale.ROOT))
-          kind.foreach(k => errors += s"$label is a $k collection; only sets and unordered lists are supported")
+          val identified = collection.isInstanceOf[IdentifierCollection]
+          if identified then errors += s"$label has a generated row ID (@CollectionId); unsupported"
           val entityId = entityIds.getOrElse(owner, None)
           val propertyId = stableId(members(owner.getMappedClass, property.getName), label).getOrElse(Unknown)
           val path = Vector(entityId.getOrElse(Unknown), propertyId)
@@ -285,9 +287,20 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
               val selected = element.getSelectables.asScala.toVector.collect { case column: Column => column }
               if selected.size != 1 then errors += s"$label elements map to ${selected.size} columns; unsupported"
               selected.map(Owned(_, path :+ "element", s"$label element"))
-          val owned = keyColumns.map(Owned(_, path :+ "key", s"$label key")) ++ elementColumns
+          // A map key taken from a property of the element entity (@MapKey) owns no column here.
+          val tableColumns = collection.getCollectionTable.getColumns.asScala.toSet
+          val indexColumns = collection match
+            case indexed: IndexedCollection => indexed.getIndex match
+              case component: Component =>
+                component.getProperties.asScala.toVector.flatMap(columns(_, component.getComponentClass, path :+ "index", label))
+              case index =>
+                val selected = index.getSelectables.asScala.toVector.collect { case column: Column if tableColumns(column) => column }
+                if selected.size > 1 then errors += s"$label keys map to ${selected.size} columns; unsupported"
+                selected.map(Owned(_, path :+ "index", s"$label index"))
+            case _ => Vector.empty
+          val owned = keyColumns.map(Owned(_, path :+ "key", s"$label key")) ++ elementColumns ++ indexColumns
           val tableId = entityId.filter(_ => propertyId != Unknown).map(_ + "/" + propertyId)
-          mapTable(label, s"collection $label", collection.getCollectionTable, tableId, owned).filter(_ => kind.isEmpty)
+          mapTable(label, s"collection $label", collection.getCollectionTable, tableId, owned).filter(_ => !identified)
 
     private def entityLabel(entity: PersistentClass): String = Option(entity.getJpaEntityName).getOrElse(entity.getEntityName)
 
@@ -409,11 +422,11 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
           Option(long).orElse(Option(short)).flatMap(_.toIntOption).map(SqlType.TimestampWithTimeZone(_))
         case _ => None
       if dataType.isEmpty then errors += s"$label has SQL type '$sqlType'; unsupported"
-      val check = columnCheck(column, label)
+      val check = columnCheck(column, dataType, label)
       dataType.map(ColumnModel(id, physical(Identifier.toIdentifier(column.getName, column.isQuoted)), _, column.isNullable, check,
         column.isIdentity))
 
-    private def columnCheck(column: Column, label: String): Option[ColumnCheck] =
+    private def columnCheck(column: Column, dataType: Option[SqlType], label: String): Option[ColumnCheck] =
       column.getCheckConstraints.asScala.toVector.map(_.getConstraint) match
         case Vector() => None
         case Vector(text) =>
@@ -425,6 +438,14 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
               Some(ColumnCheck.AllowedValues(Literal.findAllMatchIn(values).map(_.group(1)).toVector))
             case RangeCheck(reference, min, max) if refersToColumn(reference) =>
               for low <- min.toLongOption; high <- max.toLongOption yield ColumnCheck.Range(low, high)
+            // A lower bound is the range up to the largest value of the integer type.
+            case MinimumCheck(reference, min) if refersToColumn(reference) =>
+              val maximum = dataType.collect {
+                case SqlType.SmallInt => Short.MaxValue.toLong
+                case SqlType.Integer => Int.MaxValue.toLong
+                case SqlType.BigInt => Long.MaxValue
+              }
+              for low <- min.toLongOption; high <- maximum yield ColumnCheck.Range(low, high)
             case _ => None
           if check.isEmpty then errors += s"$label has the check constraint '$text'; only enum checks are supported"
           check

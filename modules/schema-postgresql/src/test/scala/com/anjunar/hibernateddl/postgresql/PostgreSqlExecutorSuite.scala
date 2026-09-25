@@ -593,7 +593,7 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
     val model = TestMetadata.read(classOf[Article], classOf[Label], classOf[Invoice], classOf[LegacyCustomer],
       classOf[Account], classOf[Shipment], classOf[Measurement], classOf[Letter], classOf[Purchase],
       classOf[Generated], classOf[Ticket], classOf[Voucher], classOf[Animal], classOf[Cat], classOf[Dog],
-      classOf[Vehicle], classOf[Car], classOf[Payment], classOf[CardPayment], classOf[TransferPayment])
+      classOf[Vehicle], classOf[Car], classOf[Payment], classOf[CardPayment], classOf[TransferPayment], classOf[Shelf])
       .fold(errors => fail(errors.mkString("\n")), identity)
     withDatabase { ds =>
       val result = executor.migrate(ds, model)
@@ -612,6 +612,11 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
         "INSERT INTO public.cardpayment (id, amount, card) VALUES (nextval('public.payment_seq'), 10, 'visa')")
       intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.animal (dtype, id) VALUES ('Horse', 2)"))
       intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.car (id, seats) VALUES (2, 5)"))
+      execute(ds, "INSERT INTO public.shelf (id) VALUES (1); " +
+        "INSERT INTO public.shelf_titles (shelf_id, lang, titles) VALUES (1, 'de', 'Regal'), (1, 'en', 'Shelf'); " +
+        "INSERT INTO public.shelf_weights (shelf_id, label_id, weights) VALUES (1, 7, 3)")
+      intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.shelf_titles (shelf_id, lang, titles) VALUES (1, 'de', 'Brett')"))
+      intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.shelf_weights (shelf_id, label_id, weights) VALUES (1, 8, 1)"))
       assertEquals(executor.migrate(ds, model), MigrationResult(1, MigrationStatus.AlreadyApplied, 0))
     }
   }
