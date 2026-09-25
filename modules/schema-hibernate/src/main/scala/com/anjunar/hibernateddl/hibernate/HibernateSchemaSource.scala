@@ -1,7 +1,7 @@
 package com.anjunar.hibernateddl.hibernate
 
 import com.anjunar.hibernateddl.core.*
-import com.anjunar.hibernateddl.hibernate.annotation.SchemaId as StableId
+import com.anjunar.hibernateddl.hibernate.annotation.{SchemaId as StableId, SecondaryTableId}
 import org.hibernate.boot.Metadata
 import org.hibernate.boot.model.naming.Identifier
 import org.hibernate.cfg.MappingSettings
@@ -11,7 +11,7 @@ import org.hibernate.id.enhanced.SequenceStyleGenerator
 import org.hibernate.boot.model.relational.SqlStringGenerationContext
 import org.hibernate.boot.model.relational.internal.SqlStringGenerationContextImpl
 import org.hibernate.mapping.{Collection as CollectionMapping, Column, Component, GeneratorSettings, IdentifierCollection,
-  IndexedCollection, JoinedSubclass, PersistentClass, Property, RootClass, SingleTableSubclass, Table, UnionSubclass}
+  IndexedCollection, Join, JoinedSubclass, PersistentClass, Property, RootClass, SingleTableSubclass, Table, UnionSubclass}
 
 import java.lang.reflect.AnnotatedElement
 import java.util.HexFormat
@@ -107,7 +107,7 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
 
     def read(): SchemaModel =
       val entities = metadata.getEntityBindings.asScala.toVector.sortBy(_.getEntityName)
-      val entityTables = entities.map(_.getTable).toSet
+      val entityTables = entities.map(_.getTable).toSet ++ entities.flatMap(_.getJoins.asScala.map(_.getTable))
       // Inverse sides and foreign-key one-to-many collections own no table of their own.
       val collections = metadata.getCollectionBindings.asScala.toVector
         .filterNot(collection => collection.isInverse || collection.isOneToMany).sortBy(_.getRole)
@@ -130,9 +130,16 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
         if owners.size > 1 then
           errors += s"Entities ${owners.map(entityLabel).sorted.mkString(", ")} share @SchemaId(\"$id\")"
       }
-      entities.filterNot(_.getJoins.isEmpty).foreach(entity => errors += s"Entity ${entityLabel(entity)} uses secondary tables; unsupported")
+      entities.foreach { entity =>
+        val joined = entity.getJoins.asScala.map(_.getTable.getName.toLowerCase(Locale.ROOT)).toSet
+        entity.getMappedClass.getAnnotationsByType(classOf[SecondaryTableId]).filterNot(id =>
+          joined(id.table.toLowerCase(Locale.ROOT))).foreach { id =>
+          errors += s"@SecondaryTableId(table = \"${id.table}\") of entity ${entityLabel(entity)} names no secondary table"
+        }
+      }
       val tableOwners = entities.filterNot(_.isInstanceOf[SingleTableSubclass])
       val mapped = tableOwners.flatMap(readEntityTable(_, entities, entityIds)) ++
+        entities.flatMap(entity => entity.getJoins.asScala.toVector.flatMap(readSecondaryTable(entity, _, entityIds))) ++
         collections.filterNot(c => sharedTables.contains(c.getCollectionTable)).flatMap(readCollection(_, entityIds))
       val byTable = mapped.map(entity => entity.table -> entity).toMap
       SchemaModel(
@@ -232,8 +239,7 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
         values.toVector.distinct.flatMap(columns(_, of.getMappedClass, Vector(entityIds(of).getOrElse(Unknown)), entityLabel(of)))
       val tablePerClassRoot = entity.isInstanceOf[RootClass] && entity.isAbstract &&
         entities.exists(sub => sub.getRootClass == entity && sub.isInstanceOf[UnionSubclass])
-      if !entity.getJoins.isEmpty then None
-      else if !table.isPhysicalTable then
+      if !table.isPhysicalTable then
         if !tablePerClassRoot then errors += s"Entity $label is not mapped to a physical table; unsupported"
         None
       else
@@ -256,6 +262,37 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
         val sharing = entities.collect { case sub: SingleTableSubclass if sub.getTable eq table => sub }
           .flatMap(sub => properties(sub.getProperties.asScala, sub))
         mapTable(label, s"entity $label", table, entityIds(entity), own ++ sharing)
+
+    /** A secondary table takes the ID `entity/secondary-table-id` from `@SecondaryTableId` and its
+      * key column `entity/secondary-table-id/key`. Its properties keep their IDs
+      * `entity/property`, so moving one between the tables changes nothing but its table.
+      */
+    private def readSecondaryTable(entity: PersistentClass, join: Join, entityIds: Map[PersistentClass, Option[String]]): Option[Mapped] =
+      val entityName = entityLabel(entity)
+      val table = join.getTable
+      val description = s"secondary table ${table.getName} of entity $entityName"
+      val declared = entity.getMappedClass.getAnnotationsByType(classOf[SecondaryTableId]).toVector
+        .filter(_.table.equalsIgnoreCase(table.getName)).map(_.value).distinct
+      val secondaryId = declared match
+        case Vector(id) if id.matches(IdFormat) => Some(id)
+        case Vector(id) =>
+          errors += s"The $description has @SecondaryTableId value \"$id\"; expected eight lowercase hex digits such as \"${newId()}\""
+          None
+        case Vector() =>
+          errors += s"The $description has no @SecondaryTableId; add e.g. " +
+            s"@SecondaryTableId(table = \"${table.getName}\", value = \"${newId()}\")"
+          None
+        case ids =>
+          errors += s"The $description has conflicting @SecondaryTableId values ${ids.mkString(", ")}"
+          None
+      val entityId = entityIds(entity)
+      val key = join.getKey.getSelectables.asScala.toVector.collect {
+        case column: Column => Owned(column, Vector(entityId.getOrElse(Unknown), secondaryId.getOrElse(Unknown), "key"), s"$entityName key")
+      }
+      val properties = join.getProperties.asScala.toVector
+        .flatMap(columns(_, entity.getMappedClass, Vector(entityId.getOrElse(Unknown)), entityName))
+      val tableId = for id <- entityId; secondary <- secondaryId yield s"$id/$secondary"
+      mapTable(entityName, description, table, tableId, key ++ properties)
 
     /** A set, list, map or array of basic values, embeddables or entities (many-to-many) in its
       * own table. The table's ID is `entity/property`, the owner key column's
@@ -408,6 +445,8 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
         case "double precision" | "float8" | "float" => Some(SqlType.DoublePrecision)
         case "date" => Some(SqlType.Date)
         case "bytea" => Some(SqlType.Binary)
+        // Hibernate stores @Lob values as PostgreSQL large objects, referenced by their oid.
+        case "oid" => Some(SqlType.LargeObject)
         case FloatType(digits) => digits.toIntOption.collect {
           case bits if bits >= 1 && bits <= 24 => SqlType.Real
           case bits if bits >= 25 && bits <= 53 => SqlType.DoublePrecision

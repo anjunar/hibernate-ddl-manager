@@ -308,13 +308,15 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
         ColumnModel(SchemaId("T_WEIGHT"), SqlIdentifier("weight"), SqlType.Real),
         ColumnModel(SchemaId("T_RATIO"), SqlIdentifier("ratio"), SqlType.DoublePrecision),
         ColumnModel(SchemaId("T_DAY"), SqlIdentifier("day"), SqlType.Date),
-        ColumnModel(SchemaId("T_DATA"), SqlIdentifier("data"), SqlType.Binary)
+        ColumnModel(SchemaId("T_DATA"), SqlIdentifier("data"), SqlType.Binary),
+        ColumnModel(SchemaId("T_LOB"), SqlIdentifier("document"), SqlType.LargeObject)
       )
       val typed = SchemaModel(Vector(TableModel(SchemaId("T"), QualifiedName(SqlIdentifier("typed"), Some(SqlIdentifier("public"))),
         columns, Vector(columns.head.id))))
       assertEquals(executor.migrate(ds, typed).status, MigrationStatus.Applied)
       execute(ds, "INSERT INTO public.typed VALUES (1, 'EUR', 12.345, 99999999999999999999, '08:30:15', 1.5, 0.25, " +
-        "'2026-09-24', '\\xcafe')")
+        "'2026-09-24', '\\xcafe', lo_from_bytea(0, 'large'))")
+      assertEquals(scalar(ds, "SELECT convert_from(lo_get(document), 'UTF8') FROM public.typed"), "large")
       assertEquals(scalar(ds, "SELECT concat_ws(' ', code, price, total, opens_at, weight, ratio, day, data) FROM public.typed"),
         "EUR 12.35 99999999999999999999 08:30:15 1.5 0.25 2026-09-24 \\xcafe")
       assertEquals(executor.migrate(ds, typed).status, MigrationStatus.AlreadyApplied)
@@ -593,7 +595,8 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
     val model = TestMetadata.read(classOf[Article], classOf[Label], classOf[Invoice], classOf[LegacyCustomer],
       classOf[Account], classOf[Shipment], classOf[Measurement], classOf[Letter], classOf[Purchase],
       classOf[Generated], classOf[Ticket], classOf[Voucher], classOf[Animal], classOf[Cat], classOf[Dog],
-      classOf[Vehicle], classOf[Car], classOf[Payment], classOf[CardPayment], classOf[TransferPayment], classOf[Shelf])
+      classOf[Vehicle], classOf[Car], classOf[Payment], classOf[CardPayment], classOf[TransferPayment], classOf[Shelf],
+      classOf[Profile])
       .fold(errors => fail(errors.mkString("\n")), identity)
     withDatabase { ds =>
       val result = executor.migrate(ds, model)
@@ -617,6 +620,9 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
         "INSERT INTO public.shelf_weights (shelf_id, label_id, weights) VALUES (1, 7, 3)")
       intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.shelf_titles (shelf_id, lang, titles) VALUES (1, 'de', 'Brett')"))
       intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.shelf_weights (shelf_id, label_id, weights) VALUES (1, 8, 1)"))
+      execute(ds, "INSERT INTO public.profile (id, name, picture) VALUES (1, 'Ada', lo_from_bytea(0, 'png')); " +
+        "INSERT INTO public.profile_details (id, bio, essay) VALUES (1, 'Mathematician', lo_from_bytea(0, 'notes'))")
+      intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.profile_details (id, bio) VALUES (2, 'Nobody')"))
       assertEquals(executor.migrate(ds, model), MigrationResult(1, MigrationStatus.AlreadyApplied, 0))
     }
   }
