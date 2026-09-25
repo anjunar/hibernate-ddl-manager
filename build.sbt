@@ -56,11 +56,15 @@ lazy val schemaIntegration = (project in file("modules/schema-integration"))
   )
 
 lazy val schemaCli = (project in file("modules/schema-cli"))
-  .dependsOn(schemaCore, schemaPostgresql)
+  .dependsOn(schemaCore, schemaPostgresql % "compile->compile;test->test")
   .settings(commonSettings)
   .settings(
     name := "schema-cli",
     publish / skip := true,
+    // The preview command connects on its own.
+    libraryDependencies += "org.postgresql" % "postgresql" % "42.7.10",
+    Test / fork := true,
+    Test / parallelExecution := false,
     Compile / mainClass := Some("com.anjunar.hibernateddl.cli.Main")
   )
 
