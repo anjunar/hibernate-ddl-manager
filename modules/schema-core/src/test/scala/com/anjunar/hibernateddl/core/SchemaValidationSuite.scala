@@ -104,7 +104,8 @@ class SchemaValidationSuite extends munit.FunSuite:
     assert(errors(SqlType.Numeric(5, -1)).exists(_.contains("invalid NUMERIC(5, -1)")))
     assert(errors(SqlType.Time(-1)).exists(_.contains("invalid TIME precision -1")))
     Vector(SqlType.Char(1), SqlType.Numeric(38, 2), SqlType.Numeric(10, 10), SqlType.Time(0), SqlType.SmallInt,
-      SqlType.Real, SqlType.DoublePrecision, SqlType.Date, SqlType.Binary, SqlType.LargeObject).foreach { valid =>
+      SqlType.Real, SqlType.DoublePrecision, SqlType.Date, SqlType.Binary, SqlType.LargeObject,
+      SqlType.Json).foreach { valid =>
       assertEquals(errors(valid), Vector.empty)
     }
   }

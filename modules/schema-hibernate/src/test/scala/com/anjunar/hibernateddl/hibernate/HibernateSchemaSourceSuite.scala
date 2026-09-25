@@ -194,7 +194,8 @@ class HibernateSchemaSourceSuite extends munit.FunSuite:
 
   test("mappings the model cannot represent are reported instead of dropped") {
     val diagnostics = errors(classOf[Unsupported], classOf[LegacyCustomer])
-    assert(diagnostics.exists(_.contains("Unsupported.document has SQL type 'jsonb'")), diagnostics)
+    assert(diagnostics.exists(_.contains("Unsupported.guarded keeps name, status with a check or NOT NULL inside its " +
+      "JSON column; Hibernate guards them with a table check that the model cannot represent; unsupported")), diagnostics)
     assert(diagnostics.exists(_.contains("Unsupported.tags has SQL type 'varchar(255) array'")), diagnostics)
     assert(diagnostics.exists(_.contains("of entity Unsupported has ON DELETE CASCADE; unsupported")), diagnostics)
     assert(diagnostics.exists(_.contains("Unsupported.folder.files is not a direct property")), diagnostics)
@@ -297,6 +298,15 @@ class HibernateSchemaSourceSuite extends munit.FunSuite:
     assertEquals(table.columns.map(c => c.name.value -> c.dataType).toMap, Map(
       "id" -> SqlType.BigInt, "body" -> SqlType.LargeObject, "scan" -> SqlType.LargeObject,
       "attachment" -> SqlType.LargeObject, "notes" -> SqlType.LargeObject))
+  }
+
+  test("JSON columns hold maps, lists, text and embeddables; an embeddable's properties need no IDs") {
+    val table = read(classOf[Settings]).toOption.get.tables.head
+    assertEquals(table.columns.map(c => c.id.value -> (c.name.value, c.dataType)).toMap, Map(
+      "b3c4d5e6/0a1b2c3d" -> ("id", SqlType.BigInt), "b3c4d5e6/1b2c3d4e" -> ("values", SqlType.Json),
+      "b3c4d5e6/2c3d4e5f" -> ("tags", SqlType.Json), "b3c4d5e6/3d4e5f60" -> ("raw", SqlType.Json),
+      "b3c4d5e6/4e5f6071" -> ("preferences", SqlType.Json)))
+    assertEquals(table.columns.flatMap(_.check), Vector.empty)
   }
 
   test("DDL options that Hibernate appends verbatim are reported instead of dropped") {

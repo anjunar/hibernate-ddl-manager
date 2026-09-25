@@ -85,6 +85,7 @@ object SchemaModelJson:
     case SqlType.Date => "date"
     case SqlType.Binary => "binary"
     case SqlType.LargeObject => "large object"
+    case SqlType.Json => "json"
 
   private enum Json:
     case Obj(fields: Map[String, Json])
@@ -190,6 +191,7 @@ object SchemaModelJson:
       case "date" => SqlType.Date
       case "binary" => SqlType.Binary
       case "large object" => SqlType.LargeObject
+      case "json" => SqlType.Json
       case CharType(length) => SqlType.Char(number(length, s"Column '$id' CHAR length"))
       case NumericType(precision, scale) =>
         SqlType.Numeric(number(precision, s"Column '$id' NUMERIC precision"), number(scale, s"Column '$id' NUMERIC scale"))

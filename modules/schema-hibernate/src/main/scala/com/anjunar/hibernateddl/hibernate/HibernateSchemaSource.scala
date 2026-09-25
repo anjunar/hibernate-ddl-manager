@@ -343,6 +343,17 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
           val tableId = entityId.filter(_ => propertyId != Unknown).map(_ + "/" + propertyId)
           mapTable(label, s"collection $label", collection.getCollectionTable, tableId, owned).filter(_ => !identified)
 
+    /** Properties inside a JSON embeddable that Hibernate guards with a table check on the
+      * JSON column: those that are not nullable or have a check, such as enums.
+      */
+    private def guardedInside(component: Component): Vector[String] =
+      component.getProperties.asScala.toVector.flatMap { property =>
+        property.getValue match
+          case nested: Component => guardedInside(nested).map(name => s"${property.getName}.$name")
+          case value =>
+            Option.when(value.getColumns.asScala.exists(c => !c.isNullable || !c.getCheckConstraints.isEmpty))(property.getName)
+      }
+
     /** DDL text that Hibernate appends verbatim; the model cannot represent any of it. */
     private def options(value: String): Option[String] = Option(value).map(_.trim).filter(_.nonEmpty)
 
@@ -430,6 +441,15 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
           errors += s"$label is a synthetic Hibernate property (e.g. a unidirectional one-to-many join column); unsupported"
           selected.map(Owned(_, path :+ Unknown, label))
         case _: CollectionMapping => Vector.empty // A collection's columns live in its own table.
+        // An embeddable stored as one JSON column: its properties live inside the document and
+        // need no IDs; the column takes the embedded property's ID.
+        case component: Component if component.getAggregateColumn != null =>
+          val guarded = guardedInside(component)
+          if guarded.nonEmpty then
+            errors += s"$label keeps ${guarded.sorted.mkString(", ")} with a check or NOT NULL inside its JSON column; " +
+              "Hibernate guards them with a table check that the model cannot represent; unsupported"
+          val id = stableId(members(owner, property.getName), label).getOrElse(Unknown)
+          Vector(Owned(component.getAggregateColumn, path :+ id, label))
         case _ if selected.isEmpty => Vector.empty // Formulas and inverse sides own no column.
         case component: Component =>
           val id = stableId(members(owner, property.getName), label).getOrElse(Unknown)
@@ -461,6 +481,8 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
         case "bytea" => Some(SqlType.Binary)
         // Hibernate stores @Lob values as PostgreSQL large objects, referenced by their oid.
         case "oid" => Some(SqlType.LargeObject)
+        // Hibernate maps SqlTypes.JSON to PostgreSQL's binary JSON type.
+        case "jsonb" => Some(SqlType.Json)
         case FloatType(digits) => digits.toIntOption.collect {
           case bits if bits >= 1 && bits <= 24 => SqlType.Real
           case bits if bits >= 25 && bits <= 53 => SqlType.DoublePrecision
