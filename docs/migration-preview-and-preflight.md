@@ -1,12 +1,12 @@
 # Arbeitspaket: Migrationsvorschau und Vorabprüfungen
 
-Status: Konzept zur Umsetzung, noch nicht implementiert.
+Status: umgesetzt. Die API- und Typnamen sowie der CLI-Aufruf unten sind die
+verfügbaren; die Entscheidungen bei der Umsetzung stehen am Ende.
 
 Dieses Arbeitspaket ergänzt die [bestehende Architektur](architecture.md) und das
 [Arbeitspaket für Backfills und NOT NULL](backfills-and-not-null.md). Es beschreibt
 eine Vorschau gegen die tatsächliche Datenbank, ohne Schema, Anwendungsdaten oder
-Migrationshistorie zu verändern. API- und Typnamen sowie CLI-Aufrufe sind
-Entwurfsvorschläge und noch keine verfügbaren Funktionen.
+Migrationshistorie zu verändern.
 
 ## Ziel und Nutzen
 
@@ -365,46 +365,46 @@ den jeweiligen Teilaufgaben.
 
 ## Abnahmekriterien
 
-- [ ] Gleiche Eingaben und geprüfte Historie ergeben bei Vorschau und Executor
+- [x] Gleiche Eingaben und geprüfte Historie ergeben bei Vorschau und Executor
   dieselben Operationen, Reihenfolgen, Risiken und erforderlichen Freigaben.
-- [ ] Fehlende Freigaben werden mit den betroffenen Schritten sichtbar. Nicht
+- [x] Fehlende Freigaben werden mit den betroffenen Schritten sichtbar. Nicht
   unterstützte Änderungen erzeugen keinen vermeintlich vollständigen Plan.
-- [ ] Neuanlage, unverändertes Schema, reguläre Migration, Übernahme und manuelle
+- [x] Neuanlage, unverändertes Schema, reguläre Migration, Übernahme und manuelle
   Migration verwenden die bestehenden Regeln und werden eindeutig unterschieden.
-- [ ] Eine leere Datenbank bleibt ohne neu angelegtes Historien-Schema oder
+- [x] Eine leere Datenbank bleibt ohne neu angelegtes Historien-Schema oder
   Historientabellen. Bestehende Daten, Modelle und Historieneinträge bleiben nach
   Vorschauen unverändert.
-- [ ] Tests des ausgeführten SQL und der Datenbankberechtigungen belegen, dass
+- [x] Tests des ausgeführten SQL und der Datenbankberechtigungen belegen, dass
   keine DDL-, datenverändernden DML-, Sequenz- oder temporären Tabellenoperationen stattfinden.
   Der Benutzer benötigt für die verfügbaren Prüfungen nur passende Leserechte.
-- [ ] Korrekte, manipulierte und nicht vergleichbare CHECK-Definitionen werden
+- [x] Korrekte, manipulierte und nicht vergleichbare CHECK-Definitionen werden
   unterschieden; der Constraint-Name allein kann keine Prüfung bestehen lassen.
-- [ ] Historienfehler, Drift, stillgelegte IDs und geänderte bekannte Backfill-
+- [x] Historienfehler, Drift, stillgelegte IDs und geänderte bekannte Backfill-
   Definitionen werden auch bei unverändertem Zielmodell erkannt.
-- [ ] NOT-NULL-, Unique-, FK- und unterstützte CHECK-Prüfungen berücksichtigen
+- [x] NOT-NULL-, Unique-, FK- und unterstützte CHECK-Prüfungen berücksichtigen
   NULL-Semantik, zusammengesetzte Schlüssel und gequotete Bezeichner.
-- [ ] Backfill-Projektionen erhalten vorhandene Werte, behandeln NULL-Quellen
+- [x] Backfill-Projektionen erhalten vorhandene Werte, behandeln NULL-Quellen
   korrekt und erkennen sowohl verbleibende NULL-Werte als auch neu entstehende
   Constraint-Verletzungen.
-- [ ] Neue Pflichtspalten auf leeren Tabellen sowie Umbenennungen und Quellen,
+- [x] Neue Pflichtspalten auf leeren Tabellen sowie Umbenennungen und Quellen,
   die später gelöscht werden, werden ohne echte Schemaänderung geprüft.
-- [ ] Timeouts, fehlende Leserechte, nicht unterstützte Projektionen und
+- [x] Timeouts, fehlende Leserechte, nicht unterstützte Projektionen und
   abgebrochene Transaktionen werden als offene oder fehlgeschlagene Prüfungen
   ausgewiesen und niemals als erfolgreiche Datenprüfung behandelt.
-- [ ] Exakte Zählungen, Schätzwerte und unbekannte Werte sind im Bericht und im
+- [x] Exakte Zählungen, Schätzwerte und unbekannte Werte sind im Bericht und im
   JSON eindeutig unterscheidbar. Ausgelassene optionale Zählungen erzeugen keine
   falsche Blockade; ausgelassene erforderliche Prüfungen verhindern `Ready`.
-- [ ] Die Verbindung erhält ihren ursprünglichen Zustand zurück. Fehler bei
+- [x] Die Verbindung erhält ihren ursprünglichen Zustand zurück. Fehler bei
   Wiederherstellung oder Schließen werden behandelt, ohne Anwendungstransaktionen
   zu committen oder zu übernehmen.
-- [ ] Eine zwischen Vorschau und Migration geänderte Datenbank wird bei der
+- [x] Eine zwischen Vorschau und Migration geänderte Datenbank wird bei der
   Ausführung erneut geprüft; der vorherige Bericht umgeht keine Sperre oder Regel.
-- [ ] Text und JSON stimmen inhaltlich überein; JSON ist versioniert und enthält
+- [x] Text und JSON stimmen inhaltlich überein; JSON ist versioniert und enthält
   keine zusätzlichen Konsolentexte, Zugangsdaten oder Datensatzinhalte.
-- [ ] API, Modell-Export, optionale Backfill-Exporte und CLI funktionieren
+- [x] API, Modell-Export, optionale Backfill-Exporte und CLI funktionieren
   zusammen; Exit-Codes decken `Ready`, `Blocked`, `Incomplete` und technische
   Aufruffehler ab.
-- [ ] Bestehende Executor-, Dialekt-, Integrations- und CLI-Tests bleiben gültig;
+- [x] Bestehende Executor-, Dialekt-, Integrations- und CLI-Tests bleiben gültig;
   der vollständige Projektcheck `sbt check` besteht.
 
 ## Grenzen
@@ -422,3 +422,27 @@ Nicht Bestandteil sind automatische Datenreparaturen, beliebige SQL-Simulation,
 Ausführung exportierter Berichte, neue Migrationsarten, Hintergrund-Backfills und
 ein Web-Dashboard. Der aktuelle Serverstart bleibt für die tatsächliche
 Migration verantwortlich.
+
+## Entscheidungen bei der Umsetzung
+
+- `MigrationPlanner` enthält die Planungsregeln für Executor und Vorschau. Der
+  Executor verweigert einen nicht ausführbaren Plan mit denselben Meldungen wie
+  zuvor; `JdbcMigrationPreview` und `HibernateSchemaMigration.preview` stellen ihn dar.
+- Die Migration vergleicht CHECK-Definitionen weiterhin exakt über eine temporäre
+  Prüftabelle. Die Vorschau zerlegt die von PostgreSQL gezeigten Formen der von
+  diesem Dialekt erzeugten CHECKs; eine erkannte Form mit anderen Werten ist Drift,
+  eine unbekannte Form `Inconclusive`.
+- Datenprüfungen laufen nur für einen vollständigen Plan im Modus Migration; sonst
+  sind sie `NotRun`. Vorgabe ist die Existenzprüfung, `includeExactCounts` zählt.
+  Schätzungen (`pg_class.reltuples`) gibt es als optionale Prüfung für Tabellen, die
+  ein Backfill füllt. Ob ein verketteter Wert in eine `varchar(n)`-Spalte passt,
+  prüft erst die Migration.
+- Der Bericht zeigt SQL mit Platzhaltern und die Typen der Parameter, nie ihre Werte.
+- Die CLI liest Zielmodell und Backfills aus den Exporten
+  `HibernateSchemaMigration.exportTarget` und `exportBackfills` (`BackfillJson`,
+  Format 1). Freigaben und die übrigen Ausführungsoptionen werden als Argumente
+  übergeben (`--approval`, `--adopt-existing-schema`, `--accept-manual-migration`,
+  Timeouts), weil die CLI keine Hibernate-Einstellungen liest.
+- Scheitert die Wiederherstellung der Verbindung, wird sie abgebrochen und nicht an
+  den Pool zurückgegeben; der Bericht bleibt gültig, weil nichts geschrieben wurde.
+

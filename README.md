@@ -245,6 +245,50 @@ dropped or renamed is gone under its old name, and records the target as the nex
 without executing DDL (`ManuallyMigrated`). An option naming another target is refused, so it cannot
 accept a later change by accident.
 
+## Previewing a migration
+
+Before a deployment, a preview shows what the next server start would do to a database,
+without changing its schema, data or history:
+
+```scala
+val report = HibernateSchemaMigration.preview(metadata, dataSource,
+  previewOptions = PreviewOptions(dataChecks = DataChecks.Existence, includeExactCounts = false))
+println(PreviewRendering.text(report))  // or PreviewRendering.json(report)
+```
+
+It plans with the same rules, options and backfills as `migrate`, inside one transaction
+that is read-only and `REPEATABLE READ` on the server; it takes no migration lock, creates no
+history and runs no DDL or data change, so a role with read rights suffices. The report lists
+the mode (migration, no change, adoption or manual migration), the steps in execution order
+with their SQL (placeholders and parameter types, never backfill constants), required and
+missing approvals, the locks the migration will take, findings with stable codes, and checks:
+
+- the history, and whether the database matches the model the plan starts from; check
+  constraints are compared structurally, and a form that cannot be compared is inconclusive;
+- whether the names of new relations are free;
+- data checks on the rows as they are, with the migration's values projected: NULLs left
+  in a column that becomes required, duplicates for a unique key, missing referenced rows for
+  a foreign key and rows that make a check FALSE, including those a backfill would create.
+  Existence is checked by default; exact counts and estimates are optional.
+
+Each check is `Passed`, `Failed`, `NotApplicable`, `NotRun` or `Inconclusive`; the report is
+`Ready`, `Blocked` or `Incomplete`. A timeout or a missing privilege makes it incomplete,
+never ready. The migration checks everything again under its locks: a ready preview grants
+nothing, and a database that changed afterwards still stops the start.
+
+The command line does the same without the application's classes, from files that
+`HibernateSchemaMigration.exportTarget(metadata)` and `exportBackfills(metadata)` wrote:
+
+```sh
+export HIBERNATE_DDL_PREVIEW_JDBC_URL=jdbc:postgresql://db:5432/app
+export HIBERNATE_DDL_PREVIEW_USER=reader HIBERNATE_DDL_PREVIEW_PASSWORD=...
+sbt "schemaCli/run preview --target target-schema.json --backfills backfills.json --format json"
+```
+
+`--approval`, `--adopt-existing-schema` and `--accept-manual-migration` stand for the
+execution options. JSON goes to standard output alone. The exit code is 0 for ready, 1 for
+blocked, 3 for incomplete and 2 for an invalid call or a technical error.
+
 ## Modules
 
 | sbt project | Contents |
@@ -254,7 +298,7 @@ accept a later change by accident.
 | `schemaExecutor` | Transaction, planning against the stored model, history |
 | `schemaPostgresql` | SQL, catalog checks, locking and history for PostgreSQL |
 | `schemaIntegration` | `HibernateSchemaMigration` and the opt-in Hibernate integrator |
-| `schemaCli` | Demo |
+| `schemaCli` | Demo and the read-only `preview` command |
 
 Package root: `com.anjunar.hibernateddl`. The core depends neither on Hibernate nor on a
 database driver; the server provides the PostgreSQL JDBC driver.
