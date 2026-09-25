@@ -38,6 +38,8 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     var existing = Set.empty[String]
     /** Objects outside the model that depend on every column whose type changes. */
     var dependents = Vector.empty[String]
+    /** Why binding a dropped index or unique key fails; otherwise it binds to "bound <columns>". */
+    var bindProblems = Vector.empty[String]
 
     def event(name: String): Unit =
       events += name
@@ -160,6 +162,8 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
           case _: SchemaOperation.SetNotNull => "set not null"
           case _: SchemaOperation.DropNotNull => "drop not null"
           case _: SchemaOperation.ChangeColumnType => "change column type"
+          case _: SchemaOperation.DropIndex => "template drop index"
+          case _: SchemaOperation.DropUniqueKey => "template drop unique key"
         })
       def nullCount(table: QualifiedName, column: SqlIdentifier): String = s"count nulls ${column.value}"
       def renderFill(fill: NullFill): Either[Vector[String], BoundStatement] =
@@ -188,6 +192,10 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
       def typeChangeBlockers(actual: Connection, table: QualifiedName, column: SqlIdentifier): Vector[String] =
         onConnection(actual, s"dependents:${column.value}")
         dependents
+      def bindDrop(actual: Connection, operation: SchemaOperation, table: QualifiedName,
+          columns: Vector[SqlIdentifier]): Either[Vector[String], String] =
+        onConnection(actual, s"bind:${table.name.value}:${columns.map(_.value).mkString(",")}")
+        if bindProblems.nonEmpty then Left(bindProblems) else Right(s"bound ${columns.map(_.value).mkString(",")}")
       def recordHistory(actual: Connection, entry: HistoryEntry): Unit =
         onConnection(actual, "record-history")
         pending = Some(entry)
@@ -773,4 +781,24 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     statement.failAt = Set("sql:1:change column type")
     assertEquals(intercept[MigrationException](statement.migrate(sized(20))).state, FailureState.RolledBack)
     assert(!statement.events.contains("record-history"), statement.events)
+  }
+
+  test("dropped indexes and unique keys are bound after the previous schema is checked and before any DDL") {
+    val keyed = account.copy(uniqueKeys = Vector(UniqueKeyModel(Vector(name.id))),
+      indexes = Vector(IndexModel(Vector(IndexColumn(name.id)))))
+    val approved = ExecutionOptions(approvals = Set(Approval.dropUniqueKey(UniqueKeyRef(account.id, Vector(name.id)))))
+    val h = new Harness
+    h.seed(SchemaModel(Vector(keyed)))
+    h.bindProblems = Vector("the index is gone")
+    val refused = intercept[MigrationException](h.migrate(initial, approved))
+    assertEquals(refused.state, FailureState.RolledBack)
+    assert(refused.getMessage.contains("the index is gone"), refused.getMessage)
+    assert(h.events.indexOf("bind:account:name") > h.events.indexOf("validate:account"), h.events)
+    assert(!h.events.exists(_.startsWith("sql:")), h.events)
+    h.bindProblems = Vector.empty
+    h.events.clear()
+    assertEquals(h.migrate(initial, approved).status, MigrationStatus.Applied)
+    assertEquals(h.events.count(_.startsWith("bind:")), 2)
+    assert(!h.events.exists(_.contains("template")), h.events)
+    assertEquals(h.history.last.statements, Vector("bound name", "bound name"))
   }

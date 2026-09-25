@@ -283,3 +283,25 @@ class PostgreSqlDialectSuite extends munit.FunSuite:
     assert(PostgreSqlDialect.render(Vector(retype(SqlType.Varchar(100), SqlType.Varchar(10485760)))).isRight)
     assert(PostgreSqlDialect.render(Vector(retype(SqlType.Numeric(10, 2), SqlType.Numeric(1000, 2)))).isRight)
   }
+
+  test("dropped indexes and unique keys render as templates that name no object and cannot run") {
+    val table = name("my \"users\"", Some("app"))
+    val dropIndex = DropIndex(IndexRef(tableId, Vector(IndexColumn(columnId), IndexColumn(SchemaId("c2"), descending = true))),
+      table, Vector(IndexedColumn(SqlIdentifier("last"), false), IndexedColumn(SqlIdentifier("fi\"rst"), true)))
+    val dropUnique = DropUniqueKey(UniqueKeyRef(tableId, Vector(columnId)), table, Vector(SqlIdentifier("email")))
+    assertEquals(PostgreSqlDialect.render(Vector(dropIndex, dropUnique)), Right(Vector(
+      "DROP INDEX \"app\".<the index (\"last\", \"fi\"\"rst\" DESC) of \"app\".\"my \"\"users\"\"\", found under the migration lock>;",
+      "ALTER TABLE \"app\".\"my \"\"users\"\"\" DROP CONSTRAINT <the unique key (\"email\"), found under the migration lock>;"
+    )))
+    assert(SchemaOperation.boundAtExecution(dropIndex) && SchemaOperation.boundAtExecution(dropUnique))
+    assert(!SchemaOperation.boundAtExecution(rename("a", "b")))
+    assert(PostgreSqlDialect.render(Vector(dropUnique.copy(columns = Vector.empty))).isLeft)
+    assert(PostgreSqlDialect.render(Vector(dropIndex.copy(columns = dropIndex.columns.map(_.copy(descending = false))))).isLeft)
+  }
+
+  test("bound drops use the catalog's names, quoted, and no IF EXISTS") {
+    assertEquals(PostgreSqlDialect.renderDropIndex(SqlIdentifier("app"), SqlIdentifier("my \"users\"_last_idx")),
+      "DROP INDEX \"app\".\"my \"\"users\"\"_last_idx\";")
+    assertEquals(PostgreSqlDialect.renderDropConstraint(name("people", Some("app")), SqlIdentifier("users_email_key")),
+      "ALTER TABLE \"app\".\"people\" DROP CONSTRAINT \"users_email_key\";")
+  }

@@ -123,3 +123,50 @@ class MigrationPlannerSuite extends munit.FunSuite:
     assertEquals(nulls.query, DataQuery.Nulls(account.name,
       Projection.Filled(Some(copy.name), FillValue.Column(source.name), SqlType.BigInt)))
   }
+
+  private val keyed = account.copy(uniqueKeys = Vector(UniqueKeyModel(Vector(name.id))))
+  private val unkeyed = SchemaModel(Vector(account.copy(uniqueKeys = Vector.empty)))
+  private val nameKey = UniqueKeyRef(account.id, Vector(name.id))
+
+  test("dropping a unique key needs its own approval, which names it by signature and as a setting entry") {
+    val blocked = plan(unkeyed, history(SchemaModel(Vector(keyed))))
+    assertEquals((blocked.complete, blocked.executable), (true, false))
+    val problem = blocked.problems.head
+    assertEquals((problem.code, problem.subject), (PlanProblem.ApprovalMissing, Some(nameKey.signature)))
+    assert(problem.message.contains(s"Approval.DropUniqueKey(\"${nameKey.signature}\")"), problem.message)
+    assert(problem.message.contains(s"drop-unique:${nameKey.signature}"), problem.message)
+    assertEquals(blocked.steps.collect { case s: PlanStep.Statement => s.approval }, Vector(Some(Approval.dropUniqueKey(nameKey))))
+    assert(plan(unkeyed, history(SchemaModel(Vector(keyed))), ExecutionOptions(approvals = Set(Approval.dropUniqueKey(nameKey))))
+      .executable)
+  }
+
+  test("neither another key's approval nor drop or revert approvals permit dropping a unique key") {
+    val other = UniqueKeyRef(account.id, Vector(bio.id))
+    val all = Set[Approval](Approval.dropUniqueKey(other), Approval.Drop(name.id), Approval.Drop(account.id), Approval.Revert(1))
+    val result = plan(unkeyed, history(unkeyed, SchemaModel(Vector(keyed))), ExecutionOptions(approvals = all))
+    assertEquals(result.problems.map(_.code), Vector(PlanProblem.ApprovalMissing))
+  }
+
+  test("a dropped plain index needs no approval; bound steps are found under the names before the migration") {
+    val indexed = account.copy(indexes = Vector(IndexModel(Vector(IndexColumn(name.id, descending = true)))))
+    val renamed = account.copy(name = QualifiedName(SqlIdentifier("accounts")),
+      columns = Vector(name.copy(name = SqlIdentifier("display_name")), bio), uniqueKeys = Vector.empty)
+    val result = plan(SchemaModel(Vector(renamed)), history(SchemaModel(Vector(indexed.copy(uniqueKeys = keyed.uniqueKeys)))),
+      ExecutionOptions(approvals = Set(Approval.dropUniqueKey(nameKey))))
+    assert(result.executable, result.problems)
+    assertEquals(MigrationPlanner.bindings(result).map((index, operation, table, columns) =>
+      (index, operation.getClass.getSimpleName, table, columns)), Vector(
+      (2, "DropUniqueKey", account.name, Vector(name.name)),
+      (3, "DropIndex", account.name, Vector(name.name))))
+    assertEquals(result.operations.take(2).map(_.getClass.getSimpleName), Vector("RenameTable", "RenameColumn"))
+  }
+
+  test("approval entries read back as the approvals that wrote them; malformed entries are refused") {
+    Vector(Approval.Drop(SchemaId("a/b")), Approval.RenameBack(SchemaId("c")), Approval.Revert(3),
+      Approval.dropUniqueKey(nameKey)).foreach { approval =>
+      assertEquals(Approval.parse(Approval.entry(approval)), Right(approval))
+    }
+    Vector("drop-unique:", "drop-unique:abc", "drop-unique:u1-XYZ", "unique:u1-00", "revert:0").foreach { entry =>
+      assert(Approval.parse(entry).isLeft, entry)
+    }
+  }

@@ -110,12 +110,12 @@ final class JdbcMigrationPreview(
             details = existing.map(name => s"${name.display} exists"))
         }
         val plan = MigrationPlanner.plan(backend, options, history, records, target, targetFingerprint, backfills, existing)
-        schemaChecks(connection, plan, checks)
+        val bound = schemaChecks(connection, plan, checks)
         dataChecks(connection, plan, previewOptions, checks)
-        report(empty, plan, checks.result)
+        report(empty, plan, checks.result, bound)
 
-  private def report(empty: PreviewReport, plan: MigrationPlan, checks: Vector[PreviewCheck]): PreviewReport =
-    val steps = PreviewReport.steps(plan)
+  private def report(empty: PreviewReport, plan: MigrationPlan, checks: Vector[PreviewCheck], bound: Map[Int, String]): PreviewReport =
+    val steps = PreviewReport.steps(plan, bound)
     val required = plan.steps.collect { case PlanStep.Statement(_, _, Some(approval), _) => approval }.distinct
     val findings = plan.problems.map { problem =>
       val step = problem.subject.flatMap(subject => steps.find(_.subjects.contains(subject)).map(_.number))
@@ -151,7 +151,7 @@ final class JdbcMigrationPreview(
   /** The database must match the model the plan starts from, relations it creates must be
     * free, and a manual migration's removed relations must be gone.
     */
-  private def schemaChecks(connection: Connection, plan: MigrationPlan, checks: Checks): Unit =
+  private def schemaChecks(connection: Connection, plan: MigrationPlan, checks: Checks): Map[Int, String] =
     def matches(model: SchemaModel, label: String): Unit =
       checks.run(PreviewCheck.SchemaMatches, s"The database matches the $label", required = true) {
         val inspection = backend.inspect(connection, model)
@@ -163,8 +163,12 @@ final class JdbcMigrationPreview(
           details = inspection.differences ++ inspection.undecided)
       }
     plan.mode match
-      case PlanMode.NoChange => matches(plan.target, "applied schema")
-      case PlanMode.Adoption => matches(plan.target, "target schema it adopts")
+      case PlanMode.NoChange =>
+        matches(plan.target, "applied schema")
+        Map.empty
+      case PlanMode.Adoption =>
+        matches(plan.target, "target schema it adopts")
+        Map.empty
       case PlanMode.ManualMigration =>
         checks.run(PreviewCheck.RelationsAbsent, "Relations the target no longer has are gone", required = true) {
           val remaining = backend.existingRelations(connection, SchemaModel(
@@ -175,6 +179,7 @@ final class JdbcMigrationPreview(
             details = remaining.map(name => s"${name.display} still exists"))
         }
         matches(plan.target, "target schema migrated by hand")
+        Map.empty
       case PlanMode.Migration =>
         if plan.history.nonEmpty then matches(plan.previous, "stored schema")
         val created = plan.operations.flatMap {
@@ -193,6 +198,30 @@ final class JdbcMigrationPreview(
               details = taken.map(name => s"${name.display} is taken"))
           }
         typeChangeChecks(connection, plan, checks)
+        bindingChecks(connection, plan, checks)
+
+  /** Binds every dropped index and unique key as the migration will, but only reading; returns
+    * the SQL by step index. The migration binds again under its locks.
+    */
+  private def bindingChecks(connection: Connection, plan: MigrationPlan, checks: Checks): Map[Int, String] =
+    val bound = Map.newBuilder[Int, String]
+    MigrationPlanner.bindings(plan).foreach { (index, operation, table, columns) =>
+      val description = s"The database has exactly the object step ${index + 1} drops, and nothing depends on it"
+      val subject = operation match
+        case SchemaOperation.DropUniqueKey(ref, _, _) => Some(ref.signature)
+        case SchemaOperation.DropIndex(ref, _, _) => Some(ref.table.value)
+        case _ => None
+      checks.run(PreviewCheck.DropTargetFound, description, required = true, Some(index + 1), subject) {
+        backend.bindDrop(connection, operation, table, columns) match
+          case Right(sql) =>
+            bound += index -> sql
+            PreviewCheck(PreviewCheck.DropTargetFound, description, CheckStatus.Passed, true, Some(index + 1), subject,
+              Vector(s"Bound as: $sql"))
+          case Left(problems) =>
+            PreviewCheck(PreviewCheck.DropTargetFound, description, CheckStatus.Failed, true, Some(index + 1), subject, problems)
+      }
+    }
+    bound.result()
 
   /** Objects outside the model that keep a column from changing its type block the migration;
     * the size of each retyped table tells how much a rewrite may have to copy.

@@ -28,7 +28,8 @@ columns), inheritance (all three strategies), `@ManyToOne`, `@OneToOne` and `@Ma
 associations, element collections (sets, lists, ordered lists and maps), secondary tables,
 `@Lob`, JSON columns (`jsonb`), unique constraints and indexes can be mapped. The executor
 creates, renames, adds, widens a column (a longer `VARCHAR`, `INTEGER` to `BIGINT`, a larger
-`NUMERIC` precision with the same scale) and, with explicit approval, drops; it adopts a
+`NUMERIC` precision with the same scale), replaces and drops indexes and unique keys (dropping a
+unique key needs its own approval) and, with explicit approval, drops; it adopts a
 matching database without history and accepts changes migrated by hand. Everything else,
 such as arrays, collections inside embeddables or any other type change, is refused with a
 message, never guessed.
@@ -122,7 +123,7 @@ schema management may at most validate: `hibernate.hbm2ddl.auto` and
 | Setting | Meaning |
 | --- | --- |
 | `hibernate.ddl_manager.adopt_existing_schema` | `true` adopts a matching database without history |
-| `hibernate.ddl_manager.approvals` | Comma-separated `drop:<id>`, `rename-back:<id>`, `revert:<revision>` |
+| `hibernate.ddl_manager.approvals` | Comma-separated `drop:<id>`, `rename-back:<id>`, `revert:<revision>`, `drop-unique:<signature>` (a plan that needs one names the entry) |
 | `hibernate.ddl_manager.accept_manual_migration` | Fingerprint of a target migrated by hand |
 | `hibernate.ddl_manager.lock_timeout_millis` | Default 5000 |
 | `hibernate.ddl_manager.statement_timeout_millis` | Default 30000 |

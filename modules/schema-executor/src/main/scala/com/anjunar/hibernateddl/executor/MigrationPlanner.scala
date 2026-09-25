@@ -230,6 +230,12 @@ object MigrationPlanner:
             Vector(drop("column", columnId, s"${table.display}.${column.value}"))
           case SchemaOperation.DropTables(tables) => tables.map(table => drop("table", table.tableId, table.table.display))
           case SchemaOperation.DropSequence(id, sequence) => Vector(drop("sequence", id, sequence.display))
+          case SchemaOperation.DropUniqueKey(ref, table, columns) =>
+            val approval = Approval.dropUniqueKey(ref)
+            Vector(approval -> (s"Dropping unique key ${ref.display} of table '${ref.table.value}' " +
+              s"(${table.display} ${columns.map(_.value).mkString("(", ", ", ")")}) lets its columns hold duplicates; if " +
+              s"intended, approve it with Approval.DropUniqueKey(\"${ref.signature}\") or the setting entry " +
+              Approval.entry(approval)))
           case _ => Vector.empty
         val approvals = operations.map(needed)
         val approvalProblems = approvals.flatten.collect {
@@ -274,6 +280,7 @@ object MigrationPlanner:
     case Approval.Drop(id) => id.value
     case Approval.RenameBack(id) => id.value
     case Approval.Revert(revision) => revision.toString
+    case Approval.DropUniqueKey(signature) => signature
 
   /** Resolves the one pending backfill for each column that becomes required in an existing
     * table. The columns it may read are the target table's, plus the previous ones that are
@@ -356,6 +363,23 @@ object MigrationPlanner:
       plan.previous.tables.find(_.id == change.tableId).flatMap { table =>
         table.columns.find(_.id == change.columnId).map(column => (change, table.name, column.name))
       }
+    }
+
+  /** The steps whose SQL is bound at execution, by index, with the table and column names the
+    * database has before the migration, where the objects they drop are looked up.
+    */
+  def bindings(plan: MigrationPlan): Vector[(Int, SchemaOperation, QualifiedName, Vector[SqlIdentifier])] =
+    def current(tableId: SchemaId, columns: Vector[SchemaId]) =
+      plan.previous.tables.find(_.id == tableId).map { table =>
+        (table.name, columns.flatMap(id => table.columns.find(_.id == id).map(_.name)))
+      }
+    plan.steps.zipWithIndex.collect { case (PlanStep.Statement(operation, _, _, _), index)
+        if SchemaOperation.boundAtExecution(operation) => (index, operation) }.flatMap { (index, operation) =>
+      val names = operation match
+        case SchemaOperation.DropIndex(ref, _, _) => current(ref.table, ref.columns.map(_.column))
+        case SchemaOperation.DropUniqueKey(ref, _, _) => current(ref.table, ref.columns)
+        case _ => None
+      names.map((table, columns) => (index, operation, table, columns))
     }
 
   /** Why objects outside the model keep a column from changing its type. */

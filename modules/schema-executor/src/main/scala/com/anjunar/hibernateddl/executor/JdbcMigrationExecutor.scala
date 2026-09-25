@@ -139,9 +139,10 @@ final class JdbcMigrationExecutor(
           Option.when(blockers.nonEmpty)(MigrationPlanner.blockedTypeChange(change.columnId, table, column, blockers))
         }
         if blocked.nonEmpty then refuse(blocked)
-        val filled = plan.steps.flatMap(step => run(connection, step))
+        val steps = bind(connection, plan)
+        val filled = steps.flatMap(step => run(connection, step))
         validateDatabase(connection, target, "Target schema")
-        val statements = plan.steps.collect {
+        val statements = steps.collect {
           case step: PlanStep.Statement => step.sql
           case step: PlanStep.Fill => step.statement.sql
         }
@@ -149,6 +150,22 @@ final class JdbcMigrationExecutor(
         val outcomes = filled.map((backfill, rows) => (backfill, BackfillResult.Executed, Some(rows))) ++
           plan.created.map(backfill => (backfill, BackfillResult.NotRequiredOnCreation, None))
         MigrationResult(next, MigrationStatus.Applied, statements.size, recordBackfills(connection, plan, outcomes), plan.pending)
+
+  /** The plan's steps with every bound-at-execution template replaced by the SQL for the object
+    * the catalog shows now, under the locks and before any DDL; replacements created later can
+    * therefore never be taken for the objects they replace. The history records this SQL.
+    */
+  private def bind(connection: Connection, plan: MigrationPlan): Vector[PlanStep] =
+    val bindings = MigrationPlanner.bindings(plan)
+    val results = bindings.map((index, operation, table, columns) => index -> backend.bindDrop(connection, operation, table, columns))
+    val problems = results.flatMap(_._2.left.toOption).flatten
+    if problems.nonEmpty then refuse(problems)
+    val bound = results.collect { case (index, Right(sql)) => index -> sql }.toMap
+    plan.steps.zipWithIndex.map {
+      case (step: PlanStep.Statement, index) if SchemaOperation.boundAtExecution(step.operation) =>
+        step.copy(sql = bound.getOrElse(index, refuse(Vector(s"Step ${index + 1} names no object it could be bound to"))))
+      case (step, _) => step
+    }
 
   private def recordBackfills(
       connection: Connection,

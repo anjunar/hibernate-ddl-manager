@@ -54,6 +54,15 @@ object PostgreSqlDialect extends SchemaDialect:
         validateName(table, "table") ++
           columns.flatMap(validateIdentifier(_, "unique key column")) ++
           Option.when(columns.isEmpty)("A unique key needs at least one column.").toVector
+      case SchemaOperation.DropIndex(ref, table, columns) =>
+        validateName(table, "table") ++
+          columns.flatMap(column => validateIdentifier(column.name, "index column")) ++
+          Option.when(columns.isEmpty || columns.map(_.descending) != ref.columns.map(_.descending))(
+            "A dropped index needs its columns with their directions.").toVector
+      case SchemaOperation.DropUniqueKey(ref, table, columns) =>
+        validateName(table, "table") ++
+          columns.flatMap(validateIdentifier(_, "unique key column")) ++
+          Option.when(columns.isEmpty || columns.size != ref.columns.size)("A dropped unique key needs its columns.").toVector
       case SchemaOperation.AddForeignKey(_, table, columns, referencedTable, referencedColumns) =>
         validateName(table, "table") ++
           validateName(referencedTable, "referenced table") ++
@@ -190,6 +199,15 @@ object PostgreSqlDialect extends SchemaDialect:
         s"CREATE INDEX ON ${qualified(table)} (${keys.mkString(", ")});"
       case SchemaOperation.AddUniqueKey(_, table, columns) =>
         s"ALTER TABLE ${qualified(table)} ADD UNIQUE (${columns.map(quoted).mkString(", ")});"
+      // Templates: the database named these objects, so the executor binds the name under the
+      // migration lock. The placeholder is no SQL, so a template can never run by mistake.
+      case SchemaOperation.DropIndex(_, table, columns) =>
+        val keys = columns.map(column => quoted(column.name) + (if column.descending then " DESC" else ""))
+        s"DROP INDEX ${table.schema.fold("")(quoted(_) + ".")}<the index (${keys.mkString(", ")}) of ${qualified(table)}, " +
+          "found under the migration lock>;"
+      case SchemaOperation.DropUniqueKey(_, table, columns) =>
+        s"ALTER TABLE ${qualified(table)} DROP CONSTRAINT <the unique key (${columns.map(quoted).mkString(", ")}), " +
+          "found under the migration lock>;"
       case SchemaOperation.AddForeignKey(_, table, columns, referencedTable, referencedColumns) =>
         s"ALTER TABLE ${qualified(table)} ADD FOREIGN KEY (${columns.map(quoted).mkString(", ")}) " +
           s"REFERENCES ${qualified(referencedTable)} (${referencedColumns.map(quoted).mkString(", ")});"
@@ -212,6 +230,16 @@ object PostgreSqlDialect extends SchemaDialect:
         s"DROP TABLE ${tables.map(table => qualified(table.table)).mkString(", ")};"
       case SchemaOperation.DropSequence(_, sequence) =>
         s"DROP SEQUENCE ${qualified(sequence)};"
+
+  /** A bound [[SchemaOperation.DropIndex]]: an index lives in its table's schema. No IF EXISTS,
+    * which would hide an index that is missing after all.
+    */
+  private[postgresql] def renderDropIndex(schema: SqlIdentifier, index: SqlIdentifier): String =
+    s"DROP INDEX ${quoted(schema)}.${quoted(index)};"
+
+  /** A bound [[SchemaOperation.DropUniqueKey]], on the table under the name it has when the step runs. */
+  private[postgresql] def renderDropConstraint(table: QualifiedName, constraint: SqlIdentifier): String =
+    s"ALTER TABLE ${qualified(table)} DROP CONSTRAINT ${quoted(constraint)};"
 
   private def renderColumn(column: ColumnModel): String =
     val nullable = if column.nullable then "" else " NOT NULL"

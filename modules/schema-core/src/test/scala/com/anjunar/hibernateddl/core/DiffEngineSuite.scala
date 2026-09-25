@@ -231,7 +231,7 @@ class DiffEngineSuite extends munit.FunSuite:
     assert(errors(DiffEngine.diff(before, changed)).exists(_.contains("Changing foreign key (customer-category)")))
   }
 
-  test("unique keys are created with a new table or added to an existing one; dropping them is refused") {
+  test("unique keys are created with a new table or added to an existing one, and dropped while their columns remain") {
     val code = column("customer-code", "code")
     val email = column("customer-email", "email")
     val unique = customer.copy(columns = customer.columns ++ Vector(code, email),
@@ -248,10 +248,12 @@ class DiffEngineSuite extends munit.FunSuite:
     val renamed = SchemaModel(Vector(unique.copy(columns = unique.columns.map(c => c.copy(name = SqlIdentifier(c.name.value + "_new"))))))
     assert(DiffEngine.diff(before, renamed).toOption.get.forall(_.isInstanceOf[SchemaOperation.RenameColumn]))
     val dropped = SchemaModel(Vector(unique.copy(uniqueKeys = unique.uniqueKeys.take(1))))
-    assert(errors(DiffEngine.diff(before, dropped)).exists(_.contains("Dropping unique key (customer-code, customer-name)")))
+    assertEquals(DiffEngine.diff(before, dropped), Right(Vector(SchemaOperation.DropUniqueKey(
+      UniqueKeyRef(customer.id, Vector(code.id, customer.columns.head.id)), customer.name,
+      Vector(SqlIdentifier("code"), SqlIdentifier("name"))))))
   }
 
-  test("indexes are created after their table or added to an existing one; dropping or changing them is refused") {
+  test("indexes are created after their table or added to an existing one; a changed direction replaces the index") {
     val code = column("customer-code", "code")
     val nameIndex = IndexModel(Vector(IndexColumn(customer.columns.head.id)))
     val codeIndex = IndexModel(Vector(IndexColumn(code.id, descending = true), IndexColumn(customer.columns.head.id)))
@@ -268,8 +270,11 @@ class DiffEngineSuite extends munit.FunSuite:
     )))
     val before = SchemaModel(Vector(indexed))
     val flipped = SchemaModel(Vector(indexed.copy(indexes = Vector(codeIndex, IndexModel(Vector(IndexColumn(customer.columns.head.id, true)))))))
-    val diagnostics = errors(DiffEngine.diff(before, flipped))
-    assert(diagnostics.exists(_.contains("Dropping index (customer-name) from table 'customer'")), diagnostics)
+    assertEquals(DiffEngine.diff(before, flipped), Right(Vector(
+      SchemaOperation.CreateIndex(customer.id, customer.name, Vector(SchemaOperation.IndexedColumn(SqlIdentifier("name"), true))),
+      SchemaOperation.DropIndex(IndexRef(customer.id, Vector(IndexColumn(customer.columns.head.id))), customer.name,
+        Vector(SchemaOperation.IndexedColumn(SqlIdentifier("name"), false)))
+    )))
   }
 
   test("changed column checks are replaced, also together with a rename, and new columns carry theirs") {
@@ -423,4 +428,68 @@ class DiffEngineSuite extends munit.FunSuite:
       SchemaOperation.ChangeColumnType(retypedTable.id, newName, SchemaId("r-name"), SqlIdentifier("Display \"Name\""),
         SqlType.Varchar(100), SqlType.Varchar(255))
     )))
+  }
+
+  private val lastName = column("person-last", "last_name")
+  private val firstName = column("person-first", "first_name")
+  private val personTenant = column("person-tenant", "tenant_id").copy(nullable = false)
+  private val personEmail = column("person-email", "email")
+  private def people(uniqueKeys: Vector[Vector[ColumnModel]], indexes: Vector[Vector[(ColumnModel, Boolean)]]) =
+    SchemaModel(Vector(table("person", "person", lastName, firstName, personTenant, personEmail).copy(
+      uniqueKeys = uniqueKeys.map(columns => UniqueKeyModel(columns.map(_.id))),
+      indexes = indexes.map(columns => IndexModel(columns.map((c, descending) => IndexColumn(c.id, descending)))))))
+  private def dropIndex(columns: (ColumnModel, Boolean)*) = SchemaOperation.DropIndex(
+    IndexRef(SchemaId("person"), columns.toVector.map((c, d) => IndexColumn(c.id, d))), QualifiedName(SqlIdentifier("person")),
+    columns.toVector.map((c, d) => SchemaOperation.IndexedColumn(c.name, d)))
+  private def createIndex(columns: (ColumnModel, Boolean)*) = SchemaOperation.CreateIndex(SchemaId("person"),
+    QualifiedName(SqlIdentifier("person")), columns.toVector.map((c, d) => SchemaOperation.IndexedColumn(c.name, d)))
+  private def dropUnique(columns: ColumnModel*) = SchemaOperation.DropUniqueKey(
+    UniqueKeyRef(SchemaId("person"), columns.toVector.map(_.id)), QualifiedName(SqlIdentifier("person")), columns.toVector.map(_.name))
+  private def addUnique(columns: ColumnModel*) =
+    SchemaOperation.AddUniqueKey(SchemaId("person"), QualifiedName(SqlIdentifier("person")), columns.toVector.map(_.name))
+
+  test("an extended, reordered or redirected index is created first, then exactly the old one is dropped") {
+    val before = people(Vector.empty, Vector(Vector(lastName -> false)))
+    assertEquals(DiffEngine.diff(before, people(Vector.empty, Vector(Vector(lastName -> false, firstName -> false)))),
+      Right(Vector(createIndex(lastName -> false, firstName -> false), dropIndex(lastName -> false))))
+    val pair = people(Vector.empty, Vector(Vector(lastName -> false, firstName -> false)))
+    assertEquals(DiffEngine.diff(pair, people(Vector.empty, Vector(Vector(firstName -> false, lastName -> false)))),
+      Right(Vector(createIndex(firstName -> false, lastName -> false), dropIndex(lastName -> false, firstName -> false))))
+    assertEquals(DiffEngine.diff(pair, people(Vector.empty, Vector(Vector(lastName -> false, firstName -> true)))),
+      Right(Vector(createIndex(lastName -> false, firstName -> true), dropIndex(lastName -> false, firstName -> false))))
+    assertEquals(DiffEngine.diff(before, people(Vector.empty, Vector.empty)), Right(Vector(dropIndex(lastName -> false))))
+  }
+
+  test("a unique key on more columns replaces the old one, which is dropped as a key of its own") {
+    val global = people(Vector(Vector(personEmail)), Vector.empty)
+    val perTenant = people(Vector(Vector(personTenant, personEmail)), Vector.empty)
+    assertEquals(DiffEngine.diff(global, perTenant), Right(Vector(addUnique(personTenant, personEmail), dropUnique(personEmail))))
+    assertEquals(DiffEngine.diff(perTenant, global), Right(Vector(addUnique(personEmail), dropUnique(personTenant, personEmail))))
+    assertEquals(DiffEngine.diff(global, people(Vector.empty, Vector.empty)), Right(Vector(dropUnique(personEmail))))
+  }
+
+  test("switching between a unique key and a plain index creates the new structure before dropping the old one") {
+    val unique = people(Vector(Vector(personEmail)), Vector.empty)
+    val indexed = people(Vector.empty, Vector(Vector(personEmail -> false)))
+    assertEquals(DiffEngine.diff(unique, indexed), Right(Vector(createIndex(personEmail -> false), dropUnique(personEmail))))
+    assertEquals(DiffEngine.diff(indexed, unique), Right(Vector(addUnique(personEmail), dropIndex(personEmail -> false))))
+  }
+
+  test("renames keep unique keys and indexes, and later steps use the new names") {
+    val before = people(Vector(Vector(personEmail)), Vector(Vector(lastName -> false)))
+    val renamed = before.tables.head.copy(name = QualifiedName(SqlIdentifier("people")), columns = before.tables.head.columns.map { c =>
+      if c.id == personEmail.id then c.copy(name = SqlIdentifier("mail")) else c
+    })
+    assertEquals(DiffEngine.diff(before, SchemaModel(Vector(renamed))).map(_.map(_.getClass.getSimpleName)),
+      Right(Vector("RenameTable", "RenameColumn")))
+    val replaced = SchemaModel(Vector(renamed.copy(uniqueKeys = Vector(UniqueKeyModel(Vector(personTenant.id, personEmail.id))))))
+    assertEquals(DiffEngine.diff(before, replaced).map(_.last), Right(SchemaOperation.DropUniqueKey(
+      UniqueKeyRef(SchemaId("person"), Vector(personEmail.id)), QualifiedName(SqlIdentifier("people")), Vector(SqlIdentifier("mail")))))
+  }
+
+  test("a dropped column takes its unique keys and indexes along, without drops or approvals of their own") {
+    val before = people(Vector(Vector(personTenant, personEmail)), Vector(Vector(personEmail -> true, lastName -> false)))
+    val after = SchemaModel(Vector(table("person", "person", lastName, firstName, personTenant)))
+    assertEquals(DiffEngine.diff(before, after), Right(Vector(SchemaOperation.DropColumn(SchemaId("person"),
+      QualifiedName(SqlIdentifier("person")), personEmail.id, personEmail.name))))
   }
