@@ -19,6 +19,8 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
   private class Harness:
     val events = ArrayBuffer.empty[String]
     var freshAutoCommit = true
+    /** The connection's isolation level; it arrives as SERIALIZABLE. */
+    var isolation = Connection.TRANSACTION_SERIALIZABLE
     var failAt = Set.empty[String]
     /** Committed history; a recorded entry becomes part of it only when the transaction commits. */
     var history = Vector.empty[HistoryEntry]
@@ -51,9 +53,11 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
         case "setAutoCommit" =>
           event(s"auto-commit:${args(0)}")
           null
+        case "getTransactionIsolation" => Int.box(isolation)
         case "setTransactionIsolation" =>
-          assertEquals(args(0), Int.box(Connection.TRANSACTION_READ_COMMITTED))
-          event("read-committed")
+          val level = args(0).asInstanceOf[Integer].intValue
+          event(if level == Connection.TRANSACTION_READ_COMMITTED then "read-committed" else s"isolation:$level")
+          isolation = level
           null
         case "createStatement" =>
           statementNumber += 1
@@ -150,7 +154,7 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     assertEquals(h.events.toVector, Vector(
       "connection", "get-auto-commit", "auto-commit:false", "read-committed", "lock", "initialize-history",
       "read-history", "existing-relations", "validate:", "statement:1", "timeout:1:30", "sql:1:create table", "close-statement:1",
-      "validate:account", "record-history", "commit", "close"
+      "validate:account", "record-history", "commit", "auto-commit:true", "isolation:8", "close"
     ))
     val entry = h.history.head
     assertEquals(entry.revision, 1L)
@@ -169,7 +173,7 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
       "read-history", "validate:account",
       "statement:1", "timeout:1:30", "sql:1:rename table", "close-statement:1",
       "statement:2", "timeout:2:30", "sql:2:rename column", "close-statement:2",
-      "validate:accounts", "record-history", "commit", "close"
+      "validate:accounts", "record-history", "commit", "auto-commit:true", "isolation:8", "close"
     ))
     val entry = h.history.last
     assertEquals(entry.revision, 2L)
@@ -184,7 +188,7 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     assertEquals(h.migrate(reordered), MigrationResult(1, MigrationStatus.AlreadyApplied, 0))
     assertEquals(h.events.toVector, Vector(
       "connection", "get-auto-commit", "auto-commit:false", "read-committed", "lock", "initialize-history",
-      "read-history", "validate-shared:account", "commit", "close"
+      "read-history", "validate-shared:account", "commit", "auto-commit:true", "isolation:8", "close"
     ))
     h.events.clear()
     h.driftAt = Set("account")
@@ -208,7 +212,7 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     assertEquals(h.migrate(initial, adopt), MigrationResult(1, MigrationStatus.Adopted, 0))
     assertEquals(h.events.toVector, Vector(
       "connection", "get-auto-commit", "auto-commit:false", "read-committed", "lock", "initialize-history",
-      "read-history", "existing-relations", "validate:account", "record-history", "commit", "close"
+      "read-history", "existing-relations", "validate:account", "record-history", "commit", "auto-commit:true", "isolation:8", "close"
     ))
     assertEquals(h.history, Vector(HistoryEntry(1, SchemaFingerprint.of(empty), SchemaFingerprint.of(initial),
       SchemaModelJson.encode(initial), Vector.empty)))
@@ -337,7 +341,7 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     assertEquals(h.migrate(retyped, manual), MigrationResult(2, MigrationStatus.ManuallyMigrated, 0))
     assertEquals(h.events.toVector, Vector(
       "connection", "get-auto-commit", "auto-commit:false", "read-committed", "lock", "initialize-history",
-      "read-history", "existing-relations", "validate:account", "record-history", "commit", "close"
+      "read-history", "existing-relations", "validate:account", "record-history", "commit", "auto-commit:true", "isolation:8", "close"
     ))
     assertEquals(h.history.last, HistoryEntry(2, SchemaFingerprint.of(initial), fingerprint,
       SchemaModelJson.encode(retyped), Vector.empty))
@@ -376,7 +380,7 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     val h = new Harness
     h.seed(initial)
     assert(h.refused(retyped).getMessage.contains("Changing type"))
-    assert(h.events.containsSlice(Vector("read-history", "rollback", "close")), h.events)
+    assert(h.events.containsSlice(Vector("read-history", "rollback", "auto-commit:true", "isolation:8", "close")), h.events)
     val render = new Harness
     render.renderErrors = Vector("Cannot render plan")
     assert(render.refused(initial).getMessage.contains("Cannot render plan"))
@@ -446,9 +450,8 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
         h.failAt = Set(stage)
         val error = h.refused(renamed)
         assertEquals(error.state, FailureState.RolledBack)
-        assert(h.events.contains("rollback"))
-        assertEquals(h.events.last, "close")
-        assert(!h.events.contains("auto-commit:true"))
+        // Auto-commit comes back only after the confirmed rollback.
+        assertEquals(h.events.takeRight(4).toVector, Vector("rollback", "auto-commit:true", "isolation:8", "close"))
       }
   }
 
@@ -463,11 +466,40 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     }
   }
 
-  test("commit failure remains OutcomeUnknown even if rollback succeeds") {
+  test("commit failure remains OutcomeUnknown even if rollback succeeds; the ended transaction is restored") {
     val h = new Harness
     h.failAt = Set("commit")
     assertEquals(intercept[MigrationException](h.migrate(initial)).state, FailureState.OutcomeUnknown)
-    assertEquals(h.events.takeRight(3).toVector, Vector("commit", "rollback", "close"))
+    assertEquals(h.events.takeRight(5).toVector, Vector("commit", "rollback", "auto-commit:true", "isolation:8", "close"))
+    assertEquals(h.isolation, java.sql.Connection.TRANSACTION_SERIALIZABLE)
+  }
+
+  test("the connection goes back with its auto-commit mode and isolation level after success and rollback") {
+    val applied = new Harness
+    applied.migrate(initial)
+    assertEquals(applied.events.takeRight(4).toVector, Vector("commit", "auto-commit:true", "isolation:8", "close"))
+    val rolledBack = new Harness
+    rolledBack.driftAt = Set("account")
+    assertEquals(rolledBack.refused(initial).state, FailureState.RolledBack)
+    assertEquals(rolledBack.events.takeRight(4).toVector, Vector("rollback", "auto-commit:true", "isolation:8", "close"))
+    Vector(applied, rolledBack).foreach(h => assertEquals(h.isolation, java.sql.Connection.TRANSACTION_SERIALIZABLE))
+  }
+
+  test("a connection that cannot be restored is aborted, and the failure is reported even after a commit") {
+    val committed = new Harness
+    committed.failAt = Set("isolation:8")
+    val error = intercept[MigrationException](committed.migrate(initial))
+    assertEquals(error.state, FailureState.Committed)
+    assert(error.getMessage.contains("committed revision 1"), error.getMessage)
+    assertEquals(committed.history.size, 1)
+    assertEquals(committed.events.takeRight(5).toVector, Vector("commit", "auto-commit:true", "isolation:8", "abort", "close"))
+    val rolledBack = new Harness
+    rolledBack.driftAt = Set("account")
+    rolledBack.failAt = Set("auto-commit:true")
+    val refused = rolledBack.refused(initial)
+    assertEquals(refused.state, FailureState.RolledBack)
+    assert(refused.getCause.getSuppressed.map(_.getMessage).contains("Failure at auto-commit:true"))
+    assertEquals(rolledBack.events.takeRight(4).toVector, Vector("rollback", "auto-commit:true", "abort", "close"))
   }
 
   test("rollback failure aborts the connection and never resets auto-commit") {
