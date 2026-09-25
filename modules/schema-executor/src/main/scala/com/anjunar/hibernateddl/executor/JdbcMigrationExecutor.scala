@@ -7,7 +7,9 @@ import scala.util.control.NonFatal
 
 /** Migrates the database to the target model during server startup, using one owned transaction.
   * The previous model is the one the latest history entry stored; without history it is the
-  * empty model. Because stable IDs never change, a server may skip releases. A target equal
+  * empty model, unless the database already contains the target's tables: such a database is
+  * adopted only when enabled and matching exactly, and refused otherwise. Because stable IDs
+  * never change, a server may skip releases. A target equal
   * to an earlier revision, or renaming something back to an earlier name, is what a server
   * with an older model would do and is refused.
   *
@@ -51,13 +53,16 @@ final class JdbcMigrationExecutor(
             throw new IllegalStateException(s"Target schema equals revision ${older.entry.revision}, but the database " +
               s"is at revision $revision; a server with an older schema must not start after a newer migration")
           }
-          val statements = plan(history, previous, target)
-          validateDatabase(connection, previous, "Previous schema")
-          statements.foreach(sql => execute(connection, sql))
-          validateDatabase(connection, target, "Target schema")
-          backend.recordHistory(connection, HistoryEntry(revision + 1, previousFingerprint, targetFingerprint,
-            SchemaModelJson.encode(target), statements))
-          MigrationResult(revision + 1, MigrationStatus.Applied, statements.size)
+          val existing = if history.isEmpty then backend.existingRelations(connection, target) else Vector.empty
+          if existing.nonEmpty then adopt(connection, target, targetFingerprint, existing)
+          else
+            val statements = plan(history, previous, target)
+            validateDatabase(connection, previous, "Previous schema")
+            statements.foreach(sql => execute(connection, sql))
+            validateDatabase(connection, target, "Target schema")
+            backend.recordHistory(connection, HistoryEntry(revision + 1, previousFingerprint, targetFingerprint,
+              SchemaModelJson.encode(target), statements))
+            MigrationResult(revision + 1, MigrationStatus.Applied, statements.size)
       commitAttempted = true
       connection.commit()
       result
@@ -106,6 +111,28 @@ final class JdbcMigrationExecutor(
         throw new MigrationException(s"Migration planning failed: ${error.getMessage}", FailureState.NotStarted, error)
 
   private final case class Applied(entry: HistoryEntry, model: SchemaModel)
+
+  /** Records a database without history as revision 1 without DDL. Every table and sequence of
+    * the target must exist and the database must match the target exactly; nothing is created,
+    * altered or guessed.
+    */
+  private def adopt(
+      connection: Connection,
+      target: SchemaModel,
+      targetFingerprint: String,
+      existing: Vector[QualifiedName]
+  ): MigrationResult =
+    def show(names: Vector[QualifiedName]) = names.map(_.display).distinct.sorted.mkString(", ")
+    if !options.adoptExistingSchema then
+      refuse(Vector(s"The database has no schema history but already contains ${show(existing)} of the target schema; " +
+        "enable adoptExistingSchema to adopt a database that matches the target exactly"))
+    val missing = (target.tables.map(_.name) ++ target.sequences.map(_.name)).filterNot(existing.contains)
+    if missing.nonEmpty then
+      refuse(Vector(s"Adopting the existing schema requires every table and sequence of the target; missing: ${show(missing)}"))
+    validateDatabase(connection, target, "Adopted schema")
+    backend.recordHistory(connection, HistoryEntry(1, EmptyFingerprint, targetFingerprint,
+      SchemaModelJson.encode(target), Vector.empty))
+    MigrationResult(1, MigrationStatus.Adopted, 0)
 
   /** Decodes every stored model and checks that the entries form one unbroken chain. */
   private def verified(entries: Vector[HistoryEntry]): Vector[Applied] =

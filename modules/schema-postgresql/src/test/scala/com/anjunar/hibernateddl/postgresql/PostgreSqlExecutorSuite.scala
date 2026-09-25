@@ -693,3 +693,61 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
       assertEquals(scalar(ds, "SELECT to_regclass('public.users') IS NULL"), "t")
     }
   }
+
+  private val adopting = new JdbcMigrationExecutor(PostgreSqlMigrationBackend, ExecutionOptions(adoptExistingSchema = true))
+
+  test("a database created by Hibernate's hbm2ddl is adopted as revision 1 only when enabled, then migrates normally") {
+    import com.anjunar.hibernateddl.hibernate.*
+    val classes = Seq(classOf[Purchase], classOf[Invoice], classOf[LegacyCustomer], classOf[Account], classOf[Shipment],
+      classOf[Generated], classOf[Ticket], classOf[Voucher], classOf[Vehicle], classOf[Car],
+      classOf[Payment], classOf[CardPayment], classOf[TransferPayment], classOf[Profile])
+    val model = TestMetadata.read(classes*).fold(errors => fail(errors.mkString("\n")), identity)
+    withDatabase { ds =>
+      execute(ds, TestMetadata.createScript(classes*))
+      val refused = intercept[MigrationException](executor.migrate(ds, model))
+      assertEquals(refused.state, FailureState.RolledBack)
+      assert(refused.getMessage.contains("no schema history but already contains public.account, public.car"), refused.getMessage)
+      noHistory(ds)
+      assertEquals(adopting.migrate(ds, model), MigrationResult(1, MigrationStatus.Adopted, 0))
+      assertEquals(scalar(ds, "SELECT cardinality(statements) FROM __hibernate_ddl.schema_history"), "0")
+      assertEquals(adopting.migrate(ds, model), MigrationResult(1, MigrationStatus.AlreadyApplied, 0))
+      val note = ColumnModel(SchemaId("9d8e7f60/5f607182"), SqlIdentifier("note"), SqlType.Text)
+      val extended = model.copy(tables = model.tables.map(t => if t.id.value == "9d8e7f60" then t.copy(columns = t.columns :+ note) else t))
+      assertEquals(executor.migrate(ds, extended), MigrationResult(2, MigrationStatus.Applied, 1))
+    }
+  }
+
+  test("adoption refuses a database that lacks a table or differs from the target, and records nothing") {
+    withDatabase { ds =>
+      execute(ds, "CREATE TABLE public.users (username varchar(100) NOT NULL, extra text)")
+      val drift = intercept[MigrationException](adopting.migrate(ds, initial))
+      assert(drift.getMessage.contains("Adopted schema does not match database"), drift.getMessage)
+      assert(drift.getMessage.contains("unexpected column \"extra\""), drift.getMessage)
+      val other = TableModel(SchemaId("OTHER"), QualifiedName(SqlIdentifier("others"), Some(SqlIdentifier("public"))),
+        Vector(ColumnModel(SchemaId("OTHER_NOTE"), SqlIdentifier("note"), SqlType.Text)))
+      val missing = intercept[MigrationException](adopting.migrate(ds, SchemaModel(Vector(users, other))))
+      assert(missing.getMessage.contains("missing: public.others"), missing.getMessage)
+      noHistory(ds)
+      assertEquals(scalar(ds, "SELECT count(*) FROM public.users"), "0")
+    }
+  }
+
+  test("Hibernate's enum checks carry PostgreSQL's names and block adoption until renamed to their derived names") {
+    import com.anjunar.hibernateddl.hibernate.*
+    val model = TestMetadata.read(classOf[Letter]).fold(errors => fail(errors.mkString("\n")), identity)
+    withDatabase { ds =>
+      execute(ds, TestMetadata.createScript(classOf[Letter]))
+      val drift = intercept[MigrationException](adopting.migrate(ds, model))
+      assert(drift.getMessage.contains("unexpected check constraint \"letter_status_check\""), drift.getMessage)
+      assert(drift.getMessage.contains("on column \"status\" is missing"), drift.getMessage)
+      noHistory(ds)
+      for table <- model.tables; column <- table.columns; check <- column.check do
+        val current = scalar(ds, "SELECT k.conname FROM pg_constraint k JOIN pg_attribute a " +
+          "ON a.attrelid = k.conrelid AND a.attnum = ALL (k.conkey) " +
+          s"WHERE k.conrelid = 'public.letter'::regclass AND k.contype = 'c' AND a.attname = '${column.name.value}'")
+        execute(ds, s"ALTER TABLE public.letter RENAME CONSTRAINT \"$current\" TO " +
+          s"\"${PostgreSqlDialect.checkName(column.id, check).value}\"")
+      assertEquals(adopting.migrate(ds, model), MigrationResult(1, MigrationStatus.Adopted, 0))
+    }
+  }
+

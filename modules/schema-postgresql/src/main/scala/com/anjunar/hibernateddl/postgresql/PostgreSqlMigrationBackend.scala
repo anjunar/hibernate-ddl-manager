@@ -102,6 +102,19 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
         row.getString("target_fingerprint"), row.getString("model"), strings(row, "statements"))
     }
 
+  override def existingRelations(connection: Connection, model: SchemaModel): Vector[QualifiedName] =
+    (model.tables.map(_.name) ++ model.sequences.map(_.name)).filter { name =>
+      query(connection,
+        """SELECT 1
+          |FROM pg_catalog.pg_class c
+          |JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          |WHERE n.nspname = ? AND c.relname = ?""".stripMargin
+      ) { statement =>
+        statement.setString(1, name.schema.get.value)
+        statement.setString(2, name.name.value)
+      }(_ => ()).nonEmpty
+    }
+
   override def recordHistory(connection: Connection, entry: HistoryEntry): Unit =
     Using.resource(connection.prepareStatement(
       s"INSERT INTO $HistoryTable (${HistoryColumns.mkString(", ")}) VALUES (?, ?, ?, CAST(? AS pg_catalog.jsonb), ?)"
