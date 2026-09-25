@@ -115,13 +115,45 @@ final case class HistoryEntry(
 enum TableLock:
   case Exclusive, Shared
 
+/** What planning needs from a backend: checks and SQL rendering without a connection. */
+trait PlanningBackend extends SchemaDialect:
+  def validate(model: SchemaModel): Vector[String]
+  /** A query whose single row and column counts the rows in which the column is NULL. */
+  def nullCount(table: QualifiedName, column: SqlIdentifier): String
+  /** An UPDATE that fills the column's NULLs and binds every constant as a parameter. */
+  def renderFill(fill: NullFill): Either[Vector[String], BoundStatement]
+
+/** What a read-only comparison of the database with a model found: differences, and what it
+  * could not decide.
+  */
+final case class Inspection(differences: Vector[String], undecided: Vector[String])
+
+/** Read-only access for a preview. Every method runs inside the transaction that
+  * `beginReadOnly` made read-only on the server; nothing is created, altered, written or
+  * explicitly locked, and no migration lock is taken.
+  */
+trait PreviewBackend extends PlanningBackend:
+  def beginReadOnly(connection: Connection, options: ExecutionOptions): Unit
+  /** The schema history, or None when its table does not exist. */
+  def readHistoryIfPresent(connection: Connection): Option[Vector[HistoryEntry]]
+  /** The recorded backfills; none when their table does not exist. */
+  def readBackfillsIfPresent(connection: Connection): Vector[BackfillRecord]
+  /** The model's tables and sequences whose names are taken by any relation in the database. */
+  def existingRelations(connection: Connection, model: SchemaModel): Vector[QualifiedName]
+  def inspect(connection: Connection, expected: SchemaModel): Inspection
+  /** Answers a data question: 1 or 0 for whether a matching row exists, or the number of
+    * matching rows when `count` is set.
+    */
+  def dataCheck(connection: Connection, query: DataQuery, count: Boolean): Long
+  /** The table's row count as the database last estimated it, if it has one. */
+  def estimateRows(connection: Connection, table: QualifiedName): Option[Long]
+
 /** Connection-taking methods run inside one executor-owned transaction.
   * validate and render run before a connection is acquired or while planning under
   * the lock. Implementations must support transactional DDL and never commit or close
   * the supplied connection.
   */
-trait TransactionalMigrationBackend extends SchemaDialect:
-  def validate(model: SchemaModel): Vector[String]
+trait TransactionalMigrationBackend extends PlanningBackend:
   def acquireLock(connection: Connection, options: ExecutionOptions): Unit
   def initializeHistory(connection: Connection): Unit
   /** Every history entry, ordered by revision. */
@@ -129,10 +161,6 @@ trait TransactionalMigrationBackend extends SchemaDialect:
   /** The model's tables and sequences whose names are taken by any relation in the database. */
   def existingRelations(connection: Connection, model: SchemaModel): Vector[QualifiedName]
   def lockAndValidate(connection: Connection, expected: SchemaModel, lock: TableLock): Vector[String]
-  /** A query whose single row and column counts the rows in which the column is NULL. */
-  def nullCount(table: QualifiedName, column: SqlIdentifier): String
-  /** An UPDATE that fills the column's NULLs and binds every constant as a parameter. */
-  def renderFill(fill: NullFill): Either[Vector[String], BoundStatement]
   def recordHistory(connection: Connection, entry: HistoryEntry): Unit
   /** Every recorded backfill, ordered by revision and ID. */
   def readBackfills(connection: Connection): Vector[BackfillRecord]

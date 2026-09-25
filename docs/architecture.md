@@ -193,6 +193,30 @@ there:
   in earlier formats are still read and keep their fingerprints. A history table with
   other columns comes from another version and is refused, never altered.
 
+## Preview
+
+`MigrationPlanner` holds the planning rules; a server start and a preview use it alike. It
+reads nothing from the database: it takes the verified history, the backfill records, the
+target and which of its relations exist, and returns the mode, the ordered steps with the
+approval each needs, whether the steps are complete, and problems with stable codes. The
+executor refuses a plan that is not executable and executes the others.
+
+`JdbcMigrationPreview` runs the planner against a database as it is, inside a transaction
+that `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY` makes read-only on the
+server. It takes no migration lock and no explicit lock, reads the histories without creating
+them, and compares the database with the plan's starting model through the backend's
+read-only inspection, which shares the migration's comparison rules. Only check constraints
+differ: a migration compares them exactly on a temporary probe table, which a read-only
+transaction may not create, so the preview parses the forms PostgreSQL shows for this
+dialect's checks; a recognized form with other values is drift, an unknown one inconclusive.
+
+Data checks are planned from the plan over the current tables, with every column projected
+to the value the migration leaves: the current one, NULL for a new column, or the backfill for
+NULL rows, with sources under their current names. Unique keys and foreign keys ignore keys
+with a NULL part, a check only fails when it is FALSE. A failing query ends the transaction;
+its check is inconclusive and every later one not run. The report renders as text or as
+versioned JSON from the same object.
+
 ## Modules
 
 | Module | Contents |
@@ -202,7 +226,7 @@ there:
 | `schema-executor` | Transaction, planning against the stored model, fingerprints, JSON format and history verification, failure states |
 | `schema-postgresql` | SQL renderer, catalog checks, locking and history for PostgreSQL 14+ |
 | `schema-integration` | `HibernateSchemaMigration`, the opt-in `SchemaMigrationIntegrator`, the `hibernate.ddl_manager.*` settings and the `BackfillProvider` SPI |
-| `schema-cli` | Demo without a database connection |
+| `schema-cli` | Demo without a database connection, and the read-only `preview` command |
 
 ## Scope of 1.0
 
