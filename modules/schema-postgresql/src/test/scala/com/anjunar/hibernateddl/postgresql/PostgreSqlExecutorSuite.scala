@@ -588,11 +588,12 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
     }
   }
 
-  test("Hibernate entities with associations, collections, enums, keys, indexes and generated keys migrate and verify end to end") {
+  test("Hibernate entities with associations, collections, inheritance, enums, keys, indexes and generated keys migrate end to end") {
     import com.anjunar.hibernateddl.hibernate.*
     val model = TestMetadata.read(classOf[Article], classOf[Label], classOf[Invoice], classOf[LegacyCustomer],
       classOf[Account], classOf[Shipment], classOf[Measurement], classOf[Letter], classOf[Purchase],
-      classOf[Generated], classOf[Ticket], classOf[Voucher])
+      classOf[Generated], classOf[Ticket], classOf[Voucher], classOf[Animal], classOf[Cat], classOf[Dog],
+      classOf[Vehicle], classOf[Car], classOf[Payment], classOf[CardPayment], classOf[TransferPayment])
       .fold(errors => fail(errors.mkString("\n")), identity)
     withDatabase { ds =>
       val result = executor.migrate(ds, model)
@@ -606,6 +607,11 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
       assertEquals(scalar(ds, "SELECT nextval('public.voucher_numbers') || ',' || nextval('public.generated_seq')"), "100,1")
       execute(ds, "INSERT INTO public.ticket DEFAULT VALUES")
       assertEquals(scalar(ds, "SELECT id FROM public.ticket"), "1")
+      execute(ds, "INSERT INTO public.animal (dtype, id, name, lives) VALUES ('Cat', 1, 'Tom', 9); " +
+        "INSERT INTO public.vehicle (id, wheels) VALUES (1, 4); INSERT INTO public.car (id, seats) VALUES (1, 5); " +
+        "INSERT INTO public.cardpayment (id, amount, card) VALUES (nextval('public.payment_seq'), 10, 'visa')")
+      intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.animal (dtype, id) VALUES ('Horse', 2)"))
+      intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.car (id, seats) VALUES (2, 5)"))
       assertEquals(executor.migrate(ds, model), MigrationResult(1, MigrationStatus.AlreadyApplied, 0))
     }
   }
