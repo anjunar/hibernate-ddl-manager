@@ -24,7 +24,10 @@ flowchart TD
 
 Everything between lock and commit runs in one transaction on one connection. Any error
 aborts the server startup; Hibernate builds the SessionFactory only after a successful
-migration.
+migration. Before DDL, and for adoption or a manual migration, the modeled tables are
+locked exclusively. A start whose target is already applied only checks the database and
+locks the tables in `ACCESS SHARE` mode, which keeps schema changes out but lets a running
+application read and write.
 
 `HibernateSchemaMigration.migrate(metadata, dataSource, options)` runs this flow between
 `buildMetadata()` and `buildSessionFactory()`. With `hibernate.ddl_manager.enabled=true`

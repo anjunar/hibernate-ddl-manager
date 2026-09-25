@@ -65,6 +65,14 @@ final case class HistoryEntry(
     statements: Vector[String]
 )
 
+/** How [[TransactionalMigrationBackend.lockAndValidate]] locks the tables it inspects until the
+  * transaction ends. Exclusive keeps everyone out, as before and after DDL. Shared only keeps
+  * schema changes out and lets the application read and write, for checking a schema that is
+  * already applied at every server start.
+  */
+enum TableLock:
+  case Exclusive, Shared
+
 /** Connection-taking methods run inside one executor-owned transaction.
   * validate and render run before a connection is acquired or while planning under
   * the lock. Implementations must support transactional DDL and never commit or close
@@ -78,5 +86,5 @@ trait TransactionalMigrationBackend extends SchemaDialect:
   def readHistory(connection: Connection): Vector[HistoryEntry]
   /** The model's tables and sequences whose names are taken by any relation in the database. */
   def existingRelations(connection: Connection, model: SchemaModel): Vector[QualifiedName]
-  def lockAndValidate(connection: Connection, expected: SchemaModel): Vector[String]
+  def lockAndValidate(connection: Connection, expected: SchemaModel, lock: TableLock): Vector[String]
   def recordHistory(connection: Connection, entry: HistoryEntry): Unit

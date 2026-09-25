@@ -47,7 +47,7 @@ final class JdbcMigrationExecutor(
       val previousFingerprint = history.lastOption.fold(EmptyFingerprint)(_.entry.targetFingerprint)
       val result =
         if targetFingerprint == previousFingerprint then
-          validateDatabase(connection, target, "Applied schema")
+          validateDatabase(connection, target, "Applied schema", TableLock.Shared)
           MigrationResult(revision, MigrationStatus.AlreadyApplied, 0)
         else
           history.find(_.entry.targetFingerprint == targetFingerprint).foreach { older =>
@@ -239,8 +239,13 @@ final class JdbcMigrationExecutor(
   private def refuse(messages: Vector[String]): Nothing =
     throw new IllegalStateException(messages.mkString("; "))
 
-  private def validateDatabase(connection: Connection, model: SchemaModel, label: String): Unit =
-    val errors = backend.lockAndValidate(connection, model)
+  private def validateDatabase(
+      connection: Connection,
+      model: SchemaModel,
+      label: String,
+      lock: TableLock = TableLock.Exclusive
+  ): Unit =
+    val errors = backend.lockAndValidate(connection, model, lock)
     if errors.nonEmpty then throw new IllegalStateException(s"$label does not match database: ${errors.mkString("; ")}")
 
   private def execute(connection: Connection, sql: String): Unit =

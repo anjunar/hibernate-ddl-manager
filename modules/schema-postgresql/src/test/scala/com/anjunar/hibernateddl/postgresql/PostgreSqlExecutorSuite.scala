@@ -158,6 +158,25 @@ class PostgreSqlExecutorSuite extends TestPostgres:
     }
   }
 
+  test("checking an applied schema lets a running application keep writing; a migration waits for it") {
+    withDatabase { ds =>
+      fixture(ds)
+      val impatient = new JdbcMigrationExecutor(PostgreSqlMigrationBackend,
+        ExecutionOptions(lockTimeoutMillis = 200, statementTimeoutMillis = 2000))
+      Using.resource(ds.getConnection) { application =>
+        application.setAutoCommit(false)
+        try
+          Using.resource(application.createStatement())(_.execute("INSERT INTO public.users VALUES ('ada')"))
+          assertEquals(impatient.migrate(ds, initial), MigrationResult(1, MigrationStatus.AlreadyApplied, 0))
+          Using.resource(application.createStatement())(_.execute("INSERT INTO public.users VALUES ('grace')"))
+          assertEquals(intercept[MigrationException](impatient.migrate(ds, target)).state, FailureState.RolledBack)
+        finally application.commit()
+      }
+      assertEquals(scalar(ds, "SELECT count(*) FROM public.users"), "3")
+      assertEquals(impatient.migrate(ds, target).status, MigrationStatus.Applied)
+    }
+  }
+
   test("an unchanged model still rejects database drift") {
     withDatabase { ds =>
       fixture(ds)
