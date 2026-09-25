@@ -193,6 +193,13 @@ object PostgreSqlDialect extends SchemaDialect:
     val check = column.check.fold("")(value => " " + renderCheck(column.id, column.name, value))
     s"${quoted(column.name)} ${renderType(column.dataType)}$nullable$identity$check"
 
+  /** A temporary table whose columns carry exactly the given columns' checks, as this dialect
+    * creates them, so that PostgreSQL can show their canonical definitions for comparison.
+    */
+  private[postgresql] def checkProbe(table: SqlIdentifier, columns: Vector[ColumnModel]): String =
+    val definitions = columns.map(column => renderColumn(column.copy(nullable = true, identity = false)))
+    s"CREATE TEMPORARY TABLE ${quoted(table)} (${definitions.mkString(", ")}) ON COMMIT DROP"
+
   /** Check constraints are named after the column ID and the check, so a plan can replace a
     * check without looking up its name, and column renames keep the name valid.
     */
