@@ -179,7 +179,7 @@ class Shelf:
 class Folder:
   @SchemaId("a0b1c2d3") @ElementCollection var files: java.util.Set[String] = new java.util.HashSet[String]()
 
-/** A secondary table with its own stable ID, and large objects (@Lob) in both tables. */
+/** A secondary table with its own stable ID. */
 @Entity
 @SchemaId("29384a5b")
 @SecondaryTable(name = "profile_details")
@@ -188,8 +188,7 @@ class Profile:
   @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
   @SchemaId("1b2c3d4e") var name: String = uninitialized
   @SchemaId("2c3d4e5f") @Column(table = "profile_details") var bio: String = uninitialized
-  @SchemaId("3d4e5f60") @Lob @Column(table = "profile_details") var essay: String = uninitialized
-  @SchemaId("4e5f6071") @Lob var picture: Array[Byte] = uninitialized
+  @SchemaId("3d4e5f60") @Column(table = "profile_details") var essay: String = uninitialized
 
 /** A secondary table without @SecondaryTableId, and one that names no secondary table. */
 @Entity
@@ -272,6 +271,7 @@ class Unsupported:
   @SchemaId("1a1b2c3d") @ManyToOne @OnDelete(action = OnDeleteAction.CASCADE) var customer: LegacyCustomer = uninitialized
   @SchemaId("2a1b2c3d") @Embedded var folder: Folder = uninitialized
   @SchemaId("3a1b2c3d") var code: String = uninitialized
+  @SchemaId("5a1b2c3d") @Lob var attachment: Array[Byte] = uninitialized
 
 /** Hibernate's default key generation: the sequence Generated_SEQ with increment 50. */
 @Entity

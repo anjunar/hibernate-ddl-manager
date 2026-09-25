@@ -25,9 +25,9 @@ An ID consists of eight random hex digits, is assigned once and never changed. T
 Status: prototype for PostgreSQL 14+, not yet a production-ready migration tool. Entities
 with the common basic types, enums, generated keys (UUIDs, sequences, identity columns),
 inheritance (all three strategies), `@ManyToOne`, `@OneToOne` and `@ManyToMany` associations,
-element collections (sets, lists, ordered lists and maps), secondary tables, `@Lob`, unique
-constraints and indexes can be mapped; JSON columns and collections inside embeddables
-cannot yet.
+element collections (sets, lists, ordered lists and maps), secondary tables, unique
+constraints and indexes can be mapped; `@Lob`, JSON columns and collections inside
+embeddables cannot.
 
 ## Getting started
 
