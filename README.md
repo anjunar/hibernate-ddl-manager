@@ -189,10 +189,18 @@ change is not planned has no effect. A dropped ID is retired for good; reusing i
 even with approvals. Drops run last and without `CASCADE`, so a view that depends on a
 dropped column makes the migration fail and roll back.
 
+### Required columns
+
+A new required column in an existing table is added nullable first; a column becomes
+required with `SET NOT NULL` after the executor has counted under the lock that no row holds
+NULL. Any NULL left makes the migration fail and roll back, so a new required column works
+in an empty table, and a column becomes required once its rows are filled. A required
+column becomes optional again with `DROP NOT NULL`; primary key and identity columns stay
+required.
+
 ### Changes the executor cannot plan
 
-Type, nullability and primary key changes, among others, need a data migration and are
-refused. The refusal names the target's fingerprint. Change the database by hand to exactly
+Type and primary key changes, among others, need a data migration and are refused. The refusal names the target's fingerprint. Change the database by hand to exactly
 the target schema, then start once with
 `ExecutionOptions(acceptManualMigration = Some("<fingerprint>"))`: the executor checks the
 database against the target under the lock, checks that every table or sequence the target

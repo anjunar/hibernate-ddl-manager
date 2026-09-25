@@ -28,6 +28,8 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     var driftAt = Set.empty[String]
     var backendErrors = Vector.empty[String]
     var renderErrors = Vector.empty[String]
+    /** What every NULL count returns. */
+    var nullRows = 0L
     /** Names of relations that exist in the database outside any history. */
     var existing = Set.empty[String]
 
@@ -71,6 +73,19 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
               case "execute" =>
                 event(s"sql:$number:${values(0)}")
                 Boolean.box(false)
+              case "executeQuery" =>
+                event(s"query:$number:${values(0)}")
+                var read = false
+                proxy(classOf[java.sql.ResultSet]) { (method, _) =>
+                  method match
+                    case "next" =>
+                      val first = !read
+                      read = true
+                      Boolean.box(first)
+                    case "getLong" => Long.box(nullRows)
+                    case "close" => null
+                    case other => throw new UnsupportedOperationException(other)
+                }
               case "close" =>
                 event(s"close-statement:$number")
                 null
@@ -113,7 +128,10 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
           case _: SchemaOperation.DropColumn => "drop column"
           case _: SchemaOperation.DropTables => "drop tables"
           case _: SchemaOperation.DropSequence => "drop sequence"
+          case _: SchemaOperation.SetNotNull => "set not null"
+          case _: SchemaOperation.DropNotNull => "drop not null"
         })
+      def nullCount(table: QualifiedName, column: SqlIdentifier): String = s"count nulls ${column.value}"
       private def onConnection(actual: Connection, label: String): Unit =
         assert(actual eq connection)
         event(label)
@@ -362,6 +380,26 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     assert(h.refused(renamed, manual).getMessage.contains("account, account_seq of the previous schema still exist"))
     h.existing = Set("accounts")
     assertEquals(h.migrate(renamed, manual), MigrationResult(2, MigrationStatus.ManuallyMigrated, 0))
+  }
+
+  test("a column becomes required only after a count under the lock finds no NULL") {
+    val required = SchemaModel(Vector(account.copy(columns = Vector(name.copy(nullable = false)))))
+    val h = new Harness
+    h.seed(initial)
+    h.nullRows = 2
+    val error = h.refused(required)
+    assert(error.getMessage.contains("Column 'account-name' (account.name) becomes required, but 2 rows hold NULL; " +
+      "register a backfill for it or fill the rows before the migration"), error.getMessage)
+    assert(!h.events.exists(_.startsWith("sql:")), h.events)
+    h.nullRows = 0
+    h.events.clear()
+    assertEquals(h.migrate(required), MigrationResult(2, MigrationStatus.Applied, 1))
+    assertEquals(h.events.toVector.filter(e => e.startsWith("validate") || e.startsWith("query") || e.startsWith("sql"))
+      .map(_.replaceAll(":[0-9]+:", ":")), Vector("validate:account", "query:count nulls name", "sql:set not null",
+        "validate:account"))
+    assertEquals(h.history.last.statements, Vector("set not null"))
+    assertEquals(h.migrate(initial, ExecutionOptions(approvals = Set(Approval.Revert(1)))).statementCount, 1)
+    assertEquals(h.history.last.statements, Vector("drop not null"))
   }
 
   test("renaming a sequence back to an earlier name is refused like an older server") {

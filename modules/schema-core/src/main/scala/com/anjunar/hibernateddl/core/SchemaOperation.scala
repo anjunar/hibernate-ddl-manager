@@ -82,6 +82,26 @@ object SchemaOperation:
   ) extends SchemaOperation:
     val risk: RiskLevel = RiskLevel.Locking
 
+  /** Makes an existing column required. PostgreSQL checks every row; the executor first fills
+    * NULLs from a registered backfill and counts what is left, so that a failure names the
+    * column instead of a constraint.
+    */
+  final case class SetNotNull(
+      tableId: SchemaId,
+      table: QualifiedName,
+      columnId: SchemaId,
+      column: SqlIdentifier
+  ) extends SchemaOperation:
+    val risk: RiskLevel = RiskLevel.Locking
+
+  final case class DropNotNull(
+      tableId: SchemaId,
+      table: QualifiedName,
+      columnId: SchemaId,
+      column: SqlIdentifier
+  ) extends SchemaOperation:
+    val risk: RiskLevel = RiskLevel.Locking
+
   /** Deletes a column and its data. The database drops the column's own checks, indexes, unique
     * keys and foreign keys with it.
     */

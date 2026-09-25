@@ -101,19 +101,36 @@ class DiffEngineSuite extends munit.FunSuite:
     )))
   }
 
-  test("adding a non-null column to an existing table requires a backfill") {
+  test("a new required column is added nullable and made required after foreign keys, before drops") {
     val extra = column("new-note", "note").copy(nullable = false)
-    val result = DiffEngine.diff(initial, SchemaModel(Vector(customer.copy(columns = customer.columns :+ extra))))
-    assert(errors(result).exists(_.contains("backfill")))
+    val gone = column("customer-gone", "gone")
+    val before = SchemaModel(Vector(customer.copy(columns = customer.columns :+ gone)))
+    val renamed = customer.name.copy(name = SqlIdentifier("customers"))
+    val after = SchemaModel(Vector(customer.copy(name = renamed, columns = customer.columns :+ extra)))
+    assertEquals(DiffEngine.diff(before, after), Right(Vector(
+      SchemaOperation.RenameTable(customer.id, customer.name, renamed),
+      SchemaOperation.AddColumn(customer.id, renamed, extra.copy(nullable = true)),
+      SchemaOperation.SetNotNull(customer.id, renamed, extra.id, extra.name),
+      SchemaOperation.DropColumn(customer.id, renamed, gone.id, gone.name)
+    )))
+    val identity = extra.copy(dataType = SqlType.BigInt, identity = true)
+    assert(errors(DiffEngine.diff(initial, SchemaModel(Vector(customer.copy(columns = customer.columns :+ identity)))))
+      .exists(_.contains("Adding identity column 'new-note' to existing table 'customer' is unsupported")))
   }
 
-  test("a rename is not returned alongside an unsupported type or nullability change") {
-    val changed = customer.copy(columns = Vector(customer.columns.head.copy(
-      name = SqlIdentifier("renamed"), dataType = SqlType.Text, nullable = false
+  test("a column becomes required or optional; a type change is still refused alongside a rename") {
+    val name = customer.columns.head
+    val required = SchemaModel(Vector(customer.copy(columns = Vector(name.copy(name = SqlIdentifier("full"), nullable = false)))))
+    assertEquals(DiffEngine.diff(initial, required), Right(Vector(
+      SchemaOperation.RenameColumn(customer.id, customer.name, name.id, name.name, SqlIdentifier("full")),
+      SchemaOperation.SetNotNull(customer.id, customer.name, name.id, SqlIdentifier("full"))
     )))
-    val diagnostics = errors(DiffEngine.diff(initial, SchemaModel(Vector(changed))))
-    assert(diagnostics.exists(_.contains("Changing type")))
-    assert(diagnostics.exists(_.contains("Changing nullability")))
+    assertEquals(DiffEngine.diff(required, initial), Right(Vector(
+      SchemaOperation.RenameColumn(customer.id, customer.name, name.id, SqlIdentifier("full"), name.name),
+      SchemaOperation.DropNotNull(customer.id, customer.name, name.id, name.name)
+    )))
+    val retyped = customer.copy(columns = Vector(name.copy(name = SqlIdentifier("renamed"), dataType = SqlType.Text)))
+    assert(errors(DiffEngine.diff(initial, SchemaModel(Vector(retyped)))).exists(_.contains("Changing type")))
   }
 
   test("schema and catalog moves are rejected") {
