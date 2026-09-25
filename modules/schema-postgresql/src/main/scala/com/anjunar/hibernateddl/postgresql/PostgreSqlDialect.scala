@@ -75,6 +75,12 @@ object PostgreSqlDialect extends SchemaDialect:
         validateName(table, "table") ++
           validateIdentifier(from, "source column") ++
           validateIdentifier(to, "target column")
+      case SchemaOperation.DropColumn(_, table, _, column) =>
+        validateName(table, "table") ++ validateIdentifier(column, "dropped column")
+      case SchemaOperation.DropTables(tables) =>
+        tables.flatMap(table => validateName(table.table, "dropped table")) ++
+          Option.when(tables.isEmpty)("Dropping tables needs at least one table.").toVector
+      case SchemaOperation.DropSequence(_, sequence) => validateName(sequence, "dropped sequence")
 
   /** Checks names, column types and primary key of a table as this dialect would create it. */
   private[postgresql] def validateTable(table: TableModel, label: String = "table"): Vector[String] =
@@ -172,6 +178,14 @@ object PostgreSqlDialect extends SchemaDialect:
         s"ALTER TABLE ${qualified(from)} RENAME TO ${quoted(to.name)};"
       case SchemaOperation.RenameColumn(_, table, _, from, to) =>
         s"ALTER TABLE ${qualified(table)} RENAME COLUMN ${quoted(from)} TO ${quoted(to)};"
+      // Without CASCADE: anything outside the model that depends on the dropped object, such
+      // as a view, makes the statement fail instead of disappearing with it.
+      case SchemaOperation.DropColumn(_, table, _, column) =>
+        s"ALTER TABLE ${qualified(table)} DROP COLUMN ${quoted(column)};"
+      case SchemaOperation.DropTables(tables) =>
+        s"DROP TABLE ${tables.map(table => qualified(table.table)).mkString(", ")};"
+      case SchemaOperation.DropSequence(_, sequence) =>
+        s"DROP SEQUENCE ${qualified(sequence)};"
 
   private def renderColumn(column: ColumnModel): String =
     val nullable = if column.nullable then "" else " NOT NULL"

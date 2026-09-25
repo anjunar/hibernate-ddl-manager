@@ -81,3 +81,23 @@ object SchemaOperation:
       to: SqlIdentifier
   ) extends SchemaOperation:
     val risk: RiskLevel = RiskLevel.Locking
+
+  /** Deletes a column and its data. The database drops the column's own checks, indexes, unique
+    * keys and foreign keys with it.
+    */
+  final case class DropColumn(
+      tableId: SchemaId,
+      table: QualifiedName,
+      columnId: SchemaId,
+      column: SqlIdentifier
+  ) extends SchemaOperation:
+    val risk: RiskLevel = RiskLevel.Destructive
+
+  final case class DroppedTable(tableId: SchemaId, table: QualifiedName)
+
+  /** Deletes tables and their data in one statement, so they may reference each other. */
+  final case class DropTables(tables: Vector[DroppedTable]) extends SchemaOperation:
+    val risk: RiskLevel = RiskLevel.Destructive
+
+  final case class DropSequence(sequenceId: SchemaId, sequence: QualifiedName) extends SchemaOperation:
+    val risk: RiskLevel = RiskLevel.Destructive

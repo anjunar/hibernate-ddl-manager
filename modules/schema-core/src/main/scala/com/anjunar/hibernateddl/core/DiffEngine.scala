@@ -1,8 +1,10 @@
 package com.anjunar.hibernateddl.core
 
 /** Plans creation, nullable additions, new unique keys, indexes and foreign keys, changed
-  * column checks and explicit-ID renames; all other changes fail closed. Foreign keys are
-  * added last, after every table exists.
+  * column checks, explicit-ID renames and drops of columns, tables and sequences; all other
+  * changes fail closed. Foreign keys are added after every table exists; drops come last, so
+  * that nothing planned before them still needs what they delete. Whether a drop may run is
+  * the caller's decision.
   */
 object DiffEngine:
   def diff(
@@ -24,7 +26,8 @@ object DiffEngine:
     val errors = Vector.newBuilder[String]
     val operations = Vector.newBuilder[SchemaOperation]
     val addedKeys = Vector.newBuilder[(TableModel, ForeignKeyModel)]
-    planSequences(previous, desired, errors, operations)
+    val droppedColumns = Vector.newBuilder[SchemaOperation]
+    val droppedSequences = planSequences(previous, desired, errors, operations)
     val oldTables = previous.tables.map(t => t.id -> t).toMap
     val newTables = desired.tables.map(t => t.id -> t).toMap
     val oldLocations = locations(previous)
@@ -35,9 +38,7 @@ object DiffEngine:
         errors += s"Stable ID '${id.value}' was reused from ${oldLocations(id)} to ${newLocations(id)}; manual migration required"
     }
 
-    (oldTables.keySet -- newTables.keySet).foreach { id =>
-      errors += s"Dropping table '${id.value}' is unsupported; manual migration required"
-    }
+    val droppedTables = (oldTables.keySet -- newTables.keySet).toVector.sortBy(_.value)
     (oldTables.keySet intersect newTables.keySet).toVector.sortBy(_.value).foreach { id =>
       val oldTable = oldTables(id)
       val newTable = newTables(id)
@@ -54,9 +55,12 @@ object DiffEngine:
 
       val oldColumns = oldTable.columns.map(c => c.id -> c).toMap
       val newColumns = newTable.columns.map(c => c.id -> c).toMap
-      (oldColumns.keySet -- newColumns.keySet).foreach { columnId =>
-        errors += s"Dropping column '${columnId.value}' from table '${id.value}' is unsupported; manual migration required"
+      val dropped = (oldColumns.keySet -- newColumns.keySet).toVector.sortBy(_.value)
+      dropped.foreach { columnId =>
+        droppedColumns += SchemaOperation.DropColumn(id, newTable.name, columnId, oldColumns(columnId).name)
       }
+      // Keys and indexes over a dropped column disappear with it.
+      def remaining(columns: Vector[SchemaId]) = !columns.exists(dropped.contains)
       (oldColumns.keySet intersect newColumns.keySet).toVector.sortBy(_.value).foreach { columnId =>
         val oldColumn = oldColumns(columnId)
         val newColumn = newColumns(columnId)
@@ -89,12 +93,12 @@ object DiffEngine:
         operations += SchemaOperation.AddUniqueKey(id, newTable.name,
           key.columns.map(columnId => newTable.columns.find(_.id == columnId).get.name))
       }
-      (oldUniqueKeys -- newTable.uniqueKeys).foreach { key =>
+      (oldUniqueKeys -- newTable.uniqueKeys).filter(key => remaining(key.columns)).foreach { key =>
         errors += s"Dropping unique key ${key.display} from table '${id.value}' is unsupported; manual migration required"
       }
       val oldIndexes = oldTable.indexes.toSet
       operations ++= createIndexes(newTable, newTable.indexes.filterNot(oldIndexes.contains))
-      (oldIndexes -- newTable.indexes).foreach { index =>
+      (oldIndexes -- newTable.indexes).filter(index => remaining(index.columns.map(_.column))).foreach { index =>
         errors += s"Dropping index ${index.display} from table '${id.value}' is unsupported; manual migration required"
       }
 
@@ -106,7 +110,7 @@ object DiffEngine:
             errors += s"Changing foreign key ${key.display} of table '${id.value}' is unsupported; manual migration required"
           case Some(_) => ()
       }
-      (oldKeys.keySet -- newTable.foreignKeys.map(_.columns)).foreach { columns =>
+      (oldKeys.keySet -- newTable.foreignKeys.map(_.columns)).filter(remaining).foreach { columns =>
         errors += s"Dropping foreign key ${oldKeys(columns).display} from table '${id.value}' is unsupported; manual migration required"
       }
     }
@@ -129,6 +133,11 @@ object DiffEngine:
         referenced.name, names(referenced, key.referencedColumns))
     }
 
+    operations ++= droppedColumns.result()
+    if droppedTables.nonEmpty then
+      operations += SchemaOperation.DropTables(droppedTables.map(id => SchemaOperation.DroppedTable(id, oldTables(id).name)))
+    operations ++= droppedSequences
+
     val diagnostics = errors.result().distinct.sorted
     if diagnostics.nonEmpty then Left(diagnostics) else Right(operations.result())
 
@@ -140,16 +149,18 @@ object DiffEngine:
       })
     }
 
-  /** Sequences are created or renamed before any table; changing or dropping one is refused. */
+  /** Sequences are created or renamed before any table and dropped after everything else,
+    * which the returned operations do; changing one is refused.
+    */
   private def planSequences(
       previous: SchemaModel,
       desired: SchemaModel,
       errors: collection.mutable.Growable[String],
       operations: collection.mutable.Growable[SchemaOperation]
-  ): Unit =
+  ): Vector[SchemaOperation] =
     val oldSequences = previous.sequences.map(s => s.id -> s).toMap
-    (oldSequences.keySet -- desired.sequences.map(_.id)).toVector.sortBy(_.value).foreach { id =>
-      errors += s"Dropping sequence '${id.value}' is unsupported; manual migration required"
+    val drops = (oldSequences.keySet -- desired.sequences.map(_.id)).toVector.sortBy(_.value).map { id =>
+      SchemaOperation.DropSequence(id, oldSequences(id).name)
     }
     desired.sequences.sortBy(_.id.value).foreach { sequence =>
       oldSequences.get(sequence.id) match
@@ -169,6 +180,7 @@ object DiffEngine:
                 errors += s"Renaming sequence '${sequence.id.value}' collides with previous '${occupant.value}'; manual migration required"
               case None => operations += SchemaOperation.RenameSequence(sequence.id, old.name, sequence.name)
     }
+    drops
 
   /** The previous table or sequence other than `self` that had this name. */
   private def previousRelation(previous: SchemaModel, name: QualifiedName, self: SchemaId): Option[SchemaId] =

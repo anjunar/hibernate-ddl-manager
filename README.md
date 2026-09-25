@@ -120,6 +120,25 @@ checks the database against the stored model, executes the DDL, checks the targe
 writes the new revision, all in one transaction. Drift, an inconsistent history and an
 older server after a newer migration block the startup.
 
+### Drops and returns need an approval
+
+Removing an entity, a property or a generated key drops its table, column or sequence, and
+with it the data. A server with an older model would do the same, as well as rename things
+back. The executor therefore refuses these changes until the options approve each one
+explicitly:
+
+```scala
+ExecutionOptions(approvals = Set(
+  Approval.Drop(SchemaId("7f3a9c21/f34e45b6")),  // a column, table or sequence
+  Approval.RenameBack(SchemaId("7f3a9c21")),     // back to a name from an earlier revision
+  Approval.Revert(3)                             // a target equal to revision 3
+))
+```
+
+The refusal names every approval that the plan needs. Approvals only permit: one whose
+change is not planned has no effect. Drops run last and without `CASCADE`, so a view that
+depends on a dropped column makes the migration fail and roll back.
+
 ## Modules
 
 | sbt project | Contents |

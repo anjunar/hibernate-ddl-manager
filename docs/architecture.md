@@ -114,10 +114,16 @@ there:
   changes at once against the model stored last.
 - If the target equals the stored model (order does not matter), the executor only checks
   the database and writes nothing.
-- An older server after a newer migration would rename things back. Therefore a target
-  model equal to an earlier revision blocks the startup, and so does a rename back to a name
-  the same ID had in an earlier revision. Tables and columns missing from an older model are
-  drops, which are not allowed anyway.
+- An older server after a newer migration would rename things back and drop what the newer
+  model added. Therefore a target model equal to an earlier revision blocks the startup, and
+  so does a rename back to a name the same ID had in an earlier revision. An intended return
+  needs an explicit approval in the options: `Approval.Revert(revision)` for a target equal
+  to that revision, `Approval.RenameBack(id)` for each rename back.
+- Dropping a table, column or sequence deletes data and needs `Approval.Drop(id)` for each
+  stable ID. A dropped table takes its columns, keys and indexes with it; a dropped column
+  takes the checks, keys and indexes over it. An entity's collection tables and sequence
+  are objects of their own and need their own approvals. The refusal lists every missing
+  approval; an approval whose change is not planned has no effect.
 - Before any planning the executor checks the whole chain: revisions without gaps, every
   previous fingerprint equal to the target fingerprint of the row before, every stored
   model readable and matching its fingerprint. A modified history blocks the startup.
@@ -145,8 +151,8 @@ Everything outside this scope is rejected, never silently ignored.
 | --- | --- | --- |
 | Model | Tables, columns `varchar(n)`, `char(n)`, `text`, `smallint`, `integer`, `bigint`, `numeric(p,s)`, `real`, `double precision`, `boolean`, `uuid`, `date`, `time(p)`, `timestamp(p)`, `timestamp(p) with time zone`, binary data (`bytea`), nullability, identity columns, column checks (allowed values, integer range), ascending bigint sequences, primary keys, unique keys, plain indexes with column directions, foreign keys to a primary key | All other types and objects |
 | Adapter | Entities, secondary tables with `@SecondaryTableId`, inheritance by `SINGLE_TABLE` (with its discriminator check), `JOINED` or `TABLE_PER_CLASS` (also with an abstract root and one sequence for the hierarchy), `@MappedSuperclass`, simple properties, embeddables, generated `UUID` keys, `@GeneratedValue` by sequence (Hibernate's default `Entity_SEQ` or `@SequenceGenerator`) or identity, `LocalDate`, `LocalTime`, `LocalDateTime`, `Instant`, `OffsetDateTime` and `@Column(secondPrecision)`, `BigDecimal` and `BigInteger` with `@Column(precision, scale)`, `Short`, `Byte`, `Float`, `Double`, `Character`, `byte[]`, `Duration` (as `numeric`), `@ManyToOne` with or without a constraint, `@OneToOne`, `@Column(unique)`, `@UniqueConstraint`, `@NaturalId`, `@Index` with `asc`/`desc`, `@Enumerated` by name or ordinal, `@ElementCollection` and `@ManyToMany` (also unidirectional `@OneToMany` through a join table) as sets, lists, `@OrderColumn` lists or maps (basic, embeddable or entity keys) of basic values, enums, embeddables or entities | Other CHECK constraints (`@Column(check)`, `@Check`, enum values containing a quote), `@Lob` (PostgreSQL large objects), JSON columns (`jsonb`), `ON DELETE` actions, associations to non-primary-key or multi-column keys, ordered unique keys, index options and expressions, `@CollectionId` bags, collections inside embeddables or sharing a table, sequences shared by several keys or used by no key, `GenerationType.TABLE`, table-level checks, defaults, columns without an ID origin |
-| Diff | New and renamed sequences, new tables, new nullable columns, new unique keys and indexes, new foreign keys (added after all tables, so cycles work), added, changed or removed column checks (existing rows are validated), table and column renames | Drops (including keys, indexes and sequences), sequence start or increment changes, identity changes, type/nullability/primary key/foreign key changes, schema moves, rename collisions and swaps |
-| History | Stored model per revision, skipped releases, opt-in adoption of an existing database that matches the target exactly | Target model of an earlier revision, rename back to an earlier name, modified history, existing tables without history unless adopted, partial adoption |
+| Diff | New and renamed sequences, new tables, new nullable columns, new unique keys and indexes, new foreign keys (added after all tables, so cycles work), added, changed or removed column checks (existing rows are validated), table and column renames; approved drops of columns (with the keys and indexes over them), tables (all in one statement, so they may reference each other) and sequences, run last and without `CASCADE` | Unapproved drops, dropping a key, index or foreign key whose columns remain, reusing a dropped name in the same plan, sequence start or increment changes, identity changes, type/nullability/primary key/foreign key changes, schema moves, rename collisions and swaps |
+| History | Stored model per revision, skipped releases, opt-in adoption of an existing database that matches the target exactly, approved returns to an earlier revision or name | Unapproved target model of an earlier revision or rename back to an earlier name, modified history, existing tables without history unless adopted, partial adoption |
 | PostgreSQL | Ordinary permanent tables with exactly these columns and `GENERATED BY DEFAULT` identity columns, unowned bigint sequences with default minimum, maximum, cache and no cycling, a non-deferrable primary key, plain unique constraints, plain B-tree indexes and plain foreign keys, matched by structure; column checks, matched by their derived name and column | `GENERATED ALWAYS` identity, sequences with other types or options or owned by a column, other constraints, unexpected or `NOT VALID` checks, unique, partial, expression, covering or non-B-tree indexes, custom operator classes, collations or `NULLS` ordering, deferrable, `INCLUDE` or `NULLS NOT DISTINCT` unique keys, foreign keys with actions, `MATCH FULL` or deferrable checking, foreign keys from unmodeled tables, triggers, rules, RLS, inheritance, partitions, custom collations |
 
 Tables that exist only in the database are left untouched.
@@ -158,15 +164,13 @@ Tables that exist only in the database are left untouched.
    keys work, as do secondary tables; an end-to-end test migrates a set of such entities into
    PostgreSQL. `@Lob`, collections inside embeddables and JSON columns come after 1.0. New
    types also need a name in the history's JSON format. Foreign key columns get no index
-   automatically;
-   declare one with `@Index` where deletes on the referenced table must be fast.
+   automatically; declare one with `@Index` where deletes on the referenced table must be
+   fast.
 2. **Server integration.** The entry point is between `MetadataBuilder.build()` and
    `getSessionFactoryBuilder.build()`. The executor needs a DataSource without JTA
    enlistment. `hibernate.hbm2ddl.auto=validate` works as an independent cross-check after
    the migration.
-3. **Drops and intentional renames back** block the startup today. They will need explicit
-   approval later.
-4. **Retired IDs** can be read from the stored models in the history once drops are
+3. **Retired IDs** can be read from the stored models in the history now that drops are
    possible. An ID copied from the Git history can then be rejected instead of being reused
    by accident.
 

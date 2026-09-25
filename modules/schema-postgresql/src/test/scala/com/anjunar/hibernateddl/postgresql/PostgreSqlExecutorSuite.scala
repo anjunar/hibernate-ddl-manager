@@ -751,3 +751,45 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
     }
   }
 
+  test("approved drops delete a column with its keys, referencing tables together and a sequence; views block them") {
+    def column(id: String, name: String, dataType: SqlType = SqlType.BigInt, nullable: Boolean = true) =
+      ColumnModel(SchemaId(id), SqlIdentifier(name), dataType, nullable)
+    def table(id: String, name: String, columns: ColumnModel*) =
+      TableModel(SchemaId(id), QualifiedName(SqlIdentifier(name), Some(SqlIdentifier("public"))), columns.toVector,
+        Vector(columns.head.id))
+    val parent = table("P", "parent", column("P_ID", "id", nullable = false), column("P_BUDDY", "buddy_id"))
+    val buddy = table("B", "buddy", column("B_ID", "id", nullable = false), column("B_PARENT", "parent_id"))
+    val parentId = column("C_PARENT", "parent_id")
+    val label = column("C_LABEL", "label", SqlType.Text)
+    val child = table("C", "child", column("C_ID", "id", nullable = false), parentId, label).copy(
+      foreignKeys = Vector(ForeignKeyModel(Vector(parentId.id), parent.id, parent.primaryKey)),
+      uniqueKeys = Vector(UniqueKeyModel(Vector(label.id, parentId.id))),
+      indexes = Vector(IndexModel(Vector(IndexColumn(parentId.id)))))
+    val sequence = SequenceModel(SchemaId("C_SEQ"), QualifiedName(SqlIdentifier("child_seq"), Some(SqlIdentifier("public"))), 1, 50)
+    val before = SchemaModel(Vector(
+      parent.copy(foreignKeys = Vector(ForeignKeyModel(Vector(SchemaId("P_BUDDY")), buddy.id, buddy.primaryKey))),
+      buddy.copy(foreignKeys = Vector(ForeignKeyModel(Vector(SchemaId("B_PARENT")), parent.id, parent.primaryKey))),
+      child), Vector(sequence))
+    val after = SchemaModel(Vector(child.copy(columns = child.columns.filterNot(_ == parentId),
+      foreignKeys = Vector.empty, uniqueKeys = Vector.empty, indexes = Vector.empty)))
+    val approvals = Set[Approval](Approval.Drop(parentId.id), Approval.Drop(parent.id), Approval.Drop(buddy.id),
+      Approval.Drop(sequence.id))
+    val approved = new JdbcMigrationExecutor(PostgreSqlMigrationBackend, ExecutionOptions(approvals = approvals))
+    withDatabase { ds =>
+      assertEquals(executor.migrate(ds, before).status, MigrationStatus.Applied)
+      execute(ds, "INSERT INTO public.parent VALUES (1, NULL); INSERT INTO public.child VALUES (1, 1, 'kept')")
+      val unapproved = intercept[MigrationException](executor.migrate(ds, after))
+      assert(unapproved.getMessage.contains("Approval.Drop(\"C_PARENT\")"), unapproved.getMessage)
+      execute(ds, "CREATE VIEW public.child_parents AS SELECT parent_id FROM public.child")
+      val blocked = intercept[MigrationException](approved.migrate(ds, after))
+      assertEquals(blocked.state, FailureState.RolledBack)
+      assertEquals(scalar(ds, "SELECT parent_id FROM public.child"), "1")
+      execute(ds, "DROP VIEW public.child_parents")
+      assertEquals(approved.migrate(ds, after), MigrationResult(2, MigrationStatus.Applied, 3))
+      assertEquals(scalar(ds, "SELECT label FROM public.child"), "kept")
+      assertEquals(scalar(ds, "SELECT to_regclass('public.parent') IS NULL AND to_regclass('public.child_seq') IS NULL"), "t")
+      assertEquals(scalar(ds, "SELECT statements[2] FROM __hibernate_ddl.schema_history WHERE revision = 2"),
+        "DROP TABLE \"public\".\"buddy\", \"public\".\"parent\";")
+    }
+  }
+

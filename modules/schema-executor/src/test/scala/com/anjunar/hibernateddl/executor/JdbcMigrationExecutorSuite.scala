@@ -106,6 +106,9 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
           case _: SchemaOperation.ChangeCheck => "change check"
           case _: SchemaOperation.CreateSequence => "create sequence"
           case _: SchemaOperation.RenameSequence => "rename sequence"
+          case _: SchemaOperation.DropColumn => "drop column"
+          case _: SchemaOperation.DropTables => "drop tables"
+          case _: SchemaOperation.DropSequence => "drop sequence"
         })
       private def onConnection(actual: Connection, label: String): Unit =
         assert(actual eq connection)
@@ -266,6 +269,37 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     assert(error.getMessage.contains("Renaming table 'account' back to its name from revision 1"), error.getMessage)
     assert(error.getMessage.contains("Renaming column 'account-name' back to its name from revision 1"), error.getMessage)
     assert(!h.events.exists(_.startsWith("sql:")))
+  }
+
+  test("an intended return to an earlier model runs with approvals for the revert and each rename back") {
+    val h = new Harness
+    h.seed(initial, renamed)
+    val error = h.refused(initial, ExecutionOptions(approvals = Set(Approval.Revert(1))))
+    assert(error.getMessage.contains("approve it with Approval.RenameBack(\"account\")"), error.getMessage)
+    assert(error.getMessage.contains("approve it with Approval.RenameBack(\"account-name\")"), error.getMessage)
+    assert(h.refused(initial).getMessage.contains("approve it with Approval.Revert(1)"))
+    val approved = Set(Approval.Revert(1), Approval.RenameBack(account.id), Approval.RenameBack(name.id))
+    assertEquals(h.migrate(initial, ExecutionOptions(approvals = approved)), MigrationResult(3, MigrationStatus.Applied, 2))
+    assertEquals(SchemaModelJson.decode(h.history.last.model), Right(initial))
+  }
+
+  test("dropping a table, column or sequence deletes data and needs an approval per stable ID") {
+    val bio = ColumnModel(SchemaId("account-bio"), SqlIdentifier("bio"), SqlType.Text)
+    val note = TableModel(SchemaId("note"), QualifiedName(SqlIdentifier("note")), Vector(name.copy(id = SchemaId("note-text"))))
+    val sequence = SequenceModel(SchemaId("account-sequence"), QualifiedName(SqlIdentifier("account_seq")), 1, 50)
+    val h = new Harness
+    h.seed(SchemaModel(Vector(account.copy(columns = Vector(name, bio)), note), Vector(sequence)))
+    val error = h.refused(initial, ExecutionOptions(approvals = Set(Approval.Drop(note.id))))
+    assert(error.getMessage.contains("Dropping column 'account-bio' (account.bio) deletes its data; " +
+      "if intended, approve it with Approval.Drop(\"account-bio\")"), error.getMessage)
+    assert(error.getMessage.contains("Dropping sequence 'account-sequence' (account_seq)"), error.getMessage)
+    assert(!error.getMessage.contains("Dropping table"), error.getMessage)
+    assert(!h.events.exists(event => event.startsWith("sql:") || event.startsWith("validate:")), h.events)
+    val approved = Set[Approval](Approval.Drop(bio.id), Approval.Drop(note.id), Approval.Drop(sequence.id))
+    val risk = h.refused(initial, ExecutionOptions(approvals = approved, allowedRisks = Set(RiskLevel.Safe, RiskLevel.Locking)))
+    assert(risk.getMessage.contains("Migration risks are not allowed: Destructive"), risk.getMessage)
+    assertEquals(h.migrate(initial, ExecutionOptions(approvals = approved)), MigrationResult(2, MigrationStatus.Applied, 3))
+    assertEquals(h.history.last.statements, Vector("drop column", "drop tables", "drop sequence"))
   }
 
   test("renaming a sequence back to an earlier name is refused like an older server") {
