@@ -157,6 +157,54 @@ class Crowded:
   @SchemaId("2c3d4e5f") @OneToMany var pinned: java.util.Set[Label] = new java.util.HashSet[Label]()
   @SchemaId("3d4e5f60") @ElementCollection @OrderColumn var ranking: java.util.List[String] = new java.util.ArrayList[String]()
 
+/** SINGLE_TABLE, the default: one table with a discriminator; subclasses add their columns. */
+@Entity
+@SchemaId("1a2b3c4e")
+class Animal:
+  @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+  @SchemaId("1b2c3d4e") var name: String = uninitialized
+
+@Entity
+@SchemaId("2b3c4d5f")
+class Cat extends Animal:
+  @SchemaId("2c3d4e5f") var lives: java.lang.Integer = uninitialized
+
+@Entity
+@SchemaId("3c4d5e60")
+class Dog extends Animal:
+  @SchemaId("3d4e5f60") var breed: String = uninitialized
+
+/** JOINED: the subclass table's key is a foreign key to the parent table. */
+@Entity
+@Inheritance(strategy = InheritanceType.JOINED)
+@SchemaId("4d5e6f71")
+class Vehicle:
+  @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+  @SchemaId("1b2c3d4e") var wheels: java.lang.Integer = uninitialized
+
+@Entity
+@SchemaId("5e6f7082")
+class Car extends Vehicle:
+  @SchemaId("2c3d4e5f") var seats: java.lang.Integer = uninitialized
+
+/** TABLE_PER_CLASS with an abstract root: no root table, one sequence for the whole hierarchy. */
+@Entity
+@Inheritance(strategy = InheritanceType.TABLE_PER_CLASS)
+@SchemaId("6f708193")
+abstract class Payment:
+  @Id @GeneratedValue @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+  @SchemaId("1b2c3d4e") var amount: java.lang.Integer = uninitialized
+
+@Entity
+@SchemaId("708192a4")
+class CardPayment extends Payment:
+  @SchemaId("2c3d4e5f") var card: String = uninitialized
+
+@Entity
+@SchemaId("8192a3b5")
+class TransferPayment extends Payment:
+  @SchemaId("3d4e5f60") var iban: String = uninitialized
+
 /** Further basic types as Hibernate maps them on PostgreSQL. */
 @Entity
 @SchemaId("8f90a1b2")
