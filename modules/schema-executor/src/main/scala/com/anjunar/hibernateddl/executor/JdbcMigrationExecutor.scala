@@ -60,8 +60,10 @@ final class JdbcMigrationExecutor(
           if reused.nonEmpty then refuse(reused)
           val existing = if history.isEmpty then backend.existingRelations(connection, target) else Vector.empty
           if existing.nonEmpty then adopt(connection, target, targetFingerprint, existing)
+          else if options.acceptManualMigration.nonEmpty then
+            acceptManual(connection, history, target, targetFingerprint)
           else
-            val statements = plan(history, previous, target)
+            val statements = plan(history, previous, target, targetFingerprint)
             validateDatabase(connection, previous, "Previous schema")
             statements.foreach(sql => execute(connection, sql))
             validateDatabase(connection, target, "Target schema")
@@ -152,6 +154,28 @@ final class JdbcMigrationExecutor(
       chain :+ Applied(entry, model)
     }
 
+  /** Records a target that an operator migrated to by hand as the next revision, without DDL.
+    * The option must name exactly this target's fingerprint, and the database must match it.
+    */
+  private def acceptManual(
+      connection: Connection,
+      history: Vector[Applied],
+      target: SchemaModel,
+      targetFingerprint: String
+  ): MigrationResult =
+    val accepted = options.acceptManualMigration.get
+    if accepted != targetFingerprint then
+      refuse(Vector(s"acceptManualMigration names the target $accepted, but this target is $targetFingerprint; " +
+        "remove the option or name this target"))
+    if history.isEmpty then
+      refuse(Vector("A database without schema history has no previous revision to migrate by hand; " +
+        "adopt an existing database with adoptExistingSchema instead"))
+    validateDatabase(connection, target, "Manually migrated schema")
+    val latest = history.last.entry
+    backend.recordHistory(connection, HistoryEntry(latest.revision + 1, latest.targetFingerprint, targetFingerprint,
+      SchemaModelJson.encode(target), Vector.empty))
+    MigrationResult(latest.revision + 1, MigrationStatus.ManuallyMigrated, 0)
+
   /** A table, column or sequence that an earlier revision had and the latest does not was
     * dropped. Its ID is retired: reusing it, for example copied from the version history of the
     * code, would attach the old identity to a new object, so no approval permits it.
@@ -167,8 +191,15 @@ final class JdbcMigrationExecutor(
       }
     }
 
-  private def plan(history: Vector[Applied], previous: SchemaModel, target: SchemaModel): Vector[String] =
-    val operations = DiffEngine.diff(previous, target).fold(refuse, identity)
+  private def plan(
+      history: Vector[Applied],
+      previous: SchemaModel,
+      target: SchemaModel,
+      targetFingerprint: String
+  ): Vector[String] =
+    val operations = DiffEngine.diff(previous, target).fold(errors => refuse(errors :+
+      ("To migrate by hand instead, change the database to exactly the target schema and start once with " +
+        s"acceptManualMigration = \"$targetFingerprint\"")), identity)
     def earlier(matches: TableModel => Boolean): Option[Long] =
       history.find(_.model.tables.exists(matches)).map(_.entry.revision)
     def renameBack(kind: String, id: SchemaId, revision: Option[Long]) =

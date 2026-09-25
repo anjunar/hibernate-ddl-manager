@@ -96,8 +96,8 @@ val executor = JdbcMigrationExecutor(
 executor.migrate(dataSource, target)
 ```
 
-`migrate` runs synchronously. On `Applied`, `AlreadyApplied` or `Adopted` the server may
-continue; a `MigrationException` must abort the startup. The executor needs a DataSource without JTA
+`migrate` runs synchronously. On any `MigrationStatus` the server may continue; a
+`MigrationException` must abort the startup. The executor needs a DataSource without JTA
 enlistment, and `hibernate.hbm2ddl.auto` must not be `update`.
 
 There are no migration IDs, checked-in snapshots or hand-maintained revisions. Every

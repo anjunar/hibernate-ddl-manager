@@ -319,6 +319,34 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     assertEquals(h.migrate(SchemaModel(Vector(account.copy(columns = Vector(name, note))))).revision, 3L)
   }
 
+  test("a change the executor cannot plan is recorded after an operator migrated it by hand") {
+    val retyped = SchemaModel(Vector(account.copy(columns = Vector(name.copy(dataType = SqlType.Varchar(200))))))
+    val fingerprint = SchemaFingerprint.of(retyped)
+    val h = new Harness
+    h.seed(initial)
+    val refused = h.refused(retyped)
+    assert(refused.getMessage.contains(s"start once with acceptManualMigration = \"$fingerprint\""), refused.getMessage)
+    val other = h.refused(retyped, ExecutionOptions(acceptManualMigration = Some(SchemaFingerprint.of(renamed))))
+    assert(other.getMessage.contains(s"but this target is $fingerprint"), other.getMessage)
+    h.driftAt = Set("account")
+    val drift = h.refused(retyped, ExecutionOptions(acceptManualMigration = Some(fingerprint)))
+    assert(drift.getMessage.contains("Manually migrated schema does not match database"), drift.getMessage)
+    h.driftAt = Set.empty
+    h.events.clear()
+    val manual = ExecutionOptions(acceptManualMigration = Some(fingerprint))
+    assertEquals(h.migrate(retyped, manual), MigrationResult(2, MigrationStatus.ManuallyMigrated, 0))
+    assertEquals(h.events.toVector, Vector(
+      "connection", "get-auto-commit", "auto-commit:false", "read-committed", "lock", "initialize-history",
+      "read-history", "validate:account", "record-history", "commit", "close"
+    ))
+    assertEquals(h.history.last, HistoryEntry(2, SchemaFingerprint.of(initial), fingerprint,
+      SchemaModelJson.encode(retyped), Vector.empty))
+    assertEquals(h.migrate(retyped, manual), MigrationResult(2, MigrationStatus.AlreadyApplied, 0))
+    val fresh = new Harness
+    assert(fresh.refused(initial, ExecutionOptions(acceptManualMigration = Some(SchemaFingerprint.of(initial))))
+      .getMessage.contains("adoptExistingSchema"))
+  }
+
   test("renaming a sequence back to an earlier name is refused like an older server") {
     val sequence = SequenceModel(SchemaId("account-sequence"), QualifiedName(SqlIdentifier("account_seq")), 1, 50)
     val renamedSequence = sequence.copy(name = QualifiedName(SqlIdentifier("accounts_seq")))

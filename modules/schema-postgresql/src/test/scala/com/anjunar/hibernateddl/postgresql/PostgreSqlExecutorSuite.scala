@@ -793,3 +793,20 @@ class PostgreSqlExecutorSuite extends munit.FunSuite:
     }
   }
 
+  test("an operator migrates a refused change by hand and the executor verifies and records it") {
+    val widened = SchemaModel(Vector(users.copy(columns = Vector(login.copy(dataType = SqlType.Varchar(200))))))
+    val manual = new JdbcMigrationExecutor(PostgreSqlMigrationBackend,
+      ExecutionOptions(acceptManualMigration = Some(SchemaFingerprint.of(widened))))
+    withDatabase { ds =>
+      fixture(ds)
+      val refused = intercept[MigrationException](executor.migrate(ds, widened))
+      assert(refused.getMessage.contains("Changing type of column 'USER_LOGIN'"), refused.getMessage)
+      assert(intercept[MigrationException](manual.migrate(ds, widened)).getMessage.contains("does not match database"))
+      execute(ds, "ALTER TABLE public.users ALTER COLUMN username TYPE varchar(200)")
+      assertEquals(manual.migrate(ds, widened), MigrationResult(2, MigrationStatus.ManuallyMigrated, 0))
+      assertEquals(executor.migrate(ds, widened), MigrationResult(2, MigrationStatus.AlreadyApplied, 0))
+      assertEquals(scalar(ds, "SELECT cardinality(statements) FROM __hibernate_ddl.schema_history WHERE revision = 2"), "0")
+      assertEquals(scalar(ds, "SELECT username FROM public.users"), "patrick")
+    }
+  }
+
