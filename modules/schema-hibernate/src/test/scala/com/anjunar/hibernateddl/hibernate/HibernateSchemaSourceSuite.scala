@@ -106,7 +106,7 @@ class HibernateSchemaSourceSuite extends munit.FunSuite:
   test("checks other than Hibernate's enum checks are reported") {
     val diagnostics = errors(classOf[OddChecks])
     assert(diagnostics.exists(_.contains("OddChecks.quote has the check constraint")), diagnostics)
-    assert(diagnostics.exists(_.contains("OddChecks.amount has the check constraint 'amount >= 0'")), diagnostics)
+    assert(diagnostics.exists(_.contains("OddChecks.amount has the check constraint 'amount <> 5'")), diagnostics)
   }
 
   test("collections map to their own tables with IDs derived from the owning property") {
@@ -141,11 +141,32 @@ class HibernateSchemaSourceSuite extends munit.FunSuite:
     assertEquals(SchemaValidation.validate(model), Vector.empty)
   }
 
-  test("collections sharing a table, ordered lists and maps are reported") {
+  test("collections sharing a table are reported") {
     val diagnostics = errors(classOf[Crowded], classOf[Label], classOf[Article])
     assert(diagnostics.exists(d => d.contains("Crowded.favorites, ") && d.contains("Crowded.pinned use table Crowded_Label")),
       diagnostics)
-    assert(diagnostics.exists(_.contains("Crowded.ranking is a list collection")), diagnostics)
+  }
+
+  test("maps and ordered lists add their key or order column as the collection's index") {
+    val model = read(classOf[Shelf], classOf[Label], classOf[Article]).toOption.get
+    def table(property: String) = model.tables.find(_.id == SchemaId(s"18293a4b/$property")).get
+    def id(property: String, part: String) = SchemaId(s"18293a4b/$property/$part")
+    val titles = table("1b2c3d4e")
+    assertEquals(titles.columns.map(c => c.id -> c.name.value).toMap, Map(
+      id("1b2c3d4e", "key") -> "shelf_id", id("1b2c3d4e", "element") -> "titles", id("1b2c3d4e", "index") -> "lang"))
+    assertEquals(titles.primaryKey.toSet, Set(id("1b2c3d4e", "key"), id("1b2c3d4e", "index")))
+    val prices = table("2c3d4e5f")
+    assertEquals(prices.columns.map(_.id).toSet, Set(id("2c3d4e5f", "key"), id("2c3d4e5f", "8c9d0e1f"),
+      id("2c3d4e5f", "9d0e1f20"), id("2c3d4e5f", "index")))
+    val label = SchemaId("b2c3d4e5")
+    assert(table("3d4e5f60").foreignKeys.exists(key => key.columns == Vector(id("3d4e5f60", "index")) && key.referencedTable == label))
+    // Hibernate guards order columns with "position>=0", a range up to the type's maximum.
+    assertEquals(table("4e5f6071").columns.find(_.id == id("4e5f6071", "index")).map(c => (c.name.value, c.dataType, c.check)),
+      Some(("position", SqlType.Integer, Some(ColumnCheck.Range(0, Int.MaxValue)))))
+    val ranked = table("5f607182")
+    assertEquals(ranked.primaryKey.toSet, Set(id("5f607182", "key"), id("5f607182", "index")))
+    assert(ranked.foreignKeys.exists(key => key.columns == Vector(id("5f607182", "element")) && key.referencedTable == label))
+    assertEquals(SchemaValidation.validate(model), Vector.empty)
   }
 
   test("renaming a referenced entity keeps the foreign key, so the diff plans only the rename") {
@@ -175,7 +196,7 @@ class HibernateSchemaSourceSuite extends munit.FunSuite:
     val diagnostics = errors(classOf[Unsupported], classOf[LegacyCustomer])
     assert(diagnostics.exists(_.contains("Unsupported.document has SQL type 'oid'")), diagnostics)
     assert(diagnostics.exists(_.contains("of entity Unsupported has ON DELETE CASCADE; unsupported")), diagnostics)
-    assert(diagnostics.exists(_.contains("Unsupported.tags is a map collection")), diagnostics)
+    assert(diagnostics.exists(_.contains("Unsupported.folder.files is not a direct property")), diagnostics)
     assert(diagnostics.exists(_.contains("of entity Unsupported has options 'WHERE code IS NOT NULL'; unsupported")), diagnostics)
   }
 
