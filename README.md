@@ -96,8 +96,8 @@ val executor = JdbcMigrationExecutor(
 executor.migrate(dataSource, target)
 ```
 
-`migrate` runs synchronously. On `Applied` or `AlreadyApplied` the server may continue; a
-`MigrationException` must abort the startup. The executor needs a DataSource without JTA
+`migrate` runs synchronously. On `Applied`, `AlreadyApplied` or `Adopted` the server may
+continue; a `MigrationException` must abort the startup. The executor needs a DataSource without JTA
 enlistment, and `hibernate.hbm2ddl.auto` must not be `update`.
 
 There are no migration IDs, checked-in snapshots or hand-maintained revisions. Every
@@ -105,6 +105,15 @@ migration stores its target model as JSON in `__hibernate_ddl.schema_history`, a
 start plans against that model. Without history the previous model is the empty one, and
 all tables are created. Because the IDs are stable across all versions, a server may skip
 releases.
+
+An existing database without history, for example one that `hbm2ddl` created, is refused
+by default. With `ExecutionOptions(adoptExistingSchema = true)` the executor adopts it as
+revision 1 without executing any DDL, but only if every table and sequence of the target
+exists and the database matches the target exactly. One difference is common: Hibernate
+names enum CHECK constraints the PostgreSQL way (`letter_status_check`), while the framework
+names them after a hash of the column ID. The refusal lists both names; after checking that
+the constraint enforces the same values, rename it with
+`ALTER TABLE … RENAME CONSTRAINT … TO …` and start again.
 
 Under a transactional advisory lock the executor checks the history, plans the changes,
 checks the database against the stored model, executes the DDL, checks the target and

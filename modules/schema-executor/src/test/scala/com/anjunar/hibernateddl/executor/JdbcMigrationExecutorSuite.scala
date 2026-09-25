@@ -26,6 +26,8 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     var driftAt = Set.empty[String]
     var backendErrors = Vector.empty[String]
     var renderErrors = Vector.empty[String]
+    /** Names of relations that exist in the database outside any history. */
+    var existing = Set.empty[String]
 
     def event(name: String): Unit =
       events += name
@@ -113,6 +115,9 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
       def readHistory(actual: Connection): Vector[HistoryEntry] =
         onConnection(actual, "read-history")
         history
+      def existingRelations(actual: Connection, model: SchemaModel): Vector[QualifiedName] =
+        onConnection(actual, "existing-relations")
+        (model.tables.map(_.name) ++ model.sequences.map(_.name)).filter(name => existing.contains(name.name.value))
       def lockAndValidate(actual: Connection, expected: SchemaModel): Vector[String] =
         val label = expected.tables.map(_.name.name.value).mkString(",")
         onConnection(actual, s"validate:$label")
@@ -141,7 +146,7 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     assertEquals(h.migrate(initial), MigrationResult(1, MigrationStatus.Applied, 1))
     assertEquals(h.events.toVector, Vector(
       "connection", "get-auto-commit", "auto-commit:false", "read-committed", "lock", "initialize-history",
-      "read-history", "validate:", "statement:1", "timeout:1:30", "sql:1:create table", "close-statement:1",
+      "read-history", "existing-relations", "validate:", "statement:1", "timeout:1:30", "sql:1:create table", "close-statement:1",
       "validate:account", "record-history", "commit", "close"
     ))
     val entry = h.history.head
@@ -181,6 +186,49 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     h.events.clear()
     h.driftAt = Set("account")
     assertEquals(h.refused(initial).state, FailureState.RolledBack)
+  }
+
+  test("a database without history that already contains the target is refused unless adoption is enabled") {
+    val h = new Harness
+    h.existing = Set("account")
+    val error = h.refused(initial)
+    assertEquals(error.state, FailureState.RolledBack)
+    assert(error.getMessage.contains("no schema history but already contains account of the target schema"), error.getMessage)
+    assert(error.getMessage.contains("enable adoptExistingSchema"), error.getMessage)
+    assert(!h.events.exists(event => event.startsWith("sql:") || event.startsWith("validate:")), h.events)
+  }
+
+  test("an existing database that matches the target exactly is adopted as revision 1 without DDL") {
+    val h = new Harness
+    h.existing = Set("account")
+    val adopt = ExecutionOptions(adoptExistingSchema = true)
+    assertEquals(h.migrate(initial, adopt), MigrationResult(1, MigrationStatus.Adopted, 0))
+    assertEquals(h.events.toVector, Vector(
+      "connection", "get-auto-commit", "auto-commit:false", "read-committed", "lock", "initialize-history",
+      "read-history", "existing-relations", "validate:account", "record-history", "commit", "close"
+    ))
+    assertEquals(h.history, Vector(HistoryEntry(1, SchemaFingerprint.of(empty), SchemaFingerprint.of(initial),
+      SchemaModelJson.encode(initial), Vector.empty)))
+    h.events.clear()
+    assertEquals(h.migrate(initial, adopt), MigrationResult(1, MigrationStatus.AlreadyApplied, 0))
+    assertEquals(h.migrate(renamed, adopt), MigrationResult(2, MigrationStatus.Applied, 2))
+    assertEquals(h.events.count(_ == "existing-relations"), 0)
+  }
+
+  test("adoption is refused when a table or sequence is missing or the database differs from the target") {
+    val sequence = SequenceModel(SchemaId("account-sequence"), QualifiedName(SqlIdentifier("account_seq")), 1, 50)
+    val adopt = ExecutionOptions(adoptExistingSchema = true)
+    val partial = new Harness
+    partial.existing = Set("account")
+    val missing = partial.refused(SchemaModel(initial.tables, Vector(sequence)), adopt)
+    assert(missing.getMessage.contains("requires every table and sequence of the target; missing: account_seq"), missing.getMessage)
+    assert(!partial.events.exists(_.startsWith("validate:")), partial.events)
+    val drifted = new Harness
+    drifted.existing = Set("account")
+    drifted.driftAt = Set("account")
+    val drift = drifted.refused(initial, adopt)
+    assert(drift.getMessage.contains("Adopted schema does not match database: physical schema drift"), drift.getMessage)
+    assert(!drifted.events.contains("record-history"), drifted.events)
   }
 
   test("an empty model on a database without history is revision 0 and records nothing") {
