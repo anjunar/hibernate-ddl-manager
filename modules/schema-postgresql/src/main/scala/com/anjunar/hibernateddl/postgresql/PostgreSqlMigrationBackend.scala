@@ -23,7 +23,7 @@ import scala.util.Using
   * statements. A history table with another column layout was created by another version
   * and is refused, never altered.
   */
-object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
+object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with PreviewBackend:
   private val HistorySchema = "__hibernate_ddl"
   private val HistoryTable = "\"__hibernate_ddl\".\"schema_history\""
   // One transaction lock per database, independent of the migrated schemas.
@@ -49,6 +49,77 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
   override def acquireLock(connection: Connection, options: ExecutionOptions): Unit =
     if connection.getAutoCommit then
       throw new SQLException("PostgreSQL migration execution requires an active transaction.")
+    checkServer(connection, options)
+    configure(connection, options)
+    query(connection, "SELECT pg_catalog.pg_advisory_xact_lock(?)")(
+      _.setLong(1, AdvisoryLockKey)
+    )(_ => ())
+    ()
+
+  /** Makes the transaction read-only and REPEATABLE READ on the server, which PostgreSQL only
+    * allows as the transaction's first statement, and checks that it took effect. Takes no
+    * migration lock.
+    */
+  override def beginReadOnly(connection: Connection, options: ExecutionOptions): Unit =
+    if connection.getAutoCommit then
+      throw new SQLException("A PostgreSQL preview requires an active transaction.")
+    checkServer(connection, options)
+    execute(connection, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+    configure(connection, options)
+    val settings = query(connection,
+      "SELECT pg_catalog.current_setting('transaction_read_only'), pg_catalog.current_setting('transaction_isolation')"
+    )(_ => ())(row => row.getString(1) -> row.getString(2)).head
+    if settings != ("on" -> "repeatable read") then
+      throw new SQLException(s"The preview transaction is not read-only and repeatable read: $settings")
+
+  override def readHistoryIfPresent(connection: Connection): Option[Vector[HistoryEntry]] =
+    Option.when(relationExists(connection, HistorySchema, "schema_history")) {
+      checkLayout(connection, HistoryTable, HistoryColumns :+ "applied_at")
+      readHistory(connection)
+    }
+
+  override def readBackfillsIfPresent(connection: Connection): Vector[BackfillRecord] =
+    if !relationExists(connection, HistorySchema, "backfill_history") then Vector.empty
+    else
+      checkLayout(connection, BackfillTable, BackfillColumns :+ "applied_at")
+      readBackfills(connection)
+
+  /** Compares like [[lockAndValidate]], but without locks and without a probe table: check
+    * constraints are compared structurally, and what cannot be compared is undecided.
+    */
+  override def inspect(connection: Connection, expected: SchemaModel): Inspection =
+    val validation = validateModel(expected)
+    if validation.nonEmpty then Inspection(validation, Vector.empty)
+    else
+      val undecided = Vector.newBuilder[String]
+      val tables = expected.tables.sortBy(table => qualified(table.name))
+      val differences = tables.flatMap(table => inspectTable(connection, table, expected, CheckMode.Structural(undecided))) ++
+        expected.sequences.flatMap(inspectSequence(connection, _))
+      Inspection(differences.distinct.sorted, undecided.result().distinct.sorted)
+
+  override def dataCheck(connection: Connection, query: DataQuery, count: Boolean): Long =
+    val (sql, parameters) = PostgreSqlDialect.renderDataCheck(query, count)
+    Using.resource(connection.prepareStatement(sql)) { statement =>
+      parameters.zipWithIndex.foreach((value, index) => statement.setObject(index + 1, value))
+      Using.resource(statement.executeQuery()) { rows =>
+        if !rows.next() then throw new SQLException("A data check returned no row.")
+        rows.getLong(1)
+      }
+    }
+
+  /** Whether a relation exists, by its catalog entry, so that missing privileges on it are not
+    * mistaken for its absence.
+    */
+  private def relationExists(connection: Connection, schema: String, name: String): Boolean =
+    query(connection,
+      """SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        |WHERE n.nspname = ? AND c.relname = ?""".stripMargin
+    ) { statement =>
+      statement.setString(1, schema)
+      statement.setString(2, name)
+    }(_ => ()).nonEmpty
+
+  private def checkServer(connection: Connection, options: ExecutionOptions): Unit =
     val metadata = connection.getMetaData
     if metadata.getDatabaseProductName != "PostgreSQL" || metadata.getDatabaseMajorVersion < 14 then
       throw new SQLException("This migration backend requires PostgreSQL 14 or newer.")
@@ -60,6 +131,8 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
     if options.lockTimeoutMillis <= 0 || options.statementTimeoutMillis <= 0 then
       throw new SQLException("Migration lock and statement timeouts must be positive.")
 
+  /** Timeouts, search path and string syntax for this transaction only. */
+  private def configure(connection: Connection, options: ExecutionOptions): Unit =
     query(connection,
       "SELECT pg_catalog.set_config('lock_timeout', ?, true), " +
         "pg_catalog.set_config('statement_timeout', ?, true), " +
@@ -75,10 +148,6 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
     )(_ => ())(_.getInt(1)).head
     if identifierLimit != 63 then
       throw new SQLException("This backend requires PostgreSQL's standard 63-byte identifier limit.")
-    query(connection, "SELECT pg_catalog.pg_advisory_xact_lock(?)")(
-      _.setLong(1, AdvisoryLockKey)
-    )(_ => ())
-    ()
 
   override def initializeHistory(connection: Connection): Unit =
     execute(connection, "CREATE SCHEMA IF NOT EXISTS \"__hibernate_ddl\"")
@@ -114,12 +183,18 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
     * refused, never altered.
     */
   private def checkLayout(connection: Connection, table: String, expected: Vector[String]): Unit =
+    val name = table.split("\\.").last.drop(1).dropRight(1)
     val columns = query(connection,
       """SELECT a.attname
         |FROM pg_catalog.pg_attribute a
-        |WHERE a.attrelid = pg_catalog.to_regclass(?) AND a.attnum > 0 AND NOT a.attisdropped
+        |JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+        |JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        |WHERE n.nspname = ? AND c.relname = ? AND a.attnum > 0 AND NOT a.attisdropped
         |ORDER BY a.attnum""".stripMargin
-    )(_.setString(1, table))(_.getString("attname"))
+    ) { statement =>
+      statement.setString(1, HistorySchema)
+      statement.setString(2, name)
+    }(_.getString("attname"))
     if columns != expected then
       throw new SQLException(s"History table $table has the columns ${columns.mkString(", ")}; " +
         s"expected ${expected.mkString(", ")}. It was created by another version of Hibernate DDL Manager.")
@@ -208,7 +283,7 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
         execute(connection, s"LOCK TABLE ONLY ${qualified(table.name)} IN $mode MODE")
       }
       // Sequences cannot be locked; the advisory lock already keeps other migrations out.
-      (tables.flatMap(table => inspectTable(connection, table, expected)) ++
+      (tables.flatMap(table => inspectTable(connection, table, expected, CheckMode.Probe)) ++
         expected.sequences.flatMap(inspectSequence(connection, _))).distinct.sorted
 
   private def validateModel(model: SchemaModel): Vector[String] =
@@ -268,7 +343,14 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
         ).flatten
     }.headOption.getOrElse(Vector(s"Database drift: sequence $display does not exist."))
 
-  private def inspectTable(connection: Connection, expected: TableModel, model: SchemaModel): Vector[String] =
+  /** How check definitions are compared: exactly, with a probe table the migration may
+    * create, or structurally, which a read-only preview does and which may leave some undecided.
+    */
+  private enum CheckMode:
+    case Probe
+    case Structural(undecided: collection.mutable.Growable[String])
+
+  private def inspectTable(connection: Connection, expected: TableModel, model: SchemaModel, mode: CheckMode): Vector[String] =
     val display = qualified(expected.name)
     val relations = query(connection,
       """SELECT c.oid, c.relkind, c.relispartition, c.relpersistence, c.reloftype,
@@ -345,7 +427,7 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
           errors += s"Database drift: primary key of $display is ${show(actualKey)}; expected ${show(expectedKey)}."
         errors ++= compareUniqueKeys(connection, oid, display, expected)
         errors ++= compareIndexes(connection, oid, display, expected)
-        errors ++= compareChecks(connection, oid, display, expected)
+        errors ++= compareChecks(connection, oid, display, expected, mode)
         errors ++= compareForeignKeys(connection, oid, display, expected, model)
         errors.result()
 
@@ -430,16 +512,24 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
 
   /** Check constraints match by the name the dialect derives from the column ID and the check,
     * must cover exactly that column and must have exactly the expected definition. PostgreSQL
-    * rewrites a check's expression, so the expected definition comes from the same server: the
-    * dialect creates the expected checks on a temporary probe table, and both definitions are
-    * compared as `pg_get_constraintdef` shows them.
+    * rewrites a check's expression, so for a migration the expected definition comes from the
+    * same server: the dialect creates the expected checks on a temporary probe table, and both
+    * definitions are compared as `pg_get_constraintdef` shows them. A preview compares
+    * structurally instead.
     */
-  private def compareChecks(connection: Connection, oid: Long, display: String, expected: TableModel): Vector[String] =
+  private def compareChecks(
+      connection: Connection,
+      oid: Long,
+      display: String,
+      expected: TableModel,
+      mode: CheckMode
+  ): Vector[String] =
     val checked = expected.columns.filter(_.check.nonEmpty)
-    val expectedChecks = checked.map { column =>
-      PostgreSqlDialect.checkName(column.id, column.check.get).value -> column.name.value
-    }.toMap
-    val expectedDefinitions = if checked.isEmpty then Map.empty[String, String] else checkDefinitions(connection, checked)
+    val byName = checked.map(column => PostgreSqlDialect.checkName(column.id, column.check.get).value -> column).toMap
+    val expectedChecks = byName.view.mapValues(_.name.value).toMap
+    val expectedDefinitions = mode match
+      case CheckMode.Probe if checked.nonEmpty => checkDefinitions(connection, checked)
+      case _ => Map.empty[String, String]
     val actualChecks = query(connection,
       """SELECT k.conname, k.convalidated, pg_catalog.pg_get_constraintdef(k.oid) AS definition,
         |       ARRAY(SELECT CAST(a.attname AS pg_catalog.text)
@@ -460,10 +550,23 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
           case Some(column) if columns != Vector(column) =>
             Vector(s"Database drift: check constraint ${quoted(name)} of $display covers " +
               s"${columns.map(quoted).mkString("(", ", ", ")")}; expected (${quoted(column)}).")
-          case Some(_) if validated && !expectedDefinitions.get(name).contains(definition) =>
-            Vector(s"Database drift: check constraint ${quoted(name)} of $display is $definition; " +
-              s"expected ${expectedDefinitions.getOrElse(name, "a definition PostgreSQL did not produce")}.")
-          case Some(_) => Vector.empty)
+          case Some(_) if !validated => Vector.empty
+          case Some(_) => mode match
+            case CheckMode.Probe if !expectedDefinitions.get(name).contains(definition) =>
+              Vector(s"Database drift: check constraint ${quoted(name)} of $display is $definition; " +
+                s"expected ${expectedDefinitions.getOrElse(name, "a definition PostgreSQL did not produce")}.")
+            case CheckMode.Probe => Vector.empty
+            case CheckMode.Structural(undecided) =>
+              val column = byName(name)
+              PostgreSqlCheckDefinitions.compare(definition, column, column.check.get) match
+                case PostgreSqlCheckDefinitions.Comparison.Equal => Vector.empty
+                case PostgreSqlCheckDefinitions.Comparison.Different(_) =>
+                  Vector(s"Database drift: check constraint ${quoted(name)} of $display is $definition; " +
+                    s"expected ${column.check.get}.")
+                case PostgreSqlCheckDefinitions.Comparison.Undecidable =>
+                  undecided += s"Check constraint ${quoted(name)} of $display is $definition, which cannot be compared " +
+                    s"with ${column.check.get} without a probe table."
+                  Vector.empty)
     } ++ expectedChecks.toVector.sorted.filterNot((name, _) => actualNames.contains(name)).map { (name, column) =>
       s"Database drift: check constraint ${quoted(name)} on column ${quoted(column)} is missing from $display."
     }

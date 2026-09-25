@@ -66,6 +66,8 @@ final case class NullFill(backfillId: String, table: QualifiedName, column: SqlI
 enum FillValue:
   case Literal(value: BackfillLiteral, as: SqlType)
   case Column(name: SqlIdentifier)
+  /** A column that does not exist yet and is NULL when the backfill runs. */
+  case Null(as: SqlType)
   case Coalesce(values: Vector[FillValue])
   case Concat(values: Vector[FillValue])
 
@@ -99,14 +101,16 @@ object BackfillValidation:
   /** Resolves a backfill for its target column. `columns` are the table's columns when the
     * backfill runs: the target's columns plus previous ones that are dropped only afterwards.
     * `filled` are the columns that other backfills of the same plan fill, which a backfill
-    * must not read.
+    * must not read. `absent` are columns that do not exist yet where the value is evaluated; they
+    * resolve to NULL.
     */
   def resolve(
       backfill: Backfill,
       table: QualifiedName,
       target: ColumnModel,
       columns: Vector[ColumnModel],
-      filled: Set[SchemaId]
+      filled: Set[SchemaId],
+      absent: Set[SchemaId] = Set.empty
   ): Either[Vector[String], NullFill] =
     val label = s"Backfill '${backfill.id}' for column '${target.id.value}'"
     def source(id: SchemaId): Either[Vector[String], ColumnModel] =
@@ -117,6 +121,8 @@ object BackfillValidation:
         case Some(column) if column.dataType == SqlType.LargeObject =>
           Left(Vector(s"$label reads the large object column '${id.value}'; rows must not share large objects"))
         case Some(column) => Right(column)
+    def reference(column: ColumnModel) =
+      if absent.contains(column.id) then FillValue.Null(column.dataType) else FillValue.Column(column.name)
     def text(dataType: SqlType) = dataType match
       case SqlType.Varchar(_) | SqlType.Text => true
       case _ => false
@@ -125,7 +131,7 @@ object BackfillValidation:
         fits(literal, expected).map(problem => Vector(s"$label: $problem")).toLeft(FillValue.Literal(literal, expected))
       case BackfillValue.Column(id) =>
         source(id).flatMap { column =>
-          if column.dataType == expected || text(column.dataType) && text(expected) then Right(FillValue.Column(column.name))
+          if column.dataType == expected || text(column.dataType) && text(expected) then Right(reference(column))
           else Left(Vector(s"$label reads column '${id.value}' of type ${column.dataType}, which cannot fill $expected " +
             "without a conversion"))
         }
@@ -138,7 +144,7 @@ object BackfillValidation:
       case BackfillValue.Literal(literal) => Left(Vector(s"$label joins the non-text constant ${show(literal)}"))
       case BackfillValue.Column(id) =>
         source(id).flatMap { column =>
-          if text(column.dataType) then Right(FillValue.Column(column.name))
+          if text(column.dataType) then Right(reference(column))
           else Left(Vector(s"$label joins column '${id.value}' of type ${column.dataType}, which is not text"))
         }
       case BackfillValue.Coalesce(values) => all(values.map(textual)).map(FillValue.Coalesce(_))
