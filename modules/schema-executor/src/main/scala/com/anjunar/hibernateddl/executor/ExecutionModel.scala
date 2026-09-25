@@ -115,13 +115,20 @@ final case class HistoryEntry(
 enum TableLock:
   case Exclusive, Shared
 
+/** What planning needs from a backend: checks and SQL rendering without a connection. */
+trait PlanningBackend extends SchemaDialect:
+  def validate(model: SchemaModel): Vector[String]
+  /** A query whose single row and column counts the rows in which the column is NULL. */
+  def nullCount(table: QualifiedName, column: SqlIdentifier): String
+  /** An UPDATE that fills the column's NULLs and binds every constant as a parameter. */
+  def renderFill(fill: NullFill): Either[Vector[String], BoundStatement]
+
 /** Connection-taking methods run inside one executor-owned transaction.
   * validate and render run before a connection is acquired or while planning under
   * the lock. Implementations must support transactional DDL and never commit or close
   * the supplied connection.
   */
-trait TransactionalMigrationBackend extends SchemaDialect:
-  def validate(model: SchemaModel): Vector[String]
+trait TransactionalMigrationBackend extends PlanningBackend:
   def acquireLock(connection: Connection, options: ExecutionOptions): Unit
   def initializeHistory(connection: Connection): Unit
   /** Every history entry, ordered by revision. */
@@ -129,10 +136,6 @@ trait TransactionalMigrationBackend extends SchemaDialect:
   /** The model's tables and sequences whose names are taken by any relation in the database. */
   def existingRelations(connection: Connection, model: SchemaModel): Vector[QualifiedName]
   def lockAndValidate(connection: Connection, expected: SchemaModel, lock: TableLock): Vector[String]
-  /** A query whose single row and column counts the rows in which the column is NULL. */
-  def nullCount(table: QualifiedName, column: SqlIdentifier): String
-  /** An UPDATE that fills the column's NULLs and binds every constant as a parameter. */
-  def renderFill(fill: NullFill): Either[Vector[String], BoundStatement]
   def recordHistory(connection: Connection, entry: HistoryEntry): Unit
   /** Every recorded backfill, ordered by revision and ID. */
   def readBackfills(connection: Connection): Vector[BackfillRecord]
