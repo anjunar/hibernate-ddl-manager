@@ -533,14 +533,21 @@ class PostgreSqlExecutorSuite extends TestPostgres:
     }
   }
 
-  test("missing, foreign and NOT VALID check constraints block the start") {
+  test("missing, foreign, NOT VALID and changed check constraints block the start, also under their own name") {
     val statusName = PostgreSqlDialect.checkName(status.id, status.check.get).value
+    val levelName = PostgreSqlDialect.checkName(level.id, level.check.get).value
     Vector(
       s"ALTER TABLE public.users DROP CONSTRAINT $statusName" -> "is missing from",
       s"ALTER TABLE public.users DROP CONSTRAINT $statusName, ADD CONSTRAINT $statusName CHECK (level > 0)" ->
         "covers (\"level\"); expected (\"status\")",
       s"ALTER TABLE public.users DROP CONSTRAINT $statusName, " +
-        s"ADD CONSTRAINT $statusName CHECK (status IN ('NEW', 'ACTIVE')) NOT VALID" -> "unsupported NOT VALID state"
+        s"ADD CONSTRAINT $statusName CHECK (status IN ('NEW', 'ACTIVE')) NOT VALID" -> "unsupported NOT VALID state",
+      s"ALTER TABLE public.users DROP CONSTRAINT $statusName, " +
+        s"ADD CONSTRAINT $statusName CHECK (status IN ('NEW', 'ACTIVE', 'GONE'))" ->
+        s"check constraint \"$statusName\" of \"public\".\"users\" is CHECK (((status)::text = ANY",
+      s"ALTER TABLE public.users DROP CONSTRAINT $levelName, ADD CONSTRAINT $levelName CHECK (level > -100)" ->
+        (s"check constraint \"$levelName\" of \"public\".\"users\" is CHECK ((level > '-100'::integer)); " +
+          "expected CHECK (((level >= 0) AND (level <= 2))).")
     ).foreach { (change, message) =>
       withDatabase { ds =>
         fixture(ds, checkedUsers)
@@ -630,10 +637,29 @@ class PostgreSqlExecutorSuite extends TestPostgres:
       execute(ds, "INSERT INTO public.ticket (subject) VALUES ('first'); INSERT INTO public.ticket VALUES (100, 'explicit')")
       assertEquals(scalar(ds, "SELECT string_agg(id::text, ',' ORDER BY id) FROM public.ticket"), "1,100")
       assertEquals(executor.migrate(ds, tickets).status, MigrationStatus.AlreadyApplied)
+      execute(ds, "ALTER TABLE public.ticket ALTER COLUMN id SET MAXVALUE 2 SET CYCLE")
+      val cycling = intercept[MigrationException](executor.migrate(ds, tickets)).getMessage
+      assert(cycling.contains("identity column \"public\".\"ticket\".\"id\" generates with maximum 2; " +
+        s"expected ${Long.MaxValue}"), cycling)
+      assert(cycling.contains("generates with cycling true; expected false"), cycling)
+      execute(ds, "ALTER TABLE public.ticket ALTER COLUMN id SET MAXVALUE 9223372036854775807 SET NO CYCLE SET INCREMENT BY 5")
+      assert(intercept[MigrationException](executor.migrate(ds, tickets)).getMessage
+        .contains("generates with increment 5; expected 1"))
+      execute(ds, "ALTER TABLE public.ticket ALTER COLUMN id SET INCREMENT BY 1")
+      assertEquals(executor.migrate(ds, tickets).status, MigrationStatus.AlreadyApplied)
       execute(ds, "ALTER TABLE public.ticket ALTER COLUMN id SET GENERATED ALWAYS")
       assert(intercept[MigrationException](executor.migrate(ds, tickets)).getMessage.contains("GENERATED ALWAYS identity"))
       execute(ds, "ALTER TABLE public.ticket ALTER COLUMN id DROP IDENTITY")
       assert(intercept[MigrationException](executor.migrate(ds, tickets)).getMessage.contains("identity=false; expected true"))
+    }
+    // Smaller key types get identity sequences of their own type and maximum.
+    val small = SchemaModel(Vector(TableModel(SchemaId("SMALL"), QualifiedName(SqlIdentifier("small"), Some(SqlIdentifier("public"))),
+      Vector(key.copy(id = SchemaId("SMALL_ID"), dataType = SqlType.SmallInt),
+        key.copy(id = SchemaId("SMALL_NUMBER"), name = SqlIdentifier("number"), dataType = SqlType.Integer)),
+      Vector(SchemaId("SMALL_ID")))))
+    withDatabase { ds =>
+      assertEquals(executor.migrate(ds, small).status, MigrationStatus.Applied)
+      assertEquals(executor.migrate(ds, small).status, MigrationStatus.AlreadyApplied)
     }
   }
 
@@ -695,20 +721,26 @@ class PostgreSqlExecutorSuite extends TestPostgres:
     }
   }
 
-  test("Hibernate's enum checks carry PostgreSQL's names and block adoption until renamed to their derived names") {
+  test("Hibernate's checks carry PostgreSQL's names and block adoption until renamed; their definitions then match") {
     import com.anjunar.hibernateddl.hibernate.*
-    val model = TestMetadata.read(classOf[Letter]).fold(errors => fail(errors.mkString("\n")), identity)
+    // Enums by name and ordinal, a discriminator and enums in a collection table.
+    val classes = Seq(classOf[Letter], classOf[Animal], classOf[Cat], classOf[Dog], classOf[Article], classOf[Label])
+    val model = TestMetadata.read(classes*).fold(errors => fail(errors.mkString("\n")), identity)
     withDatabase { ds =>
-      execute(ds, TestMetadata.createScript(classOf[Letter]))
+      execute(ds, TestMetadata.createScript(classes*))
       val drift = intercept[MigrationException](adopting.migrate(ds, model))
       assert(drift.getMessage.contains("unexpected check constraint \"letter_status_check\""), drift.getMessage)
       assert(drift.getMessage.contains("on column \"status\" is missing"), drift.getMessage)
       noHistory(ds)
-      for table <- model.tables; column <- table.columns; check <- column.check do
+      val checks = for table <- model.tables; column <- table.columns; check <- column.check yield (table, column, check)
+      assertEquals(checks.map((t, c, _) => s"${t.name.name.value}.${c.name.value}").sorted,
+        Vector("animal.dtype", "article_statuses.statuses", "letter.Stage", "letter.priority", "letter.status"))
+      for (table, column, check) <- checks do
+        val relation = s"\"${table.name.schema.get.value}\".\"${table.name.name.value}\""
         val current = scalar(ds, "SELECT k.conname FROM pg_constraint k JOIN pg_attribute a " +
           "ON a.attrelid = k.conrelid AND a.attnum = ALL (k.conkey) " +
-          s"WHERE k.conrelid = 'public.letter'::regclass AND k.contype = 'c' AND a.attname = '${column.name.value}'")
-        execute(ds, s"ALTER TABLE public.letter RENAME CONSTRAINT \"$current\" TO " +
+          s"WHERE k.conrelid = '$relation'::regclass AND k.contype = 'c' AND a.attname = '${column.name.value}'")
+        execute(ds, s"ALTER TABLE $relation RENAME CONSTRAINT \"$current\" TO " +
           s"\"${PostgreSqlDialect.checkName(column.id, check).value}\"")
       assertEquals(adopting.migrate(ds, model), MigrationResult(1, MigrationStatus.Adopted, 0))
     }
@@ -770,6 +802,22 @@ class PostgreSqlExecutorSuite extends TestPostgres:
       assertEquals(executor.migrate(ds, widened), MigrationResult(2, MigrationStatus.AlreadyApplied, 0))
       assertEquals(scalar(ds, "SELECT cardinality(statements) FROM __hibernate_ddl.schema_history WHERE revision = 2"), "0")
       assertEquals(scalar(ds, "SELECT username FROM public.users"), "patrick")
+    }
+  }
+
+  test("a manual migration cannot record a drop or rename that the database does not show") {
+    val empty = SchemaModel(Vector.empty)
+    def manual(model: SchemaModel) = new JdbcMigrationExecutor(PostgreSqlMigrationBackend,
+      ExecutionOptions(acceptManualMigration = Some(SchemaFingerprint.of(model))))
+    withDatabase { ds =>
+      fixture(ds)
+      val dropped = intercept[MigrationException](manual(empty).migrate(ds, empty))
+      assert(dropped.getMessage.contains("public.users of the previous schema still exist"), dropped.getMessage)
+      execute(ds, "CREATE TABLE public.accounts (login_name varchar(100) NOT NULL)")
+      val copied = intercept[MigrationException](manual(target).migrate(ds, target))
+      assert(copied.getMessage.contains("public.users of the previous schema still exist"), copied.getMessage)
+      execute(ds, "DROP TABLE public.users")
+      assertEquals(manual(target).migrate(ds, target), MigrationResult(2, MigrationStatus.ManuallyMigrated, 0))
     }
   }
 

@@ -143,9 +143,11 @@ by default. With `ExecutionOptions(adoptExistingSchema = true)` the executor ado
 revision 1 without executing any DDL, but only if every table and sequence of the target
 exists and the database matches the target exactly. One difference is common: Hibernate
 names enum CHECK constraints the PostgreSQL way (`letter_status_check`), while the framework
-names them after a hash of the column ID. The refusal lists both names; after checking that
-the constraint enforces the same values, rename it with
-`ALTER TABLE … RENAME CONSTRAINT … TO …` and start again.
+names them after a hash of the column ID. The refusal lists both names; rename the constraint
+with `ALTER TABLE … RENAME CONSTRAINT … TO …` and start again. The executor also compares
+each check's definition, so a renamed constraint passes only if it enforces exactly the
+modeled values. Hibernate's enum and discriminator checks do; an `@OrderColumn`'s
+`position >= 0` differs from the modeled range and must be replaced.
 
 Under a transactional advisory lock the executor checks the history, plans the changes,
 checks the database against the stored model, executes the DDL, checks the target and
@@ -181,8 +183,9 @@ Type, nullability and primary key changes, among others, need a data migration a
 refused. The refusal names the target's fingerprint. Change the database by hand to exactly
 the target schema, then start once with
 `ExecutionOptions(acceptManualMigration = Some("<fingerprint>"))`: the executor checks the
-database against the target under the lock and records it as the next revision without
-executing DDL (`ManuallyMigrated`). An option naming another target is refused, so it cannot
+database against the target under the lock, checks that every table or sequence the target
+dropped or renamed is gone under its old name, and records the target as the next revision
+without executing DDL (`ManuallyMigrated`). An option naming another target is refused, so it cannot
 accept a later change by accident.
 
 ## Modules

@@ -39,16 +39,26 @@ final class SchemaMigrationIntegrator extends Integrator:
       val provider = Option(registry.getService(classOf[ConnectionProvider])).getOrElse(
         refuse("Hibernate has no single ConnectionProvider (multi-tenancy?); call HibernateSchemaMigration.migrate " +
           "with a DataSource before building the SessionFactory"))
-      HibernateSchemaMigration.migrate(metadata, ProviderDataSource(provider))
+      val dataSource = ProviderDataSource(provider)
+      val result = HibernateSchemaMigration.migrate(metadata, dataSource)
+      dataSource.resetFailure.foreach { error =>
+        throw new MigrationException(s"Migration ended at revision ${result.revision}, but the connection could not " +
+          s"be given back to Hibernate as it was lent and was aborted: ${error.getMessage}", FailureState.Committed, error)
+      }
 
   private def refuse(message: String): Nothing =
     throw new MigrationException(s"Migration failed: $message", FailureState.NotStarted)
 
 /** Hands out connections of a Hibernate ConnectionProvider with auto-commit enabled, and gives
   * them back to the provider when closed. A connection that arrives without auto-commit is
-  * rolled back first, so nothing left pending on it can be committed.
+  * rolled back first, so nothing left pending on it can be committed, and gets its mode back
+  * on close; the executor restores everything else it changed. A connection whose mode cannot
+  * be restored is aborted, and the failure stays readable in `resetFailure`, because the
+  * executor does not let a close failure turn a successful migration into a failed one.
   */
 private final class ProviderDataSource(provider: ConnectionProvider) extends DataSource:
+  @volatile var resetFailure: Option[Throwable] = None
+
   override def getConnection(): Connection =
     val raw = provider.getConnection()
     try
@@ -64,9 +74,14 @@ private final class ProviderDataSource(provider: ConnectionProvider) extends Dat
               if !closed then
                 closed = true
                 try
-                  if !raw.isClosed && raw.getAutoCommit != autoCommit then
-                    raw.rollback()
-                    raw.setAutoCommit(autoCommit)
+                  // The executor ends its transaction first, or aborts the connection.
+                  if !raw.isClosed && raw.getAutoCommit != autoCommit then raw.setAutoCommit(autoCommit)
+                catch
+                  case NonFatal(error) =>
+                    resetFailure = Some(error)
+                    try raw.abort((command: Runnable) => command.run())
+                    catch case NonFatal(abortError) => error.addSuppressed(abortError)
+                    throw error
                 finally provider.closeConnection(raw)
               null
             case "isClosed" => Boolean.box(closed || raw.isClosed)

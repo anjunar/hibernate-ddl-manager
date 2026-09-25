@@ -36,17 +36,35 @@ class SchemaMigrationIntegrationSuite extends TestPostgres:
   private def revisions(ds: DataSource): String =
     scalar(ds, "SELECT coalesce(string_agg(revision::text, ',' ORDER BY revision), '') FROM __hibernate_ddl.schema_history")
 
-  /** A pool that hands out connections without auto-commit, as Hibernate's own pool does by default. */
-  private def withoutAutoCommit(ds: DataSource): DataSource =
-    java.lang.reflect.Proxy.newProxyInstance(classOf[DataSource].getClassLoader, Array(classOf[DataSource]),
-      (_, method, args) =>
-        val result = method.invoke(ds, Option(args).getOrElse(Array.empty[AnyRef])*)
-        result match
-          case connection: Connection =>
-            connection.setAutoCommit(false)
-            connection
-          case other => other
-    ).asInstanceOf[DataSource]
+  /** A pool that hands out connections without auto-commit, as Hibernate's own pool does by
+    * default, and with SERIALIZABLE isolation. It records the auto-commit mode and isolation of
+    * every connection that switched to READ COMMITTED, as the migration's does, when it comes back.
+    */
+  private final class StrictPool(ds: DataSource):
+    val returned = collection.mutable.ArrayBuffer.empty[(Boolean, Int)]
+    val dataSource: DataSource = proxy(classOf[DataSource], ds) {
+      case connection: Connection =>
+        connection.setAutoCommit(false)
+        connection.setTransactionIsolation(Connection.TRANSACTION_SERIALIZABLE)
+        var migrating = false
+        proxy(classOf[Connection], connection)(identity, (method, args) => method.getName match
+          case "setTransactionIsolation" if args(0) == Int.box(Connection.TRANSACTION_READ_COMMITTED) => migrating = true
+          case "close" if migrating => returned += (connection.getAutoCommit -> connection.getTransactionIsolation)
+          case _ => ()
+        )
+      case other => other
+    }
+
+    private def proxy[A](kind: Class[A], target: A)(
+        result: AnyRef => AnyRef,
+        before: (java.lang.reflect.Method, Array[AnyRef]) => Unit = (_, _) => ()
+    ): A =
+      java.lang.reflect.Proxy.newProxyInstance(kind.getClassLoader, Array(kind), (_, method, args) =>
+        val values = Option(args).getOrElse(Array.empty[AnyRef])
+        before(method, values)
+        try result(method.invoke(target, values*))
+        catch case error: java.lang.reflect.InvocationTargetException => throw error.getCause
+      ).asInstanceOf[A]
 
   private val enabled = MigrationSettings.Enabled -> "true"
   private val validate = "hibernate.hbm2ddl.auto" -> "validate"
@@ -61,7 +79,8 @@ class SchemaMigrationIntegrationSuite extends TestPostgres:
 
   test("when enabled, the integrator migrates before Hibernate validates the schema, and the entities work") {
     withDatabase { ds =>
-      withSessionFactory(withoutAutoCommit(ds), entities, enabled, validate) { factory =>
+      val pool = StrictPool(ds)
+      withSessionFactory(pool.dataSource, entities, enabled, validate) { factory =>
         factory.inTransaction { session =>
           val letter = new Letter
           letter.id = 1L
@@ -71,6 +90,7 @@ class SchemaMigrationIntegrationSuite extends TestPostgres:
         }
       }
       assertEquals(revisions(ds), "1")
+      assertEquals(pool.returned.toVector, Vector(false -> Connection.TRANSACTION_SERIALIZABLE))
       assertEquals(scalar(ds, "SELECT status FROM public.letter"), "Sent")
       withSessionFactory(ds, entities, enabled, validate)(_ => ())
       assertEquals(revisions(ds), "1")
