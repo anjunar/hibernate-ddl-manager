@@ -37,6 +37,20 @@ class PostgreSqlDialectSuite extends munit.FunSuite:
     )
   }
 
+  test("drops render without CASCADE; all tables go in one statement") {
+    val orders = name("order", Some("sales"))
+    assertEquals(PostgreSqlDialect.render(Vector(
+      DropColumn(tableId, orders, columnId, SqlIdentifier("status")),
+      DropTables(Vector(DroppedTable(tableId, orders), DroppedTable(SchemaId("t2"), name("line", Some("sales"))))),
+      DropSequence(SchemaId("s"), name("order_seq", Some("sales")))
+    )), Right(Vector(
+      "ALTER TABLE \"sales\".\"order\" DROP COLUMN \"status\";",
+      "DROP TABLE \"sales\".\"order\", \"sales\".\"line\";",
+      "DROP SEQUENCE \"sales\".\"order_seq\";"
+    )))
+    assert(PostgreSqlDialect.render(Vector(DropTables(Vector.empty))).isLeft)
+  }
+
   test("returns all diagnostics without a partial SQL plan") {
     val source = QualifiedName(SqlIdentifier("orders"), catalog = Some(SqlIdentifier("database")))
     val operations = Vector(

@@ -7,9 +7,12 @@ import scala.util.control.NonFatal
 
 /** Migrates the database to the target model during server startup, using one owned transaction.
   * The previous model is the one the latest history entry stored; without history it is the
-  * empty model. Because stable IDs never change, a server may skip releases. A target equal
-  * to an earlier revision, or renaming something back to an earlier name, is what a server
-  * with an older model would do and is refused.
+  * empty model, unless the database already contains the target's tables: such a database is
+  * adopted only when enabled and matching exactly, and refused otherwise. Because stable IDs
+  * never change, a server may skip releases. A target equal to an earlier revision, or
+  * renaming something back to an earlier name, is what a server with an older model would do,
+  * and dropping a table, column or sequence deletes data: each is refused unless the options
+  * carry an explicit [[Approval]] for it.
   *
   * A successful return permits startup. Any exception must prevent server startup.
   * A failure to close the connection after a successful commit does not change the
@@ -44,20 +47,29 @@ final class JdbcMigrationExecutor(
       val previousFingerprint = history.lastOption.fold(EmptyFingerprint)(_.entry.targetFingerprint)
       val result =
         if targetFingerprint == previousFingerprint then
-          validateDatabase(connection, target, "Applied schema")
+          validateDatabase(connection, target, "Applied schema", TableLock.Shared)
           MigrationResult(revision, MigrationStatus.AlreadyApplied, 0)
         else
           history.find(_.entry.targetFingerprint == targetFingerprint).foreach { older =>
-            throw new IllegalStateException(s"Target schema equals revision ${older.entry.revision}, but the database " +
-              s"is at revision $revision; a server with an older schema must not start after a newer migration")
+            if !options.approvals.contains(Approval.Revert(older.entry.revision)) then
+              refuse(Vector(s"Target schema equals revision ${older.entry.revision}, but the database is at revision " +
+                s"$revision; a server with an older schema must not start after a newer migration. If returning to " +
+                s"it is intended, approve it with Approval.Revert(${older.entry.revision})"))
           }
-          val statements = plan(history, previous, target)
-          validateDatabase(connection, previous, "Previous schema")
-          statements.foreach(sql => execute(connection, sql))
-          validateDatabase(connection, target, "Target schema")
-          backend.recordHistory(connection, HistoryEntry(revision + 1, previousFingerprint, targetFingerprint,
-            SchemaModelJson.encode(target), statements))
-          MigrationResult(revision + 1, MigrationStatus.Applied, statements.size)
+          val reused = retired(history, target)
+          if reused.nonEmpty then refuse(reused)
+          val existing = if history.isEmpty then backend.existingRelations(connection, target) else Vector.empty
+          if existing.nonEmpty then adopt(connection, target, targetFingerprint, existing)
+          else if options.acceptManualMigration.nonEmpty then
+            acceptManual(connection, history, target, targetFingerprint)
+          else
+            val statements = plan(history, previous, target, targetFingerprint)
+            validateDatabase(connection, previous, "Previous schema")
+            statements.foreach(sql => execute(connection, sql))
+            validateDatabase(connection, target, "Target schema")
+            backend.recordHistory(connection, HistoryEntry(revision + 1, previousFingerprint, targetFingerprint,
+              SchemaModelJson.encode(target), statements))
+            MigrationResult(revision + 1, MigrationStatus.Applied, statements.size)
       commitAttempted = true
       connection.commit()
       result
@@ -107,6 +119,28 @@ final class JdbcMigrationExecutor(
 
   private final case class Applied(entry: HistoryEntry, model: SchemaModel)
 
+  /** Records a database without history as revision 1 without DDL. Every table and sequence of
+    * the target must exist and the database must match the target exactly; nothing is created,
+    * altered or guessed.
+    */
+  private def adopt(
+      connection: Connection,
+      target: SchemaModel,
+      targetFingerprint: String,
+      existing: Vector[QualifiedName]
+  ): MigrationResult =
+    def show(names: Vector[QualifiedName]) = names.map(_.display).distinct.sorted.mkString(", ")
+    if !options.adoptExistingSchema then
+      refuse(Vector(s"The database has no schema history but already contains ${show(existing)} of the target schema; " +
+        "enable adoptExistingSchema to adopt a database that matches the target exactly"))
+    val missing = (target.tables.map(_.name) ++ target.sequences.map(_.name)).filterNot(existing.contains)
+    if missing.nonEmpty then
+      refuse(Vector(s"Adopting the existing schema requires every table and sequence of the target; missing: ${show(missing)}"))
+    validateDatabase(connection, target, "Adopted schema")
+    backend.recordHistory(connection, HistoryEntry(1, EmptyFingerprint, targetFingerprint,
+      SchemaModelJson.encode(target), Vector.empty))
+    MigrationResult(1, MigrationStatus.Adopted, 0)
+
   /** Decodes every stored model and checks that the entries form one unbroken chain. */
   private def verified(entries: Vector[HistoryEntry]): Vector[Applied] =
     entries.foldLeft(Vector.empty[Applied]) { (chain, entry) =>
@@ -120,26 +154,81 @@ final class JdbcMigrationExecutor(
       chain :+ Applied(entry, model)
     }
 
-  private def plan(history: Vector[Applied], previous: SchemaModel, target: SchemaModel): Vector[String] =
-    val operations = DiffEngine.diff(previous, target).fold(refuse, identity)
+  /** Records a target that an operator migrated to by hand as the next revision, without DDL.
+    * The option must name exactly this target's fingerprint, and the database must match it.
+    */
+  private def acceptManual(
+      connection: Connection,
+      history: Vector[Applied],
+      target: SchemaModel,
+      targetFingerprint: String
+  ): MigrationResult =
+    val accepted = options.acceptManualMigration.get
+    if accepted != targetFingerprint then
+      refuse(Vector(s"acceptManualMigration names the target $accepted, but this target is $targetFingerprint; " +
+        "remove the option or name this target"))
+    if history.isEmpty then
+      refuse(Vector("A database without schema history has no previous revision to migrate by hand; " +
+        "adopt an existing database with adoptExistingSchema instead"))
+    validateDatabase(connection, target, "Manually migrated schema")
+    val latest = history.last.entry
+    backend.recordHistory(connection, HistoryEntry(latest.revision + 1, latest.targetFingerprint, targetFingerprint,
+      SchemaModelJson.encode(target), Vector.empty))
+    MigrationResult(latest.revision + 1, MigrationStatus.ManuallyMigrated, 0)
+
+  /** A table, column or sequence that an earlier revision had and the latest does not was
+    * dropped. Its ID is retired: reusing it, for example copied from the version history of the
+    * code, would attach the old identity to a new object, so no approval permits it.
+    */
+  private def retired(history: Vector[Applied], target: SchemaModel): Vector[String] =
+    def ids(model: SchemaModel): Set[SchemaId] =
+      (model.tables.flatMap(table => table.id +: table.columns.map(_.id)) ++ model.sequences.map(_.id)).toSet
+    val latest = history.lastOption.fold(Set.empty[SchemaId])(applied => ids(applied.model))
+    (ids(target) -- latest).toVector.sortBy(_.value).flatMap { id =>
+      history.findLast(applied => ids(applied.model).contains(id)).map { applied =>
+        s"Stable ID '${id.value}' was dropped after revision ${applied.entry.revision} and is retired; " +
+          "a retired ID must never be reused, generate a new one"
+      }
+    }
+
+  private def plan(
+      history: Vector[Applied],
+      previous: SchemaModel,
+      target: SchemaModel,
+      targetFingerprint: String
+  ): Vector[String] =
+    val operations = DiffEngine.diff(previous, target).fold(errors => refuse(errors :+
+      ("To migrate by hand instead, change the database to exactly the target schema and start once with " +
+        s"acceptManualMigration = \"$targetFingerprint\"")), identity)
     def earlier(matches: TableModel => Boolean): Option[Long] =
       history.find(_.model.tables.exists(matches)).map(_.entry.revision)
-    val reverted = operations.flatMap {
+    def renameBack(kind: String, id: SchemaId, revision: Option[Long]) =
+      revision.filterNot(_ => options.approvals.contains(Approval.RenameBack(id))).map { revision =>
+        s"Renaming $kind '${id.value}' back to its name from revision $revision is what an older server would do; " +
+          s"if intended, approve it with Approval.RenameBack(\"${id.value}\")"
+      }
+    def drop(kind: String, id: SchemaId, name: String) =
+      Option.when(!options.approvals.contains(Approval.Drop(id))) {
+        s"Dropping $kind '${id.value}' ($name) deletes its data; if intended, approve it with Approval.Drop(\"${id.value}\")"
+      }
+    val unapproved = operations.flatMap {
       case SchemaOperation.RenameTable(id, _, to) =>
-        earlier(table => table.id == id && table.name == to).map { revision =>
-          s"Renaming table '${id.value}' back to its name from revision $revision is what an older server would do; manual migration required"
-        }
+        renameBack("table", id, earlier(table => table.id == id && table.name == to)).toVector
       case SchemaOperation.RenameColumn(tableId, _, columnId, _, to) =>
-        earlier(table => table.id == tableId && table.columns.exists(c => c.id == columnId && c.name == to)).map { revision =>
-          s"Renaming column '${columnId.value}' back to its name from revision $revision is what an older server would do; manual migration required"
-        }
+        renameBack("column", columnId,
+          earlier(table => table.id == tableId && table.columns.exists(c => c.id == columnId && c.name == to))).toVector
       case SchemaOperation.RenameSequence(id, _, to) =>
-        history.find(_.model.sequences.exists(s => s.id == id && s.name == to)).map(_.entry.revision).map { revision =>
-          s"Renaming sequence '${id.value}' back to its name from revision $revision is what an older server would do; manual migration required"
-        }
-      case _ => None
+        renameBack("sequence", id,
+          history.find(_.model.sequences.exists(s => s.id == id && s.name == to)).map(_.entry.revision)).toVector
+      case SchemaOperation.DropColumn(_, table, columnId, column) =>
+        drop("column", columnId, s"${table.display}.${column.value}").toVector
+      case SchemaOperation.DropTables(tables) =>
+        tables.flatMap(table => drop("table", table.tableId, table.table.display))
+      case SchemaOperation.DropSequence(id, sequence) =>
+        drop("sequence", id, sequence.display).toVector
+      case _ => Vector.empty
     }
-    if reverted.nonEmpty then refuse(reverted)
+    if unapproved.nonEmpty then refuse(unapproved)
     val rejectedRisks = operations.map(_.risk).filterNot(options.allowedRisks.contains).distinct
     if rejectedRisks.nonEmpty then refuse(Vector(s"Migration risks are not allowed: ${rejectedRisks.mkString(", ")}"))
     val statements = backend.render(operations).fold(refuse, identity)
@@ -150,8 +239,13 @@ final class JdbcMigrationExecutor(
   private def refuse(messages: Vector[String]): Nothing =
     throw new IllegalStateException(messages.mkString("; "))
 
-  private def validateDatabase(connection: Connection, model: SchemaModel, label: String): Unit =
-    val errors = backend.lockAndValidate(connection, model)
+  private def validateDatabase(
+      connection: Connection,
+      model: SchemaModel,
+      label: String,
+      lock: TableLock = TableLock.Exclusive
+  ): Unit =
+    val errors = backend.lockAndValidate(connection, model, lock)
     if errors.nonEmpty then throw new IllegalStateException(s"$label does not match database: ${errors.mkString("; ")}")
 
   private def execute(connection: Connection, sql: String): Unit =

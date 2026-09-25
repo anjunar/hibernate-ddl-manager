@@ -13,7 +13,7 @@ flowchart TD
     D --> EX[JdbcMigrationExecutor]
     EX --> LOCK[Advisory lock]
     LOCK --> HIST[Read and verify history: model applied last]
-    HIST --> DIFF[DiffEngine: comparison by ID]
+    HIST --> DIFF[DiffEngine: comparison by ID; retired IDs, drops and returns checked against approvals]
     DIFF --> SQL[PostgreSqlDialect: DDL]
     SQL --> PRE[Lock tables, check database against previous model]
     PRE --> DDL[Execute DDL]
@@ -24,7 +24,22 @@ flowchart TD
 
 Everything between lock and commit runs in one transaction on one connection. Any error
 aborts the server startup; Hibernate builds the SessionFactory only after a successful
-migration. `hibernate.hbm2ddl.auto` must not be `update` for the managed tables.
+migration. Before DDL, and for adoption or a manual migration, the modeled tables are
+locked exclusively. A start whose target is already applied only checks the database and
+locks the tables in `ACCESS SHARE` mode, which keeps schema changes out but lets a running
+application read and write.
+
+`HibernateSchemaMigration.migrate(metadata, dataSource, options)` runs this flow between
+`buildMetadata()` and `buildSessionFactory()`. With `hibernate.ddl_manager.enabled=true`
+the `SchemaMigrationIntegrator`, registered through `META-INF/services`, does the same while
+Hibernate builds the SessionFactory: integrators run before Hibernate's schema management,
+so `hibernate.hbm2ddl.auto=validate` becomes an independent check of the migrated schema.
+It borrows one connection from Hibernate's ConnectionProvider, rolls back and enables
+auto-commit on it if needed, and restores it before giving it back. It refuses JTA and
+multi-tenancy, where the server must call the explicit API with a suitable DataSource.
+Both paths refuse a non-PostgreSQL dialect and any Hibernate schema action other than
+`none` or `validate`, because Hibernate must not change the managed schema itself.
+`hibernate.ddl_manager.*` settings map onto the execution options; unknown ones are errors.
 
 ## Stable identity with `@SchemaId`
 
@@ -47,6 +62,11 @@ class Customer:
   embedded column `7f3a9c21/3e4f5a6b/5a6b7c8d`. Two uses of the same embeddable class thus
   get separate IDs.
 - The primary key refers to column IDs and survives renames.
+- A secondary table cannot carry `@SchemaId`, so the entity names its ID with
+  `@SecondaryTableId(table = "customer_details", value = "5d6e7f80")`: the table becomes
+  `entity/5d6e7f80`, its key column `entity/5d6e7f80/key`. Its properties keep
+  `entity/property`. When renaming the table, change `table` along with
+  `@SecondaryTable(name)` and keep `value`.
 - An association's join column takes the association property's ID. Its foreign key refers
   to the referenced table's ID and primary-key column IDs, so renames on either side keep
   it intact. Constraint names are not part of the model; PostgreSQL chooses them.
@@ -98,14 +118,36 @@ there:
 
 - Without history the previous model is the empty model (revision 0). The first start
   creates all tables.
+- A database without history that already contains a table or sequence of the target is
+  refused, unless `ExecutionOptions.adoptExistingSchema` is set. Then every table and
+  sequence of the target must exist, and the database must match the target exactly under
+  the lock; the executor records it as revision 1 with no statements and returns
+  `Adopted`. Nothing is created, changed or renamed. Hibernate names enum checks
+  `table_column_check`, the framework after a hash of the column ID; such checks show up as
+  drift and must be renamed by hand before adoption.
 - Because the IDs are stable across all versions, a server that skipped releases plans all
   changes at once against the model stored last.
 - If the target equals the stored model (order does not matter), the executor only checks
   the database and writes nothing.
-- An older server after a newer migration would rename things back. Therefore a target
-  model equal to an earlier revision blocks the startup, and so does a rename back to a name
-  the same ID had in an earlier revision. Tables and columns missing from an older model are
-  drops, which are not allowed anyway.
+- An older server after a newer migration would rename things back and drop what the newer
+  model added. Therefore a target model equal to an earlier revision blocks the startup, and
+  so does a rename back to a name the same ID had in an earlier revision. An intended return
+  needs an explicit approval in the options: `Approval.Revert(revision)` for a target equal
+  to that revision, `Approval.RenameBack(id)` for each rename back.
+- Dropping a table, column or sequence deletes data and needs `Approval.Drop(id)` for each
+  stable ID. A dropped table takes its columns, keys and indexes with it; a dropped column
+  takes the checks, keys and indexes over it. An entity's collection tables and sequence
+  are objects of their own and need their own approvals. The refusal lists every missing
+  approval; an approval whose change is not planned has no effect.
+- A change the executor cannot plan is refused together with the target's fingerprint. An
+  operator can migrate the database by hand and start once with
+  `ExecutionOptions.acceptManualMigration` set to that fingerprint: the executor checks the
+  database against the target exactly and records it as the next revision with no
+  statements. An option naming another target is refused. Earlier-revision, retired-ID and
+  drift checks still apply.
+- A dropped ID is retired: an ID that an earlier revision had and the latest does not may
+  never appear again, not even with approvals. This rejects an ID copied from the version
+  history of the code, which would attach the dropped object's identity to a new one.
 - Before any planning the executor checks the whole chain: revisions without gaps, every
   previous fingerprint equal to the target fingerprint of the row before, every stored
   model readable and matching its fingerprint. A modified history blocks the startup.
@@ -123,43 +165,41 @@ there:
 | `schema-hibernate` | `@SchemaId` and `HibernateSchemaSource` (boot metadata → model), pinned to Hibernate 7.4.10 |
 | `schema-executor` | Transaction, planning against the stored model, fingerprints, JSON format and history verification, failure states |
 | `schema-postgresql` | SQL renderer, catalog checks, locking and history for PostgreSQL 14+ |
+| `schema-integration` | `HibernateSchemaMigration`, the opt-in `SchemaMigrationIntegrator` and the `hibernate.ddl_manager.*` settings |
 | `schema-cli` | Demo without a database connection |
 
-## Current scope
+## Scope of 1.0
 
 Everything outside this scope is rejected, never silently ignored.
 
 | Area | Supported | Reported and rejected |
 | --- | --- | --- |
 | Model | Tables, columns `varchar(n)`, `char(n)`, `text`, `smallint`, `integer`, `bigint`, `numeric(p,s)`, `real`, `double precision`, `boolean`, `uuid`, `date`, `time(p)`, `timestamp(p)`, `timestamp(p) with time zone`, binary data (`bytea`), nullability, identity columns, column checks (allowed values, integer range), ascending bigint sequences, primary keys, unique keys, plain indexes with column directions, foreign keys to a primary key | All other types and objects |
-| Adapter | Entities without secondary tables, inheritance by `SINGLE_TABLE` (with its discriminator check), `JOINED` or `TABLE_PER_CLASS` (also with an abstract root and one sequence for the hierarchy), `@MappedSuperclass`, simple properties, embeddables, generated `UUID` keys, `@GeneratedValue` by sequence (Hibernate's default `Entity_SEQ` or `@SequenceGenerator`) or identity, `LocalDate`, `LocalTime`, `LocalDateTime`, `Instant`, `OffsetDateTime` and `@Column(secondPrecision)`, `BigDecimal` and `BigInteger` with `@Column(precision, scale)`, `Short`, `Byte`, `Float`, `Double`, `Character`, `byte[]`, `Duration` (as `numeric`), `@ManyToOne` with or without a constraint, `@OneToOne`, `@Column(unique)`, `@UniqueConstraint`, `@NaturalId`, `@Index` with `asc`/`desc`, `@Enumerated` by name or ordinal, `@ElementCollection` and `@ManyToMany` (also unidirectional `@OneToMany` through a join table) as sets, lists, `@OrderColumn` lists or maps (basic, embeddable or entity keys) of basic values, enums, embeddables or entities | Other CHECK constraints (`@Column(check)`, `@Check`, enum values containing a quote), `@Lob` (PostgreSQL large objects), `ON DELETE` actions, associations to non-primary-key or multi-column keys, ordered unique keys, index options and expressions, `@CollectionId` bags, collections inside embeddables or sharing a table, sequences shared by several keys or used by no key, `GenerationType.TABLE`, table-level checks, defaults, columns without an ID origin |
-| Diff | New and renamed sequences, new tables, new nullable columns, new unique keys and indexes, new foreign keys (added after all tables, so cycles work), added, changed or removed column checks (existing rows are validated), table and column renames | Drops (including keys, indexes and sequences), sequence start or increment changes, identity changes, type/nullability/primary key/foreign key changes, schema moves, rename collisions and swaps |
-| History | Stored model per revision, skipped releases | Target model of an earlier revision, rename back to an earlier name, modified history, tables without history (no adoption of existing databases) |
+| Adapter | Entities, secondary tables with `@SecondaryTableId`, inheritance by `SINGLE_TABLE` (with its discriminator check), `JOINED` or `TABLE_PER_CLASS` (also with an abstract root and one sequence for the hierarchy), `@MappedSuperclass`, simple properties, embeddables, generated `UUID` keys, `@GeneratedValue` by sequence (Hibernate's default `Entity_SEQ` or `@SequenceGenerator`) or identity, `LocalDate`, `LocalTime`, `LocalDateTime`, `Instant`, `OffsetDateTime` and `@Column(secondPrecision)`, `BigDecimal` and `BigInteger` with `@Column(precision, scale)`, `Short`, `Byte`, `Float`, `Double`, `Character`, `byte[]`, `Duration` (as `numeric`), `@ManyToOne` with or without a constraint, `@OneToOne`, `@Column(unique)`, `@UniqueConstraint`, `@NaturalId`, `@Index` with `asc`/`desc`, `@Enumerated` by name or ordinal, `@ElementCollection` and `@ManyToMany` (also unidirectional `@OneToMany` through a join table) as sets, lists, `@OrderColumn` lists or maps (basic, embeddable or entity keys) of basic values, enums, embeddables or entities | Other CHECK constraints (`@Column(check)`, `@Check`, enum values containing a quote), `@Lob` (PostgreSQL large objects), JSON columns (`jsonb`), `ON DELETE` actions, associations to non-primary-key or multi-column keys, ordered unique keys, index options and expressions, `@CollectionId` bags, collections inside embeddables or sharing a table, sequences shared by several keys or used by no key, `GenerationType.TABLE`, table-level checks, defaults, columns without an ID origin |
+| Diff | New and renamed sequences, new tables, new nullable columns, new unique keys and indexes, new foreign keys (added after all tables, so cycles work), added, changed or removed column checks (existing rows are validated), table and column renames; approved drops of columns (with the keys and indexes over them), tables (all in one statement, so they may reference each other) and sequences, run last and without `CASCADE` | Unapproved drops, dropping a key, index or foreign key whose columns remain, reusing a dropped name in the same plan, sequence start or increment changes, identity changes, type/nullability/primary key/foreign key changes, schema moves, rename collisions and swaps |
+| History | Stored model per revision, skipped releases, opt-in adoption of an existing database that matches the target exactly, approved returns to an earlier revision or name | Unapproved target model of an earlier revision or rename back to an earlier name, modified history, existing tables without history unless adopted, partial adoption |
 | PostgreSQL | Ordinary permanent tables with exactly these columns and `GENERATED BY DEFAULT` identity columns, unowned bigint sequences with default minimum, maximum, cache and no cycling, a non-deferrable primary key, plain unique constraints, plain B-tree indexes and plain foreign keys, matched by structure; column checks, matched by their derived name and column | `GENERATED ALWAYS` identity, sequences with other types or options or owned by a column, other constraints, unexpected or `NOT VALID` checks, unique, partial, expression, covering or non-B-tree indexes, custom operator classes, collations or `NULLS` ordering, deferrable, `INCLUDE` or `NULLS NOT DISTINCT` unique keys, foreign keys with actions, `MATCH FULL` or deferrable checking, foreign keys from unmodeled tables, triggers, rules, RLS, inheritance, partitions, custom collations |
 
 Tables that exist only in the database are left untouched.
 
-## Open points
+Foreign key columns get no index automatically; declare one with `@Index` where deletes on
+the referenced table must be fast. An end-to-end test migrates a set of entities covering
+the adapter's scope into PostgreSQL, and another adopts a schema that Hibernate's own schema
+generation created.
 
-1. **Model coverage for real entities.** The common basic types, enums, `UUID` keys,
-   associations, collection tables, inheritance, unique constraints, indexes and generated
-   keys work; an end-to-end test migrates a set of such entities into PostgreSQL. Next:
-   secondary tables and `@Lob`, then collections inside embeddables. New types also need a
-   name in the history's JSON format. Foreign key columns get no index automatically;
-   declare one with `@Index` where deletes on the referenced table must be fast.
-2. **Adopting existing databases.** Without history the previous model is the empty model;
-   tables that already exist (for example from `hbm2ddl`) make `CREATE TABLE` fail.
-   Proposal: if a database without history already matches the target model, the executor
-   records it as revision 1 without DDL.
-3. **Server integration.** The entry point is between `MetadataBuilder.build()` and
-   `getSessionFactoryBuilder.build()`. The executor needs a DataSource without JTA
-   enlistment. `hibernate.hbm2ddl.auto=validate` works as an independent cross-check after
-   the migration.
-4. **Drops and intentional renames back** block the startup today. They will need explicit
-   approval later.
-5. **Retired IDs** can be read from the stored models in the history once drops are
-   possible. An ID copied from the Git history can then be rejected instead of being reused
-   by accident.
+## After 1.0
 
-Possible later: data migrations and backfills, multi-phase deployments (expand/contract),
-further dialects and an export to Flyway or Liquibase as an alternative mode of operation.
+Until then, each of these is refused, or needs a manual migration (`acceptManualMigration`):
+
+- **Model coverage:** `@Lob` (PostgreSQL large objects, which also need `vacuumlo` or the
+  `lo` trigger), JSON columns, collections inside embeddables, `@CollectionId` bags, other
+  CHECK constraints, `ON DELETE` actions. Each new type needs a name in the history's JSON
+  format.
+- **Dropping a unique key, index or foreign key whose columns remain.** PostgreSQL names
+  these objects, so dropping one needs a lookup by structure under the lock.
+- **Adopting Hibernate-named checks:** matching a check constraint by its definition instead
+  of its derived name, so that a database created by `hbm2ddl` with enums is adopted without
+  renaming its checks by hand.
+- **Data migrations and backfills** (non-null columns, type changes), multi-phase
+  deployments (expand/contract), further dialects and an export to Flyway or Liquibase as an
+  alternative mode of operation.

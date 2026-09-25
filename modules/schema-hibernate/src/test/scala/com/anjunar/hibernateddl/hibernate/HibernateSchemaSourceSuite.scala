@@ -194,7 +194,8 @@ class HibernateSchemaSourceSuite extends munit.FunSuite:
 
   test("mappings the model cannot represent are reported instead of dropped") {
     val diagnostics = errors(classOf[Unsupported], classOf[LegacyCustomer])
-    assert(diagnostics.exists(_.contains("Unsupported.document has SQL type 'oid'")), diagnostics)
+    assert(diagnostics.exists(_.contains("Unsupported.document has SQL type 'jsonb'")), diagnostics)
+    assert(diagnostics.exists(_.contains("Unsupported.attachment has SQL type 'oid'")), diagnostics)
     assert(diagnostics.exists(_.contains("of entity Unsupported has ON DELETE CASCADE; unsupported")), diagnostics)
     assert(diagnostics.exists(_.contains("Unsupported.folder.files is not a direct property")), diagnostics)
     assert(diagnostics.exists(_.contains("of entity Unsupported has options 'WHERE code IS NOT NULL'; unsupported")), diagnostics)
@@ -266,6 +267,29 @@ class HibernateSchemaSourceSuite extends munit.FunSuite:
     assertEquals(card.columns.map(c => c.id.value -> c.name.value).toMap,
       Map("708192a4/0a1b2c3d" -> "id", "708192a4/1b2c3d4e" -> "amount", "708192a4/2c3d4e5f" -> "card"))
     assertEquals(model.sequences.map(s => s.id.value -> s.name.name.value), Vector("6f708193/0a1b2c3d/sequence" -> "payment_seq"))
+  }
+
+  test("a secondary table takes its ID from @SecondaryTableId; its properties keep their IDs") {
+    val model = read(classOf[Profile]).toOption.get
+    val profile = model.tables.find(_.id == SchemaId("29384a5b")).get
+    val details = model.tables.find(_.id == SchemaId("29384a5b/3a4b5c6d")).get
+    assertEquals(details.name.name.value, "profile_details")
+    assertEquals(details.columns.map(c => c.id.value -> (c.name.value, c.dataType)).toMap, Map(
+      "29384a5b/3a4b5c6d/key" -> ("id", SqlType.BigInt),
+      "29384a5b/2c3d4e5f" -> ("bio", SqlType.Varchar(255)),
+      "29384a5b/3d4e5f60" -> ("essay", SqlType.Varchar(255))
+    ))
+    assertEquals(details.primaryKey, Vector(SchemaId("29384a5b/3a4b5c6d/key")))
+    assertEquals(details.foreignKeys, Vector(ForeignKeyModel(Vector(SchemaId("29384a5b/3a4b5c6d/key")), profile.id, profile.primaryKey)))
+    assertEquals(profile.columns.map(_.id.value).toSet, Set("29384a5b/0a1b2c3d", "29384a5b/1b2c3d4e"))
+  }
+
+  test("a secondary table without @SecondaryTableId and an annotation naming no secondary table are reported") {
+    val diagnostics = errors(classOf[Unlabelled])
+    assert(diagnostics.exists(_.matches(
+      """The secondary table unlabelled_details of entity Unlabelled has no @SecondaryTableId; add e\.g\. """ +
+        """@SecondaryTableId\(table = "unlabelled_details", value = "[0-9a-f]{8}"\)""")), diagnostics)
+    assert(diagnostics.contains("@SecondaryTableId(table = \"elsewhere\") of entity Unlabelled names no secondary table"), diagnostics)
   }
 
   test("fresh IDs have the required format") {

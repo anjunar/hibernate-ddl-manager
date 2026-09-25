@@ -1,5 +1,5 @@
 ThisBuild / organization := "com.anjunar.hibernateddl"
-ThisBuild / version := "0.1.0-SNAPSHOT"
+ThisBuild / version := "1.0.0"
 ThisBuild / scalaVersion := "3.9.0"
 
 lazy val commonSettings = Seq(
@@ -9,7 +9,7 @@ lazy val commonSettings = Seq(
 )
 
 lazy val root = (project in file("."))
-  .aggregate(schemaCore, schemaHibernate, schemaExecutor, schemaPostgresql, schemaCli)
+  .aggregate(schemaCore, schemaHibernate, schemaExecutor, schemaPostgresql, schemaIntegration, schemaCli)
   .settings(
     name := "hibernate-ddl-manager",
     publish / skip := true
@@ -42,6 +42,16 @@ lazy val schemaExecutor = (project in file("modules/schema-executor"))
   .dependsOn(schemaCore)
   .settings(commonSettings)
   .settings(name := "schema-executor")
+
+lazy val schemaIntegration = (project in file("modules/schema-integration"))
+  .dependsOn(schemaHibernate % "compile->compile;test->test", schemaExecutor,
+    schemaPostgresql % "compile->compile;test->test")
+  .settings(commonSettings)
+  .settings(
+    name := "schema-integration",
+    Test / fork := true,
+    Test / parallelExecution := false
+  )
 
 lazy val schemaCli = (project in file("modules/schema-cli"))
   .dependsOn(schemaCore, schemaPostgresql)

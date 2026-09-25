@@ -15,9 +15,9 @@ import scala.util.Using
   * generated columns, custom collations, inheritance, partitions, other constraints,
   * other indexes, triggers, rules and RLS require a richer schema model before
   * execution is supported. Unmanaged tables outside the supplied model are allowed,
-  * but must not reference a modeled table. Every modeled table is exclusively locked
-  * before catalog inspection; callers must retain this transaction until the
-  * migration and its history entry have both committed.
+  * but must not reference a modeled table. Every modeled table is locked before catalog
+  * inspection, exclusively unless the executor only checks an applied schema; callers must
+  * retain this transaction until the migration and its history entry have both committed.
   *
   * The history table stores every applied model as jsonb, together with the executed
   * statements. A history table with another column layout was created by another version
@@ -102,6 +102,19 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
         row.getString("target_fingerprint"), row.getString("model"), strings(row, "statements"))
     }
 
+  override def existingRelations(connection: Connection, model: SchemaModel): Vector[QualifiedName] =
+    (model.tables.map(_.name) ++ model.sequences.map(_.name)).filter { name =>
+      query(connection,
+        """SELECT 1
+          |FROM pg_catalog.pg_class c
+          |JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          |WHERE n.nspname = ? AND c.relname = ?""".stripMargin
+      ) { statement =>
+        statement.setString(1, name.schema.get.value)
+        statement.setString(2, name.name.value)
+      }(_ => ()).nonEmpty
+    }
+
   override def recordHistory(connection: Connection, entry: HistoryEntry): Unit =
     Using.resource(connection.prepareStatement(
       s"INSERT INTO $HistoryTable (${HistoryColumns.mkString(", ")}) VALUES (?, ?, ?, CAST(? AS pg_catalog.jsonb), ?)"
@@ -118,15 +131,19 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
       finally statements.free()
     }
 
-  override def lockAndValidate(connection: Connection, expected: SchemaModel): Vector[String] =
+  override def lockAndValidate(connection: Connection, expected: SchemaModel, lock: TableLock): Vector[String] =
     val validation = validateModel(expected)
     if validation.nonEmpty then validation
     else
       val tables = expected.tables.sortBy(table => qualified(table.name))
       // Lock every table before inspecting any of them. ONLY avoids recursively
-      // locking an unmodeled inheritance tree, which inspection will reject.
+      // locking an unmodeled inheritance tree, which inspection will reject. ACCESS SHARE
+      // conflicts only with ACCESS EXCLUSIVE, which most DDL takes.
+      val mode = lock match
+        case TableLock.Exclusive => "ACCESS EXCLUSIVE"
+        case TableLock.Shared => "ACCESS SHARE"
       tables.foreach { table =>
-        execute(connection, s"LOCK TABLE ONLY ${qualified(table.name)} IN ACCESS EXCLUSIVE MODE")
+        execute(connection, s"LOCK TABLE ONLY ${qualified(table.name)} IN $mode MODE")
       }
       // Sequences cannot be locked; the advisory lock already keeps other migrations out.
       (tables.flatMap(table => inspectTable(connection, table, expected)) ++
