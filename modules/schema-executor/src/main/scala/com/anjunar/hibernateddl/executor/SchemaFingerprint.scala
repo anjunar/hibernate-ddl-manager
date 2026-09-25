@@ -7,9 +7,9 @@ import java.security.MessageDigest
 
 /** Canonical SHA-256 identity of a complete schema model.
   * Table, column and key ordering is irrelevant; stable IDs and all physical metadata matter.
-  * Foreign keys, unique keys, indexes and column checks are appended after all tables in that
-  * order, each section only when there are any, so models without them keep the fingerprints
-  * that existing histories store.
+  * Foreign keys, unique keys, indexes, column checks, identity columns and sequences are
+  * appended after all tables in that order, each section only when there are any, so models
+  * without them keep the fingerprints that existing histories store.
   */
 object SchemaFingerprint:
   def of(model: SchemaModel): String =
@@ -112,6 +112,26 @@ object SchemaFingerprint:
             string(out, "range")
             out.writeLong(min)
             out.writeLong(max)
+      }
+    val identities = tables.flatMap(table => table.columns.filter(_.identity).map(_.id).sortBy(_.value).map(table.id -> _))
+    if identities.nonEmpty then
+      string(out, "identity-columns")
+      out.writeInt(identities.size)
+      identities.foreach { (tableId, columnId) =>
+        string(out, tableId.value)
+        string(out, columnId.value)
+      }
+    val sequences = model.sequences.sortBy(_.id.value)
+    if sequences.nonEmpty then
+      string(out, "sequences")
+      out.writeInt(sequences.size)
+      sequences.foreach { sequence =>
+        string(out, sequence.id.value)
+        string(out, sequence.name.name.value)
+        optionalIdentifier(out, sequence.name.schema)
+        optionalIdentifier(out, sequence.name.catalog)
+        out.writeLong(sequence.start)
+        out.writeLong(sequence.increment)
       }
     out.flush()
     MessageDigest.getInstance("SHA-256").digest(bytes.toByteArray)

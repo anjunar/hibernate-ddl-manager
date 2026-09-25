@@ -246,6 +246,30 @@ class DiffEngineSuite extends munit.FunSuite:
     )))
   }
 
+  test("sequences are created or renamed first; changing, moving or dropping them is refused") {
+    val sequence = SequenceModel(SchemaId("customer-sequence"), QualifiedName(SqlIdentifier("customer_seq")), 1, 50)
+    val renamed = sequence.copy(name = QualifiedName(SqlIdentifier("client_seq")))
+    assertEquals(DiffEngine.diff(initial, SchemaModel(initial.tables, Vector(sequence))),
+      Right(Vector(SchemaOperation.CreateSequence(sequence))))
+    val before = SchemaModel(initial.tables, Vector(sequence))
+    assertEquals(DiffEngine.diff(before, SchemaModel(initial.tables, Vector(renamed))),
+      Right(Vector(SchemaOperation.RenameSequence(sequence.id, sequence.name, renamed.name))))
+    assert(errors(DiffEngine.diff(before, initial)).exists(_.contains("Dropping sequence 'customer-sequence'")))
+    assert(errors(DiffEngine.diff(before, SchemaModel(initial.tables, Vector(sequence.copy(increment = 1)))))
+      .exists(_.contains("Changing start or increment")))
+    assert(errors(DiffEngine.diff(before, SchemaModel(initial.tables,
+      Vector(sequence.copy(name = sequence.name.copy(schema = Some(SqlIdentifier("other"))))))))
+      .exists(_.contains("Moving sequence")))
+    val taken = SequenceModel(SchemaId("other-sequence"), customer.name, 1, 1)
+    val movedAway = Vector(customer.copy(name = QualifiedName(SqlIdentifier("customers"))))
+    assert(errors(DiffEngine.diff(initial, SchemaModel(movedAway, Vector(taken))))
+      .exists(_.contains("Creating sequence 'other-sequence' uses the previous name of 'customer'")))
+    val identity = customer.columns.head.copy(dataType = SqlType.BigInt, nullable = false)
+    assert(errors(DiffEngine.diff(SchemaModel(Vector(customer.copy(columns = Vector(identity)))),
+      SchemaModel(Vector(customer.copy(columns = Vector(identity.copy(identity = true)))))))
+      .exists(_.contains("Changing identity generation")))
+  }
+
   test("renames expose their locking risk") {
     val renamed = customer.name.copy(name = SqlIdentifier("renamed"))
     assertEquals(SchemaOperation.RenameTable(customer.id, customer.name, renamed).risk, RiskLevel.Locking)

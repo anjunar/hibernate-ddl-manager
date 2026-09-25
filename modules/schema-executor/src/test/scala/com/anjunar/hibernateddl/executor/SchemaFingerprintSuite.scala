@@ -81,6 +81,32 @@ class SchemaFingerprintSuite extends munit.FunSuite:
     assertEquals(SchemaFingerprint.of(model), "2e078d3ab32f3cd52cb02314f213bcce5e9d22aba3700cd4ff457cb1d883afb7")
   }
 
+  test("models with column checks but without identity columns or sequences keep the fingerprints that earlier versions stored") {
+    val table = keyed.tables.head
+    val status = ColumnModel(SchemaId("t/status"), SqlIdentifier("status"), SqlType.Varchar(10),
+      check = Some(ColumnCheck.AllowedValues(Vector("NEW", "OLD"))))
+    val model = SchemaModel(Vector(table.copy(columns = Vector(table.columns.head, status))))
+    assertEquals(SchemaFingerprint.of(model), "4854bd7150afe372ceb85e2a9a3e9af7d81b4bbd69b2cea7daed768b11b0d520")
+  }
+
+  test("identity columns and sequences change the fingerprint, but sequence order does not") {
+    val table = keyed.tables.head
+    val identity = SchemaModel(Vector(table.copy(columns = table.columns.map(c => if c.id == table.columns.head.id then
+      c.copy(dataType = SqlType.BigInt, identity = true) else c))))
+    val plain = SchemaModel(Vector(table.copy(columns = table.columns.map(c => if c.id == table.columns.head.id then
+      c.copy(dataType = SqlType.BigInt) else c))))
+    assertNotEquals(SchemaFingerprint.of(identity), SchemaFingerprint.of(plain))
+    val first = SequenceModel(SchemaId("a"), QualifiedName(SqlIdentifier("a_seq"), Some(SqlIdentifier("public"))), 1, 50)
+    val second = SequenceModel(SchemaId("b"), QualifiedName(SqlIdentifier("b_seq"), Some(SqlIdentifier("public"))), 1, 1)
+    val fingerprint = SchemaFingerprint.of(keyed.copy(sequences = Vector(first, second)))
+    assertEquals(SchemaFingerprint.of(keyed.copy(sequences = Vector(second, first))), fingerprint)
+    Vector(first.copy(start = 2), first.copy(increment = 1), first.copy(name = first.name.copy(name = SqlIdentifier("x"))),
+      first.copy(name = first.name.copy(schema = None)), first.copy(id = SchemaId("c"))).foreach { changed =>
+      assertNotEquals(SchemaFingerprint.of(keyed.copy(sequences = Vector(changed, second))), fingerprint, changed)
+    }
+    assertNotEquals(SchemaFingerprint.of(keyed), fingerprint)
+  }
+
   test("column checks change the fingerprint") {
     val table = keyed.tables.head
     def withCheck(check: Option[ColumnCheck]) =

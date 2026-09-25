@@ -102,6 +102,8 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
           case _: SchemaOperation.AddUniqueKey => "add unique key"
           case _: SchemaOperation.CreateIndex => "create index"
           case _: SchemaOperation.ChangeCheck => "change check"
+          case _: SchemaOperation.CreateSequence => "create sequence"
+          case _: SchemaOperation.RenameSequence => "rename sequence"
         })
       private def onConnection(actual: Connection, label: String): Unit =
         assert(actual eq connection)
@@ -216,6 +218,17 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     assert(error.getMessage.contains("Renaming table 'account' back to its name from revision 1"), error.getMessage)
     assert(error.getMessage.contains("Renaming column 'account-name' back to its name from revision 1"), error.getMessage)
     assert(!h.events.exists(_.startsWith("sql:")))
+  }
+
+  test("renaming a sequence back to an earlier name is refused like an older server") {
+    val sequence = SequenceModel(SchemaId("account-sequence"), QualifiedName(SqlIdentifier("account_seq")), 1, 50)
+    val renamedSequence = sequence.copy(name = QualifiedName(SqlIdentifier("accounts_seq")))
+    val h = new Harness
+    h.seed(SchemaModel(initial.tables, Vector(sequence)), SchemaModel(initial.tables, Vector(renamedSequence)))
+    val bio = ColumnModel(SchemaId("account-bio"), SqlIdentifier("bio"), SqlType.Text)
+    val reverted = SchemaModel(initial.tables.map(t => t.copy(columns = t.columns :+ bio)), Vector(sequence))
+    val error = h.refused(reverted)
+    assert(error.getMessage.contains("Renaming sequence 'account-sequence' back to its name from revision 1"), error.getMessage)
   }
 
   test("unsupported changes, render errors and disallowed risks are refused under the lock before DDL") {

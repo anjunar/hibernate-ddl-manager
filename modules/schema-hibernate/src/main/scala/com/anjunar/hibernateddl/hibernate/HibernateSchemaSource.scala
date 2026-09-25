@@ -7,13 +7,17 @@ import org.hibernate.boot.model.naming.Identifier
 import org.hibernate.cfg.MappingSettings
 import org.hibernate.engine.config.spi.{ConfigurationService, StandardConverters}
 import org.hibernate.annotations.OnDeleteAction
-import org.hibernate.mapping.{Collection as CollectionMapping, Column, Component, PersistentClass, Property, Table}
+import org.hibernate.id.enhanced.SequenceStyleGenerator
+import org.hibernate.boot.model.relational.SqlStringGenerationContext
+import org.hibernate.boot.model.relational.internal.SqlStringGenerationContextImpl
+import org.hibernate.mapping.{Collection as CollectionMapping, Column, Component, GeneratorSettings, PersistentClass, Property, RootClass, Table}
 
 import java.lang.reflect.AnnotatedElement
 import java.util.HexFormat
 import java.util.Locale
 import java.util.concurrent.ThreadLocalRandom
 import scala.jdk.CollectionConverters.*
+import scala.util.control.NonFatal
 
 /** Reads the desired physical schema from Hibernate boot metadata.
   *
@@ -81,9 +85,19 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
       database.getJdbcEnvironment.getNameQualifierSupport.supportsCatalogs)
 
     private def defaultQualifier(setting: String, implicitName: Identifier, supported: Boolean): Option[Identifier] =
-      val configured = database.getServiceRegistry.requireService(classOf[ConfigurationService])
-        .getSetting(setting, StandardConverters.STRING)
-      Option.when(supported)(Option(names.toIdentifier(configured)).orElse(Option(implicitName))).flatten
+      Option.when(supported)(Option(names.toIdentifier(configured(setting))).orElse(Option(implicitName))).flatten
+
+    private def configured(setting: String): String =
+      database.getServiceRegistry.requireService(classOf[ConfigurationService]).getSetting(setting, StandardConverters.STRING)
+
+    // The settings Hibernate itself uses when it creates identifier generators.
+    private val generatorSettings = new GeneratorSettings:
+      private val catalog = configured(MappingSettings.DEFAULT_CATALOG)
+      private val schema = configured(MappingSettings.DEFAULT_SCHEMA)
+      def getDefaultCatalog: String = catalog
+      def getDefaultSchema: String = schema
+      def getSqlStringGenerationContext: SqlStringGenerationContext =
+        SqlStringGenerationContextImpl.fromExplicit(database.getJdbcEnvironment, database, catalog, schema)
 
     def read(): SchemaModel =
       val entities = metadata.getEntityBindings.asScala.toVector.sortBy(_.getEntityName)
@@ -101,13 +115,11 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
       metadata.collectTableMappings.asScala.filterNot(table => entityTables(table) || collectionTables(table)).foreach { table =>
         errors += s"Table ${table.getName} belongs to no entity or collection; unsupported"
       }
-      database.getNamespaces.asScala.flatMap(_.getSequences.asScala).foreach { sequence =>
-        errors += s"Sequence ${sequence.getExportIdentifier} is unsupported; use assigned identifiers"
-      }
       database.getAuxiliaryDatabaseObjects.asScala.foreach { auxiliary =>
         errors += s"Auxiliary database object ${auxiliary.getExportIdentifier} is unsupported"
       }
-      val mappedEntities = entities.flatMap(readEntity)
+      val entityMappings = entities.flatMap(entity => readEntity(entity).map(entity -> _))
+      val mappedEntities = entityMappings.map(_._2)
       mappedEntities.groupBy(_.model.id).foreach { (id, owners) =>
         if owners.size > 1 then
           errors += s"Entities ${owners.map(_.label).sorted.mkString(", ")} share @SchemaId(\"${id.value}\")"
@@ -116,8 +128,61 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
       val mapped = mappedEntities ++ collections.filterNot(c => sharedTables.contains(c.getCollectionTable))
         .flatMap(readCollection(_, entityIds))
       val byTable = mapped.map(entity => entity.table -> entity).toMap
-      SchemaModel(mapped.map(entity =>
-        entity.model.copy(foreignKeys = foreignKeys(entity, byTable, entityTables ++ collectionTables))))
+      SchemaModel(
+        mapped.map(entity => entity.model.copy(foreignKeys = foreignKeys(entity, byTable, entityTables ++ collectionTables))),
+        sequences(entityMappings)
+      )
+
+    /** Every Hibernate sequence must generate the key of exactly one mapped entity. It takes that
+      * key column's ID plus `/sequence`, so renaming the sequence is planned as a rename.
+      */
+    private def sequences(entities: Vector[(PersistentClass, Mapped)]): Vector[SequenceModel] =
+      val known = database.getNamespaces.asScala.toVector.flatMap(_.getSequences.asScala)
+      val users = entities.flatMap { (entity, mapped) =>
+        val generator =
+          try Some(entity.getIdentifier.createGenerator(database.getDialect, entity.asInstanceOf[RootClass],
+            entity.getIdentifierProperty, generatorSettings))
+          catch case NonFatal(error) =>
+            errors += s"Key generator of ${mapped.description} cannot be created: ${error.getMessage}"
+            None
+        generator.collect { case sequence: SequenceStyleGenerator => sequence.getDatabaseStructure.getPhysicalName }
+          .flatMap { name =>
+            val sequence = known.find { candidate =>
+              candidate.getName.getSequenceName == name.getObjectName && candidate.getName.getSchemaName == name.getSchemaName &&
+                candidate.getName.getCatalogName == name.getCatalogName
+            }
+            val keyColumns = entity.getIdentifier.getSelectables.asScala.toVector.collect { case column: Column => column }
+            if sequence.isEmpty then errors += s"Key sequence $name of ${mapped.description} is not registered; unsupported"
+            if keyColumns.size != 1 then errors += s"${mapped.description} generates a multi-column key from a sequence; unsupported"
+            for
+              found <- sequence
+              column <- keyColumns.headOption if keyColumns.size == 1
+              keyId <- mapped.columnIds.get(column)
+            yield found -> (mapped.label, keyId)
+          }
+      }
+      known.flatMap { sequence =>
+        users.filter(_._1 eq sequence).map(_._2) match
+          case Vector((_, keyId)) =>
+            val name = sequence.getName
+            Some(SequenceModel(
+              SchemaId(keyId.value + "/sequence"),
+              QualifiedName(
+                physical(name.getSequenceName),
+                Option(name.getSchemaName).orElse(defaultSchema).map(physical),
+                Option(name.getCatalogName).orElse(defaultCatalog).map(physical)
+              ),
+              sequence.getInitialValue.toLong,
+              sequence.getIncrementSize.toLong
+            ))
+          case Vector() =>
+            errors += s"Sequence ${sequence.getExportIdentifier} generates the key of no mapped entity; unsupported"
+            None
+          case sharing =>
+            errors += s"Sequence ${sequence.getExportIdentifier} generates the keys of entities " +
+              s"${sharing.map(_._1).sorted.mkString(", ")}; give each entity its own sequence"
+            None
+      }
 
     /** Foreign keys of associations, referencing the primary key of another mapped entity. */
     private def foreignKeys(entity: Mapped, byTable: Map[Table, Mapped], ownedTables: Set[Table]): Vector[ForeignKeyModel] =
@@ -286,7 +351,6 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
       Vector(
         Option.when(column.getDefaultValue != null)("a default value"),
         Option.when(column.getGeneratedAs != null)("a generation expression"),
-        Option.when(column.isIdentity)("identity generation"),
         Option.when(column.getCollation != null)("a custom collation")
       ).flatten.foreach(feature => errors += s"$label has $feature; unsupported")
       val sqlType = column.getSqlType(metadata)
@@ -316,7 +380,8 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
         case _ => None
       if dataType.isEmpty then errors += s"$label has SQL type '$sqlType'; unsupported"
       val check = columnCheck(column, label)
-      dataType.map(ColumnModel(id, physical(Identifier.toIdentifier(column.getName, column.isQuoted)), _, column.isNullable, check))
+      dataType.map(ColumnModel(id, physical(Identifier.toIdentifier(column.getName, column.isQuoted)), _, column.isNullable, check,
+        column.isIdentity))
 
     private def columnCheck(column: Column, label: String): Option[ColumnCheck] =
       column.getCheckConstraints.asScala.toVector.map(_.getConstraint) match
