@@ -183,8 +183,9 @@ Type, nullability and primary key changes, among others, need a data migration a
 refused. The refusal names the target's fingerprint. Change the database by hand to exactly
 the target schema, then start once with
 `ExecutionOptions(acceptManualMigration = Some("<fingerprint>"))`: the executor checks the
-database against the target under the lock and records it as the next revision without
-executing DDL (`ManuallyMigrated`). An option naming another target is refused, so it cannot
+database against the target under the lock, checks that every table or sequence the target
+dropped or renamed is gone under its old name, and records the target as the next revision
+without executing DDL (`ManuallyMigrated`). An option naming another target is refused, so it cannot
 accept a later change by accident.
 
 ## Modules

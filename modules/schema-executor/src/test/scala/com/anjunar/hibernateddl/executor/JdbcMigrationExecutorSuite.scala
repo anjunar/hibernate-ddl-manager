@@ -337,7 +337,7 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     assertEquals(h.migrate(retyped, manual), MigrationResult(2, MigrationStatus.ManuallyMigrated, 0))
     assertEquals(h.events.toVector, Vector(
       "connection", "get-auto-commit", "auto-commit:false", "read-committed", "lock", "initialize-history",
-      "read-history", "validate:account", "record-history", "commit", "close"
+      "read-history", "existing-relations", "validate:account", "record-history", "commit", "close"
     ))
     assertEquals(h.history.last, HistoryEntry(2, SchemaFingerprint.of(initial), fingerprint,
       SchemaModelJson.encode(retyped), Vector.empty))
@@ -345,6 +345,19 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     val fresh = new Harness
     assert(fresh.refused(initial, ExecutionOptions(acceptManualMigration = Some(SchemaFingerprint.of(initial))))
       .getMessage.contains("adoptExistingSchema"))
+  }
+
+  test("a manual migration is refused while a table or sequence the target no longer has still exists") {
+    val sequence = SequenceModel(SchemaId("account-sequence"), QualifiedName(SqlIdentifier("account_seq")), 1, 50)
+    val h = new Harness
+    h.seed(SchemaModel(initial.tables, Vector(sequence)))
+    h.existing = Set("account", "account_seq")
+    val dropped = h.refused(empty, ExecutionOptions(acceptManualMigration = Some(SchemaFingerprint.of(empty))))
+    assert(dropped.getMessage.contains("account, account_seq of the previous schema still exist"), dropped.getMessage)
+    val manual = ExecutionOptions(acceptManualMigration = Some(SchemaFingerprint.of(renamed)))
+    assert(h.refused(renamed, manual).getMessage.contains("account, account_seq of the previous schema still exist"))
+    h.existing = Set("accounts")
+    assertEquals(h.migrate(renamed, manual), MigrationResult(2, MigrationStatus.ManuallyMigrated, 0))
   }
 
   test("renaming a sequence back to an earlier name is refused like an older server") {

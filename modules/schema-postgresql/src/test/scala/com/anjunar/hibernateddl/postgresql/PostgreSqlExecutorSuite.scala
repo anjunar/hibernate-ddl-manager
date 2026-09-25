@@ -786,3 +786,19 @@ class PostgreSqlExecutorSuite extends TestPostgres:
     }
   }
 
+  test("a manual migration cannot record a drop or rename that the database does not show") {
+    val empty = SchemaModel(Vector.empty)
+    def manual(model: SchemaModel) = new JdbcMigrationExecutor(PostgreSqlMigrationBackend,
+      ExecutionOptions(acceptManualMigration = Some(SchemaFingerprint.of(model))))
+    withDatabase { ds =>
+      fixture(ds)
+      val dropped = intercept[MigrationException](manual(empty).migrate(ds, empty))
+      assert(dropped.getMessage.contains("public.users of the previous schema still exist"), dropped.getMessage)
+      execute(ds, "CREATE TABLE public.accounts (login_name varchar(100) NOT NULL)")
+      val copied = intercept[MigrationException](manual(target).migrate(ds, target))
+      assert(copied.getMessage.contains("public.users of the previous schema still exist"), copied.getMessage)
+      execute(ds, "DROP TABLE public.users")
+      assertEquals(manual(target).migrate(ds, target), MigrationResult(2, MigrationStatus.ManuallyMigrated, 0))
+    }
+  }
+

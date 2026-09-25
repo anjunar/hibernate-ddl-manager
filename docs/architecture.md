@@ -149,8 +149,9 @@ there:
 - A change the executor cannot plan is refused together with the target's fingerprint. An
   operator can migrate the database by hand and start once with
   `ExecutionOptions.acceptManualMigration` set to that fingerprint: the executor checks the
-  database against the target exactly and records it as the next revision with no
-  statements. An option naming another target is refused. Earlier-revision, retired-ID and
+  database against the target exactly, checks that no table or sequence of the previous
+  model remains under a name the target no longer has, and records the target as the next
+  revision with no statements. An option naming another target is refused. Earlier-revision, retired-ID and
   drift checks still apply.
 - A dropped ID is retired: an ID that an earlier revision had and the latest does not may
   never appear again, not even with approvals. This rejects an ID copied from the version
