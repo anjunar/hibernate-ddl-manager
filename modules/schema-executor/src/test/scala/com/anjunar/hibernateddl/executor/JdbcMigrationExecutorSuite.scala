@@ -121,9 +121,9 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
       def existingRelations(actual: Connection, model: SchemaModel): Vector[QualifiedName] =
         onConnection(actual, "existing-relations")
         (model.tables.map(_.name) ++ model.sequences.map(_.name)).filter(name => existing.contains(name.name.value))
-      def lockAndValidate(actual: Connection, expected: SchemaModel): Vector[String] =
+      def lockAndValidate(actual: Connection, expected: SchemaModel, lock: TableLock): Vector[String] =
         val label = expected.tables.map(_.name.name.value).mkString(",")
-        onConnection(actual, s"validate:$label")
+        onConnection(actual, if lock == TableLock.Shared then s"validate-shared:$label" else s"validate:$label")
         if driftAt.contains(label) then Vector("physical schema drift") else Vector.empty
       def recordHistory(actual: Connection, entry: HistoryEntry): Unit =
         onConnection(actual, "record-history")
@@ -184,7 +184,7 @@ class JdbcMigrationExecutorSuite extends munit.FunSuite:
     assertEquals(h.migrate(reordered), MigrationResult(1, MigrationStatus.AlreadyApplied, 0))
     assertEquals(h.events.toVector, Vector(
       "connection", "get-auto-commit", "auto-commit:false", "read-committed", "lock", "initialize-history",
-      "read-history", "validate:account", "commit", "close"
+      "read-history", "validate-shared:account", "commit", "close"
     ))
     h.events.clear()
     h.driftAt = Set("account")

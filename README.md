@@ -84,12 +84,16 @@ suggestion.
 
 ## Migrating the database at server startup
 
-With `schema-integration` on the classpath, one Hibernate setting is enough:
+With `schema-integration` on the classpath, Hibernate settings switch the migration on:
 
 ```properties
 hibernate.ddl_manager.enabled=true
 hibernate.hbm2ddl.auto=validate
+hibernate.default_schema=public
 ```
+
+Every table and sequence needs an explicit schema, from `@Table(schema)` or
+`hibernate.default_schema`.
 
 While Hibernate builds the SessionFactory, and before its own schema validation, the
 integrator reads the entities, migrates the database through one connection of Hibernate's
@@ -142,7 +146,10 @@ the constraint enforces the same values, rename it with
 Under a transactional advisory lock the executor checks the history, plans the changes,
 checks the database against the stored model, executes the DDL, checks the target and
 writes the new revision, all in one transaction. Drift, an inconsistent history and an
-older server after a newer migration block the startup.
+older server after a newer migration block the startup. While a migration runs, its tables
+are locked exclusively. A start without changes only checks the database under a shared
+lock that keeps schema changes out, so an application running on other nodes keeps reading
+and writing.
 
 ### Drops and returns need an approval
 
