@@ -1,5 +1,5 @@
 ThisBuild / organization := "com.anjunar.hibernateddl"
-ThisBuild / version := "0.1.0-SNAPSHOT"
+ThisBuild / version := "1.0.0"
 ThisBuild / scalaVersion := "3.9.0"
 
 lazy val commonSettings = Seq(

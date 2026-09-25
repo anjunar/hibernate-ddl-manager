@@ -13,7 +13,7 @@ flowchart TD
     D --> EX[JdbcMigrationExecutor]
     EX --> LOCK[Advisory lock]
     LOCK --> HIST[Read and verify history: model applied last]
-    HIST --> DIFF[DiffEngine: comparison by ID]
+    HIST --> DIFF[DiffEngine: comparison by ID; retired IDs, drops and returns checked against approvals]
     DIFF --> SQL[PostgreSqlDialect: DDL]
     SQL --> PRE[Lock tables, check database against previous model]
     PRE --> DDL[Execute DDL]
@@ -168,7 +168,7 @@ there:
 | `schema-integration` | `HibernateSchemaMigration`, the opt-in `SchemaMigrationIntegrator` and the `hibernate.ddl_manager.*` settings |
 | `schema-cli` | Demo without a database connection |
 
-## Current scope
+## Scope of 1.0
 
 Everything outside this scope is rejected, never silently ignored.
 
@@ -182,15 +182,24 @@ Everything outside this scope is rejected, never silently ignored.
 
 Tables that exist only in the database are left untouched.
 
-## Open points
+Foreign key columns get no index automatically; declare one with `@Index` where deletes on
+the referenced table must be fast. An end-to-end test migrates a set of entities covering
+the adapter's scope into PostgreSQL, and another adopts a schema that Hibernate's own schema
+generation created.
 
-1. **Model coverage for real entities.** The common basic types, enums, `UUID` keys,
-   associations, collection tables, inheritance, unique constraints, indexes and generated
-   keys work, as do secondary tables; an end-to-end test migrates a set of such entities into
-   PostgreSQL. `@Lob`, collections inside embeddables and JSON columns come after 1.0. New
-   types also need a name in the history's JSON format. Foreign key columns get no index
-   automatically; declare one with `@Index` where deletes on the referenced table must be
-   fast.
+## After 1.0
 
-Possible later: data migrations and backfills, multi-phase deployments (expand/contract),
-further dialects and an export to Flyway or Liquibase as an alternative mode of operation.
+Until then, each of these is refused, or needs a manual migration (`acceptManualMigration`):
+
+- **Model coverage:** `@Lob` (PostgreSQL large objects, which also need `vacuumlo` or the
+  `lo` trigger), JSON columns, collections inside embeddables, `@CollectionId` bags, other
+  CHECK constraints, `ON DELETE` actions. Each new type needs a name in the history's JSON
+  format.
+- **Dropping a unique key, index or foreign key whose columns remain.** PostgreSQL names
+  these objects, so dropping one needs a lookup by structure under the lock.
+- **Adopting Hibernate-named checks:** matching a check constraint by its definition instead
+  of its derived name, so that a database created by `hbm2ddl` with enums is adopted without
+  renaming its checks by hand.
+- **Data migrations and backfills** (non-null columns, type changes), multi-phase
+  deployments (expand/contract), further dialects and an export to Flyway or Liquibase as an
+  alternative mode of operation.
