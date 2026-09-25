@@ -56,13 +56,39 @@ class DiffEngineSuite extends munit.FunSuite:
     assertEquals(plannedIds, Vector("a", "a-1", "a-2", "b", "b-1"))
   }
 
-  test("new tables and nullable columns are planned; removals still require manual migration") {
+  test("a dropped table or column cannot hand its name to a new one in the same plan") {
     val unrelated = SchemaModel(Vector(table("new-customer", "customer", column("new-name", "name"))))
-    val diagnostics = errors(DiffEngine.diff(initial, unrelated))
-    assert(diagnostics.exists(_.contains("Dropping table")))
+    assert(errors(DiffEngine.diff(initial, unrelated)).exists(_.contains("uses the previous name of 'customer'")))
     val replacedColumn = SchemaModel(Vector(customer.copy(columns = Vector(column("replacement", "name")))))
-    val columnDiagnostics = errors(DiffEngine.diff(initial, replacedColumn))
-    assert(columnDiagnostics.exists(_.contains("Dropping column")))
+    assert(errors(DiffEngine.diff(initial, replacedColumn)).exists(_.contains("uses an occupied previous name")))
+  }
+
+  test("drops come last: columns, then all tables in one operation, then sequences; keys over dropped columns go with them") {
+    val id = ColumnModel(SchemaId("category/id"), SqlIdentifier("id"), SqlType.BigInt, nullable = false)
+    val category = TableModel(SchemaId("category"), QualifiedName(SqlIdentifier("category")), Vector(id), Vector(id.id))
+    val tag = table("tag", "tag", column("tag-name", "name"))
+    val link = ColumnModel(SchemaId("customer-category"), SqlIdentifier("category_id"), SqlType.BigInt)
+    val code = column("customer-code", "code")
+    val linked = customer.copy(columns = customer.columns ++ Vector(link, code),
+      foreignKeys = Vector(ForeignKeyModel(Vector(link.id), category.id, Vector(id.id))),
+      uniqueKeys = Vector(UniqueKeyModel(Vector(code.id, link.id))),
+      indexes = Vector(IndexModel(Vector(IndexColumn(link.id)))))
+    val sequence = SequenceModel(SchemaId("customer-sequence"), QualifiedName(SqlIdentifier("customer_seq")), 1, 50)
+    val before = SchemaModel(Vector(linked, category, tag), Vector(sequence))
+    val note = column("customer-note", "note")
+    val renamed = QualifiedName(SqlIdentifier("customers"))
+    val after = SchemaModel(Vector(customer.copy(name = renamed, columns = customer.columns ++ Vector(code, note))))
+    assertEquals(DiffEngine.diff(before, after), Right(Vector(
+      SchemaOperation.RenameTable(customer.id, customer.name, renamed),
+      SchemaOperation.AddColumn(customer.id, renamed, note),
+      SchemaOperation.DropColumn(customer.id, renamed, link.id, link.name),
+      SchemaOperation.DropTables(Vector(SchemaOperation.DroppedTable(category.id, category.name),
+        SchemaOperation.DroppedTable(tag.id, tag.name))),
+      SchemaOperation.DropSequence(sequence.id, sequence.name)
+    )))
+    assert(DiffEngine.diff(before, after).toOption.get.takeRight(3).forall(_.risk == RiskLevel.Destructive))
+    val keptColumn = SchemaModel(Vector(linked.copy(foreignKeys = Vector.empty), tag), Vector(sequence))
+    assert(errors(DiffEngine.diff(before, keptColumn)).exists(_.contains("Dropping foreign key (customer-category)")))
   }
 
   test("create table and add nullable column are deterministic and preserve stable IDs") {
@@ -246,7 +272,7 @@ class DiffEngineSuite extends munit.FunSuite:
     )))
   }
 
-  test("sequences are created or renamed first; changing, moving or dropping them is refused") {
+  test("sequences are created or renamed first and dropped last; changing or moving them is refused") {
     val sequence = SequenceModel(SchemaId("customer-sequence"), QualifiedName(SqlIdentifier("customer_seq")), 1, 50)
     val renamed = sequence.copy(name = QualifiedName(SqlIdentifier("client_seq")))
     assertEquals(DiffEngine.diff(initial, SchemaModel(initial.tables, Vector(sequence))),
@@ -254,7 +280,7 @@ class DiffEngineSuite extends munit.FunSuite:
     val before = SchemaModel(initial.tables, Vector(sequence))
     assertEquals(DiffEngine.diff(before, SchemaModel(initial.tables, Vector(renamed))),
       Right(Vector(SchemaOperation.RenameSequence(sequence.id, sequence.name, renamed.name))))
-    assert(errors(DiffEngine.diff(before, initial)).exists(_.contains("Dropping sequence 'customer-sequence'")))
+    assertEquals(DiffEngine.diff(before, initial), Right(Vector(SchemaOperation.DropSequence(sequence.id, sequence.name))))
     assert(errors(DiffEngine.diff(before, SchemaModel(initial.tables, Vector(sequence.copy(increment = 1)))))
       .exists(_.contains("Changing start or increment")))
     assert(errors(DiffEngine.diff(before, SchemaModel(initial.tables,

@@ -9,9 +9,10 @@ import scala.util.control.NonFatal
   * The previous model is the one the latest history entry stored; without history it is the
   * empty model, unless the database already contains the target's tables: such a database is
   * adopted only when enabled and matching exactly, and refused otherwise. Because stable IDs
-  * never change, a server may skip releases. A target equal
-  * to an earlier revision, or renaming something back to an earlier name, is what a server
-  * with an older model would do and is refused.
+  * never change, a server may skip releases. A target equal to an earlier revision, or
+  * renaming something back to an earlier name, is what a server with an older model would do,
+  * and dropping a table, column or sequence deletes data: each is refused unless the options
+  * carry an explicit [[Approval]] for it.
   *
   * A successful return permits startup. Any exception must prevent server startup.
   * A failure to close the connection after a successful commit does not change the
@@ -50,8 +51,10 @@ final class JdbcMigrationExecutor(
           MigrationResult(revision, MigrationStatus.AlreadyApplied, 0)
         else
           history.find(_.entry.targetFingerprint == targetFingerprint).foreach { older =>
-            throw new IllegalStateException(s"Target schema equals revision ${older.entry.revision}, but the database " +
-              s"is at revision $revision; a server with an older schema must not start after a newer migration")
+            if !options.approvals.contains(Approval.Revert(older.entry.revision)) then
+              refuse(Vector(s"Target schema equals revision ${older.entry.revision}, but the database is at revision " +
+                s"$revision; a server with an older schema must not start after a newer migration. If returning to " +
+                s"it is intended, approve it with Approval.Revert(${older.entry.revision})"))
           }
           val existing = if history.isEmpty then backend.existingRelations(connection, target) else Vector.empty
           if existing.nonEmpty then adopt(connection, target, targetFingerprint, existing)
@@ -151,22 +154,33 @@ final class JdbcMigrationExecutor(
     val operations = DiffEngine.diff(previous, target).fold(refuse, identity)
     def earlier(matches: TableModel => Boolean): Option[Long] =
       history.find(_.model.tables.exists(matches)).map(_.entry.revision)
-    val reverted = operations.flatMap {
+    def renameBack(kind: String, id: SchemaId, revision: Option[Long]) =
+      revision.filterNot(_ => options.approvals.contains(Approval.RenameBack(id))).map { revision =>
+        s"Renaming $kind '${id.value}' back to its name from revision $revision is what an older server would do; " +
+          s"if intended, approve it with Approval.RenameBack(\"${id.value}\")"
+      }
+    def drop(kind: String, id: SchemaId, name: String) =
+      Option.when(!options.approvals.contains(Approval.Drop(id))) {
+        s"Dropping $kind '${id.value}' ($name) deletes its data; if intended, approve it with Approval.Drop(\"${id.value}\")"
+      }
+    val unapproved = operations.flatMap {
       case SchemaOperation.RenameTable(id, _, to) =>
-        earlier(table => table.id == id && table.name == to).map { revision =>
-          s"Renaming table '${id.value}' back to its name from revision $revision is what an older server would do; manual migration required"
-        }
+        renameBack("table", id, earlier(table => table.id == id && table.name == to)).toVector
       case SchemaOperation.RenameColumn(tableId, _, columnId, _, to) =>
-        earlier(table => table.id == tableId && table.columns.exists(c => c.id == columnId && c.name == to)).map { revision =>
-          s"Renaming column '${columnId.value}' back to its name from revision $revision is what an older server would do; manual migration required"
-        }
+        renameBack("column", columnId,
+          earlier(table => table.id == tableId && table.columns.exists(c => c.id == columnId && c.name == to))).toVector
       case SchemaOperation.RenameSequence(id, _, to) =>
-        history.find(_.model.sequences.exists(s => s.id == id && s.name == to)).map(_.entry.revision).map { revision =>
-          s"Renaming sequence '${id.value}' back to its name from revision $revision is what an older server would do; manual migration required"
-        }
-      case _ => None
+        renameBack("sequence", id,
+          history.find(_.model.sequences.exists(s => s.id == id && s.name == to)).map(_.entry.revision)).toVector
+      case SchemaOperation.DropColumn(_, table, columnId, column) =>
+        drop("column", columnId, s"${table.display}.${column.value}").toVector
+      case SchemaOperation.DropTables(tables) =>
+        tables.flatMap(table => drop("table", table.tableId, table.table.display))
+      case SchemaOperation.DropSequence(id, sequence) =>
+        drop("sequence", id, sequence.display).toVector
+      case _ => Vector.empty
     }
-    if reverted.nonEmpty then refuse(reverted)
+    if unapproved.nonEmpty then refuse(unapproved)
     val rejectedRisks = operations.map(_.risk).filterNot(options.allowedRisks.contains).distinct
     if rejectedRisks.nonEmpty then refuse(Vector(s"Migration risks are not allowed: ${rejectedRisks.mkString(", ")}"))
     val statements = backend.render(operations).fold(refuse, identity)
