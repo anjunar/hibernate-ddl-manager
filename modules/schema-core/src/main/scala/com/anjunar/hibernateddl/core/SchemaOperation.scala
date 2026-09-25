@@ -7,6 +7,16 @@ sealed trait SchemaOperation:
   def risk: RiskLevel
 
 object SchemaOperation:
+  final case class CreateSequence(sequence: SequenceModel) extends SchemaOperation:
+    val risk: RiskLevel = RiskLevel.Safe
+
+  final case class RenameSequence(
+      sequenceId: SchemaId,
+      from: QualifiedName,
+      to: QualifiedName
+  ) extends SchemaOperation:
+    val risk: RiskLevel = RiskLevel.Locking
+
   final case class CreateTable(table: TableModel) extends SchemaOperation:
     val risk: RiskLevel = RiskLevel.Locking
 

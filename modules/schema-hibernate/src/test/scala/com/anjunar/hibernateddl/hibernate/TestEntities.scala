@@ -182,7 +182,28 @@ class Unsupported:
   @SchemaId("2a1b2c3d") @ElementCollection var tags: java.util.Map[String, String] = new java.util.HashMap[String, String]()
   @SchemaId("3a1b2c3d") var code: String = uninitialized
 
+/** Hibernate's default key generation: the sequence Generated_SEQ with increment 50. */
 @Entity
 @SchemaId("cccccccc")
 class Generated:
   @Id @GeneratedValue @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+
+@Entity
+@SchemaId("e5f60718")
+class Ticket:
+  @Id @GeneratedValue(strategy = GenerationType.IDENTITY) @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+
+@Entity
+@SchemaId("f6071829")
+class Voucher:
+  @Id @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "voucher_gen")
+  @SequenceGenerator(name = "voucher_gen", sequenceName = "voucher_numbers", allocationSize = 10, initialValue = 100)
+  @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+
+/** Draws its keys from Voucher's sequence, which one sequence per entity key does not allow. */
+@Entity
+@SchemaId("0718293a")
+class Coupon:
+  @Id @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "coupon_gen")
+  @SequenceGenerator(name = "coupon_gen", sequenceName = "voucher_numbers", allocationSize = 10, initialValue = 100)
+  @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
