@@ -40,6 +40,9 @@ trait TestPostgres extends munit.FunSuite:
   override def afterAll(): Unit =
     if embedded != null then embedded.close()
 
+  /** The server's maintenance database, for cluster-wide statements such as roles. */
+  protected def maintenance: DataSource = database(None)
+
   protected def withDatabase[A](body: DataSource => A): A =
     val name = "executor_" + UUID.randomUUID().toString.replace("-", "")
     execute(database(None), s"CREATE DATABASE $name")

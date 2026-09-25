@@ -87,7 +87,7 @@ object SchemaModelJson:
     case SqlType.LargeObject => "large object"
     case SqlType.Json => "json"
 
-  private enum Json:
+  private[executor] enum Json:
     case Obj(fields: Map[String, Json])
     case Arr(items: Vector[Json])
     case Str(value: String)
@@ -95,9 +95,9 @@ object SchemaModelJson:
     case Bool(value: Boolean)
     case Null
 
-  private final class InvalidJson(message: String) extends RuntimeException(message) with NoStackTrace
+  private[executor] final class InvalidJson(message: String) extends RuntimeException(message) with NoStackTrace
 
-  private def invalid(message: String): Nothing = throw new InvalidJson(message)
+  private[executor] def invalid(message: String): Nothing = throw new InvalidJson(message)
 
   private def readModel(json: Json): SchemaModel =
     val format = json match
@@ -224,17 +224,17 @@ object SchemaModelJson:
   private def number(digits: String, label: String): Int =
     digits.toIntOption.getOrElse(invalid(s"$label $digits is out of range"))
 
-  private def fields(json: Json, label: String, expected: Set[String]): Map[String, Json] = json match
+  private[executor] def fields(json: Json, label: String, expected: Set[String]): Map[String, Json] = json match
     case Json.Obj(values) if values.keySet == expected => values
     case Json.Obj(values) =>
       invalid(s"$label has fields ${values.keySet.toVector.sorted.mkString(", ")}; expected ${expected.toVector.sorted.mkString(", ")}")
     case _ => invalid(s"$label must be an object")
 
-  private def array(json: Json, label: String): Vector[Json] = json match
+  private[executor] def array(json: Json, label: String): Vector[Json] = json match
     case Json.Arr(items) => items
     case _ => invalid(s"$label must be an array")
 
-  private def string(json: Json, label: String): String = json match
+  private[executor] def string(json: Json, label: String): String = json match
     case Json.Str(value) => value
     case _ => invalid(s"$label must be a string")
 
@@ -243,7 +243,7 @@ object SchemaModelJson:
     case other => Some(string(other, label))
 
   /** RFC 8259 JSON, restricted to integer numbers and rejecting duplicate fields. */
-  private final class Parser(text: String):
+  private[executor] final class Parser(text: String):
     private var position = 0
 
     def document(): Json =

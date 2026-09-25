@@ -1,6 +1,6 @@
 package com.anjunar.hibernateddl.integration
 
-import com.anjunar.hibernateddl.core.Backfill
+import com.anjunar.hibernateddl.core.{Backfill, SchemaModel}
 import com.anjunar.hibernateddl.executor.*
 import com.anjunar.hibernateddl.hibernate.HibernateSchemaSource
 import com.anjunar.hibernateddl.postgresql.PostgreSqlMigrationBackend
@@ -34,13 +34,43 @@ object HibernateSchemaMigration:
       options: ExecutionOptions = ExecutionOptions(),
       backfills: Vector[Backfill] = Vector.empty
   ): MigrationResult =
+    val (executionOptions, target, all) = resolve(metadata, options, backfills)
+    JdbcMigrationExecutor(PostgreSqlMigrationBackend, executionOptions).migrate(dataSource, target, all)
+
+  /** What [[migrate]] would do, read-only, with the same options, target and backfills. The
+    * report never replaces the migration: a server must still start with [[migrate]] or the
+    * integrator, which checks everything again under its locks.
+    */
+  def preview(
+      metadata: Metadata,
+      dataSource: DataSource,
+      options: ExecutionOptions = ExecutionOptions(),
+      backfills: Vector[Backfill] = Vector.empty,
+      previewOptions: PreviewOptions = PreviewOptions()
+  ): PreviewReport =
+    val (executionOptions, target, all) = resolve(metadata, options, backfills)
+    JdbcMigrationPreview(PostgreSqlMigrationBackend, executionOptions).preview(dataSource, target, all, previewOptions)
+
+  /** The target model in the history's JSON form, for `schema-cli preview --target`. */
+  def exportTarget(metadata: Metadata): String =
+    SchemaModelJson.encode(resolve(metadata, ExecutionOptions(), Vector.empty)._2)
+
+  /** The providers' backfills plus `backfills` in their JSON form, for `schema-cli preview --backfills`. */
+  def exportBackfills(metadata: Metadata, backfills: Vector[Backfill] = Vector.empty): String =
+    BackfillJson.encode(resolve(metadata, ExecutionOptions(), backfills)._3)
+
+  /** Options refined by the settings, the target read from the entities, and every backfill. */
+  private def resolve(
+      metadata: Metadata,
+      options: ExecutionOptions,
+      backfills: Vector[Backfill]
+  ): (ExecutionOptions, SchemaModel, Vector[Backfill]) =
     val settings = configuration(metadata)
     val executionOptions = MigrationSettings.options(settings, options).fold(refuse, identity)
     val errors = checkSetup(metadata, settings)
     if errors.nonEmpty then refuse(errors)
     val target = HibernateSchemaSource.read(metadata).fold(errors => refuse(errors.map("Entity mapping: " + _)), identity)
-    JdbcMigrationExecutor(PostgreSqlMigrationBackend, executionOptions).migrate(dataSource, target,
-      provided(metadata) ++ backfills)
+    (executionOptions, target, provided(metadata) ++ backfills)
 
   /** The backfills of every provider on the application's class path. */
   private[integration] def provided(metadata: Metadata): Vector[Backfill] =
