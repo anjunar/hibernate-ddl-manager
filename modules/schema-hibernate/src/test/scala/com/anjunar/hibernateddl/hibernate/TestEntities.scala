@@ -122,7 +122,7 @@ class Letter:
 class OddChecks:
   @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
   @SchemaId("1b2c3d4e") @Enumerated(EnumType.STRING) var quote: Quote = uninitialized
-  @SchemaId("2c3d4e5f") @Column(check = Array(new CheckConstraint(constraint = "amount >= 0"))) var amount: Integer = uninitialized
+  @SchemaId("2c3d4e5f") @Column(check = Array(new CheckConstraint(constraint = "amount <> 5"))) var amount: Integer = uninitialized
 
 @Embeddable
 class Line:
@@ -148,14 +148,36 @@ class Article:
   @SchemaId("4e5f6071") @ElementCollection @Enumerated(EnumType.STRING)
   var statuses: java.util.Set[Status] = new java.util.HashSet[Status]()
 
-/** Two collections that Hibernate's default naming puts into the same join table, and an ordered list. */
+/** Two collections that Hibernate's default naming puts into the same join table. */
 @Entity
 @SchemaId("d4e5f607")
 class Crowded:
   @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
   @SchemaId("1b2c3d4e") @ManyToMany var favorites: java.util.Set[Label] = new java.util.HashSet[Label]()
   @SchemaId("2c3d4e5f") @OneToMany var pinned: java.util.Set[Label] = new java.util.HashSet[Label]()
-  @SchemaId("3d4e5f60") @ElementCollection @OrderColumn var ranking: java.util.List[String] = new java.util.ArrayList[String]()
+
+@Embeddable
+class Price:
+  @SchemaId("8c9d0e1f") var amount: java.lang.Integer = uninitialized
+  @SchemaId("9d0e1f20") var currency: String = uninitialized
+
+/** Maps with basic, embeddable and entity values or keys, and ordered lists. */
+@Entity
+@SchemaId("18293a4b")
+class Shelf:
+  @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+  @SchemaId("1b2c3d4e") @ElementCollection @MapKeyColumn(name = "lang")
+  var titles: java.util.Map[String, String] = new java.util.HashMap[String, String]()
+  @SchemaId("2c3d4e5f") @ElementCollection var prices: java.util.Map[String, Price] = new java.util.HashMap[String, Price]()
+  @SchemaId("3d4e5f60") @ElementCollection @MapKeyJoinColumn(name = "label_id")
+  var weights: java.util.Map[Label, Integer] = new java.util.HashMap[Label, Integer]()
+  @SchemaId("4e5f6071") @ElementCollection @OrderColumn(name = "position")
+  var steps: java.util.List[String] = new java.util.ArrayList[String]()
+  @SchemaId("5f607182") @ManyToMany @OrderColumn var ranked: java.util.List[Label] = new java.util.ArrayList[Label]()
+
+@Embeddable
+class Folder:
+  @SchemaId("a0b1c2d3") @ElementCollection var files: java.util.Set[String] = new java.util.HashSet[String]()
 
 /** SINGLE_TABLE, the default: one table with a discriminator; subclasses add their columns. */
 @Entity
@@ -227,7 +249,7 @@ class Unsupported:
   @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
   @SchemaId("4a1b2c3d") @Lob var document: String = uninitialized
   @SchemaId("1a1b2c3d") @ManyToOne @OnDelete(action = OnDeleteAction.CASCADE) var customer: LegacyCustomer = uninitialized
-  @SchemaId("2a1b2c3d") @ElementCollection var tags: java.util.Map[String, String] = new java.util.HashMap[String, String]()
+  @SchemaId("2a1b2c3d") @Embedded var folder: Folder = uninitialized
   @SchemaId("3a1b2c3d") var code: String = uninitialized
 
 /** Hibernate's default key generation: the sequence Generated_SEQ with increment 50. */
