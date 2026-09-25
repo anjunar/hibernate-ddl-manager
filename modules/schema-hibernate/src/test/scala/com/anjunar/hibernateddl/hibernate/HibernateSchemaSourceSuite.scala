@@ -292,6 +292,19 @@ class HibernateSchemaSourceSuite extends munit.FunSuite:
     assert(diagnostics.contains("@SecondaryTableId(table = \"elsewhere\") of entity Unlabelled names no secondary table"), diagnostics)
   }
 
+  test("DDL options that Hibernate appends verbatim are reported instead of dropped") {
+    val script = TestMetadata.createScript(classOf[Tuned])
+    assert(script.contains("CHECK (score > 0)") && script.contains("CACHE 20") && script.contains("fillfactor"), script)
+    val diagnostics = errors(classOf[Tuned])
+    Vector(
+      "Tuned.score has the options 'CHECK (score > 0)'; unsupported",
+      "Table Tuned of entity Tuned has options 'WITH (fillfactor = 70)'; unsupported",
+      "of entity Tuned has options 'DEFERRABLE'; unsupported",
+      "Foreign key (parent_id) of entity Tuned has options 'DEFERRABLE'; unsupported",
+      "Sequence tuned_seq has options 'CACHE 20'; unsupported"
+    ).foreach(message => assert(diagnostics.exists(_.contains(message)), s"$message in $diagnostics"))
+  }
+
   test("fresh IDs have the required format") {
     assert(Vector.fill(20)(HibernateSchemaSource.newId()).forall(_.matches("[0-9a-f]{8}")))
   }
