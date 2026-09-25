@@ -137,8 +137,18 @@ ExecutionOptions(approvals = Set(
 
 The refusal names every approval that the plan needs. Approvals only permit: one whose
 change is not planned has no effect. A dropped ID is retired for good; reusing it is refused
-even with approvals. Drops run last and without `CASCADE`, so a view that
-depends on a dropped column makes the migration fail and roll back.
+even with approvals. Drops run last and without `CASCADE`, so a view that depends on a
+dropped column makes the migration fail and roll back.
+
+### Changes the executor cannot plan
+
+Type, nullability and primary key changes, among others, need a data migration and are
+refused. The refusal names the target's fingerprint. Change the database by hand to exactly
+the target schema, then start once with
+`ExecutionOptions(acceptManualMigration = Some("<fingerprint>"))`: the executor checks the
+database against the target under the lock and records it as the next revision without
+executing DDL (`ManuallyMigrated`). An option naming another target is refused, so it cannot
+accept a later change by accident.
 
 ## Modules
 
