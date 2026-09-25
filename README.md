@@ -1,5 +1,8 @@
 # Hibernate DDL Manager
 
+Website: [English](https://anjunar.com/en/hibernate-ddl-manager) · [Deutsch](https://anjunar.com/de/hibernate-ddl-manager)
+Documentation: [English](https://docs.anjunar.com/en/hibernate-ddl-manager) · [Deutsch](https://docs.anjunar.com/de/hibernate-ddl-manager)
+
 Scala 3 framework for controlled schema evolution from Hibernate metadata. The server calls
 it at startup, before it builds the SessionFactory, and the framework changes the database
 itself. It detects renames through stable IDs in the entities:
