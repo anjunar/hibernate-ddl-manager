@@ -1,6 +1,7 @@
 package com.anjunar.hibernateddl.postgresql
 
 import com.anjunar.hibernateddl.core.*
+import com.anjunar.hibernateddl.executor.{DataQuery, Projection}
 
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
@@ -209,7 +210,7 @@ object PostgreSqlDialect extends SchemaDialect:
     def names(value: FillValue): Vector[String] = value match
       case FillValue.Literal(BackfillLiteral.Text(text), _) =>
         Option.when(text.contains('\u0000'))("A text constant must not contain NUL.").toVector
-      case FillValue.Literal(_, _) => Vector.empty
+      case FillValue.Literal(_, _) | FillValue.Null(_) => Vector.empty
       case FillValue.Column(name) => validateIdentifier(name, "source column")
       case FillValue.Coalesce(values) => values.flatMap(names)
       case FillValue.Concat(values) => values.flatMap(names)
@@ -217,16 +218,68 @@ object PostgreSqlDialect extends SchemaDialect:
     if errors.nonEmpty then Left(errors.map(message => s"Backfill '${fill.backfillId}': $message"))
     else
       val parameters = Vector.newBuilder[AnyRef]
-      def expression(value: FillValue): String = value match
-        case FillValue.Literal(literal, as) =>
-          parameters += parameter(literal)
-          s"CAST(? AS ${renderType(as)})"
-        case FillValue.Column(name) => quoted(name)
-        case FillValue.Coalesce(values) => values.map(expression).mkString("COALESCE(", ", ", ")")
-        case FillValue.Concat(values) => values.map(expression).mkString("(", " || ", ")")
-      val sql = s"UPDATE ${qualified(fill.table)} SET ${quoted(fill.column)} = ${expression(fill.value)} " +
+      val sql = s"UPDATE ${qualified(fill.table)} SET ${quoted(fill.column)} = ${expression(fill.value, parameters)} " +
         s"WHERE ${quoted(fill.column)} IS NULL"
       Right(sql -> parameters.result())
+
+  private def expression(value: FillValue, parameters: collection.mutable.Growable[AnyRef]): String = value match
+    case FillValue.Literal(literal, as) =>
+      parameters += parameter(literal)
+      s"CAST(? AS ${renderType(as)})"
+    case FillValue.Column(name) => quoted(name)
+    case FillValue.Null(as) => s"CAST(NULL AS ${renderType(as)})"
+    case FillValue.Coalesce(values) => values.map(expression(_, parameters)).mkString("COALESCE(", ", ", ")")
+    case FillValue.Concat(values) => values.map(expression(_, parameters)).mkString("(", " || ", ")")
+
+  /** A read-only query for a preview's data question. It returns one row with one number: 1 or 0
+    * for whether a matching row exists, or the number of matching rows. Projections evaluate
+    * what the migration will leave over the table as it is; constants are parameters.
+    */
+  private[postgresql] def renderDataCheck(query: DataQuery, count: Boolean): (String, Vector[AnyRef]) =
+    val parameters = Vector.newBuilder[AnyRef]
+    def projection(value: Projection): String = value match
+      case Projection.Current(column) => quoted(column)
+      case Projection.Absent(dataType) => s"CAST(NULL AS ${renderType(dataType)})"
+      case Projection.Filled(Some(column), fill, _) =>
+        s"CASE WHEN ${quoted(column)} IS NULL THEN ${expression(fill, parameters)} ELSE ${quoted(column)} END"
+      case Projection.Filled(None, fill, _) => expression(fill, parameters)
+    def projected(table: QualifiedName, values: Vector[Projection]) =
+      val columns = values.indices.map(index => s"k$index").toVector
+      val select = values.zip(columns).map((value, column) => s"${projection(value)} AS $column").mkString(", ")
+      (s"(SELECT $select FROM ${qualified(table)}) AS projected", columns)
+    def rows(from: String, condition: String) =
+      if count then s"SELECT count(*) FROM $from WHERE $condition"
+      else s"SELECT CASE WHEN EXISTS (SELECT 1 FROM $from WHERE $condition) THEN 1 ELSE 0 END"
+    val sql = query match
+      case DataQuery.Nulls(table, value) => rows(qualified(table), s"(${projection(value)}) IS NULL")
+      case DataQuery.Duplicates(table, key) =>
+        val (from, columns) = projected(table, key)
+        val groups = s"SELECT count(*) AS n FROM $from WHERE ${columns.map(_ + " IS NOT NULL").mkString(" AND ")} " +
+          s"GROUP BY ${columns.mkString(", ")} HAVING count(*) > 1"
+        if count then s"SELECT coalesce(sum(n), 0) FROM ($groups) AS duplicates"
+        else s"SELECT CASE WHEN EXISTS ($groups) THEN 1 ELSE 0 END"
+      case DataQuery.Unresolved(table, key, referenced) =>
+        val (from, columns) = projected(table, key)
+        // MATCH SIMPLE: a key with a NULL part references nothing and is never checked.
+        val missing = referenced.fold("") { (target, targetColumns) =>
+          s" AND NOT EXISTS (SELECT 1 FROM ${qualified(target)} AS referenced WHERE " +
+            targetColumns.zip(columns).map((column, key) => s"referenced.${quoted(column)} = projected.$key").mkString(" AND ") + ")"
+        }
+        rows(from, columns.map(_ + " IS NOT NULL").mkString(" AND ") + missing)
+      case DataQuery.Violations(table, value, dataType, check) =>
+        val (from, columns) = projected(table, Vector(value))
+        val cast = s"CAST(? AS ${renderType(dataType)})"
+        // A check holds when TRUE or NULL; only FALSE violates it.
+        val condition = check match
+          case ColumnCheck.AllowedValues(values) =>
+            values.foreach(parameters += _)
+            s"NOT (${columns.head} IN (${values.map(_ => cast).mkString(", ")}))"
+          case ColumnCheck.Range(min, max) =>
+            parameters += java.lang.Long.valueOf(min)
+            parameters += java.lang.Long.valueOf(max)
+            s"NOT (${columns.head} BETWEEN $cast AND $cast)"
+        rows(from, condition)
+    sql -> parameters.result()
 
   private def parameter(literal: BackfillLiteral): AnyRef = literal match
     case BackfillLiteral.Text(value) => value
