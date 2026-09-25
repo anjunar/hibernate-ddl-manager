@@ -136,7 +136,8 @@ ExecutionOptions(approvals = Set(
 ```
 
 The refusal names every approval that the plan needs. Approvals only permit: one whose
-change is not planned has no effect. Drops run last and without `CASCADE`, so a view that
+change is not planned has no effect. A dropped ID is retired for good; reusing it is refused
+even with approvals. Drops run last and without `CASCADE`, so a view that
 depends on a dropped column makes the migration fail and roll back.
 
 ## Modules
