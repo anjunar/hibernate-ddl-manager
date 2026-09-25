@@ -15,8 +15,11 @@ import scala.util.control.NonFatal
   * carry an explicit [[Approval]] for it.
   *
   * A successful return permits startup. Any exception must prevent server startup.
-  * A failure to close the connection after a successful commit does not change the
-  * known migration outcome. No caller transaction is committed or rolled back.
+  * Once the transaction has ended with a known outcome, the connection gets back the
+  * auto-commit mode and isolation level it arrived with, so a pool never hands it on
+  * changed; if that fails, it is aborted and the failure is reported. A failure to close the
+  * connection after a successful commit does not change the known migration outcome. No
+  * caller transaction is committed or rolled back.
   */
 final class JdbcMigrationExecutor(
     backend: TransactionalMigrationBackend,
@@ -28,13 +31,16 @@ final class JdbcMigrationExecutor(
   def migrate(dataSource: DataSource, target: SchemaModel): MigrationResult =
     val targetFingerprint = prepare(target)
     var connection: Connection = null
+    var isolation = Connection.TRANSACTION_NONE
     var transactionStarted = false
     var commitAttempted = false
+    var committed = false
     var primaryFailure: Throwable = null
     try
       connection = dataSource.getConnection()
       if !connection.getAutoCommit then
         throw new IllegalStateException("Migration requires a fresh connection with auto-commit enabled")
+      isolation = connection.getTransactionIsolation
       connection.setAutoCommit(false)
       transactionStarted = true
       // A transaction waiting for the migration lock must see the preceding commit.
@@ -72,8 +78,17 @@ final class JdbcMigrationExecutor(
             MigrationResult(revision + 1, MigrationStatus.Applied, statements.size)
       commitAttempted = true
       connection.commit()
+      committed = true
+      restore(connection, isolation).foreach { error =>
+        abort(connection, error)
+        throw new MigrationException(s"Migration committed revision ${result.revision}, but the connection could not " +
+          s"be restored and was aborted: ${error.getMessage}", FailureState.Committed, error)
+      }
       result
     catch
+      case failure: MigrationException if committed =>
+        primaryFailure = failure
+        throw failure
       case NonFatal(cause) =>
         var rollbackFailed = false
         if transactionStarted then
@@ -83,8 +98,12 @@ final class JdbcMigrationExecutor(
               rollbackFailed = true
               cause.addSuppressed(rollbackError)
               // Never restore auto-commit here: it could commit the unresolved transaction.
-              try connection.abort((command: Runnable) => command.run())
-              catch case NonFatal(abortError) => cause.addSuppressed(abortError)
+              abort(connection, cause)
+          if !rollbackFailed then
+            restore(connection, isolation).foreach { error =>
+              cause.addSuppressed(error)
+              abort(connection, cause)
+            }
         val state =
           if commitAttempted || rollbackFailed then FailureState.OutcomeUnknown
           else if transactionStarted then FailureState.RolledBack
@@ -98,6 +117,21 @@ final class JdbcMigrationExecutor(
         catch
           case NonFatal(closeError) =>
             if primaryFailure != null then primaryFailure.addSuppressed(closeError)
+
+  /** Gives the connection back the auto-commit mode and isolation level it arrived with; only
+    * after the transaction ended, so nothing pending can be committed. Returns the failure.
+    */
+  private def restore(connection: Connection, isolation: Int): Option[Throwable] =
+    try
+      connection.setAutoCommit(true)
+      if isolation != Connection.TRANSACTION_NONE then connection.setTransactionIsolation(isolation)
+      None
+    catch case NonFatal(error) => Some(error)
+
+  /** Closes the physical connection, so that no pool reuses it in an unknown state. */
+  private def abort(connection: Connection, failure: Throwable): Unit =
+    try connection.abort((command: Runnable) => command.run())
+    catch case NonFatal(abortError) => failure.addSuppressed(abortError)
 
   /** Checks everything that does not depend on the database and returns the target fingerprint. */
   private def prepare(target: SchemaModel): String =

@@ -29,6 +29,12 @@ locked exclusively. A start whose target is already applied only checks the data
 locks the tables in `ACCESS SHARE` mode, which keeps schema changes out but lets a running
 application read and write.
 
+The executor switches the connection to `READ COMMITTED` without auto-commit. Once the
+transaction has ended with a known outcome, it gives the connection back the auto-commit
+mode and isolation level it arrived with, so that a pool never hands it on changed. If that
+fails, it aborts the connection and reports the failure, after a commit as
+`FailureState.Committed`: the schema is migrated, but the server does not start silently.
+
 `HibernateSchemaMigration.migrate(metadata, dataSource, options)` runs this flow between
 `buildMetadata()` and `buildSessionFactory()`. With `hibernate.ddl_manager.enabled=true`
 the `SchemaMigrationIntegrator`, registered through `META-INF/services`, does the same while
