@@ -26,10 +26,16 @@ Status: 1.0 for PostgreSQL 14+ and Hibernate ORM 7.4, with a deliberately narrow
 Entities with the common basic types, enums, generated keys (UUIDs, sequences, identity
 columns), inheritance (all three strategies), `@ManyToOne`, `@OneToOne` and `@ManyToMany`
 associations, element collections (sets, lists, ordered lists and maps), secondary tables,
-unique constraints and indexes can be mapped. The executor creates, renames, adds and, with
-explicit approval, drops; it adopts a matching database without history and accepts changes
-migrated by hand. Everything else, such as `@Lob`, JSON columns, collections inside
+`@Lob`, unique constraints and indexes can be mapped. The executor creates, renames, adds
+and, with explicit approval, drops; it adopts a matching database without history and
+accepts changes migrated by hand. Everything else, such as JSON columns, collections inside
 embeddables or type changes, is refused with a message, never guessed.
+
+Hibernate stores `@Lob` values, `Blob` and `Clob` on PostgreSQL as large objects in `oid`
+columns. PostgreSQL does not delete a large object when its row is deleted or its value
+replaced; run `vacuumlo` regularly to remove orphaned ones. The `lo` extension's
+`lo_manage` trigger is no option here, because the executor refuses triggers on managed
+tables.
 
 ## Getting started
 
