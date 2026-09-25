@@ -4,7 +4,7 @@ import sbt.url
 // subproject, so they replace the former `ThisBuild /` settings. A bare setting applies
 // everywhere, the root included; what only one module needs belongs to that module.
 
-version := "1.0.0"
+version := "1.0.1"
 organization := "com.anjunar.hibernateddl"
 organizationName := "Anjunar"
 organizationHomepage := Some(url("https://github.com/anjunar"))
