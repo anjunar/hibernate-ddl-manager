@@ -169,6 +169,68 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
       statement.setString(3, column.value)
     }(_.getString("description"))
 
+  /** Finds the one plain index or unique constraint of the table with exactly the dropped
+    * definition: ordered column names, directions and nothing the model cannot represent.
+    * Nothing is chosen by name, by a partial column list or among several matches, and a
+    * foreign key that depends on the object refuses the drop, since there is no CASCADE. The
+    * statement uses the name the catalog shows, which later renames do not change.
+    */
+  override def bindDrop(
+      connection: Connection,
+      operation: SchemaOperation,
+      table: QualifiedName,
+      columns: Vector[SqlIdentifier]
+  ): Either[Vector[String], String] =
+    val display = qualified(table)
+    def bindOne[A](kind: String, shown: String, found: Vector[A], name: A => String, index: A => Long,
+        features: A => Vector[String])(sql: A => String): Either[Vector[String], String] =
+      found match
+        case Vector() => Left(Vector(s"Database drift: $kind $shown of $display, which the target drops, does not exist."))
+        case Vector(one) if features(one).nonEmpty =>
+          Left(Vector(s"${kind.capitalize} ${quoted(name(one))} of $display has unsupported " +
+            s"${features(one).mkString(", ")}; it is not dropped."))
+        case Vector(one) =>
+          val dependents = referencingKeys(connection, index(one))
+          if dependents.nonEmpty then Left(Vector(s"${kind.capitalize} ${quoted(name(one))} of $display cannot be dropped " +
+            s"while ${dependents.mkString(", ")} depend${if dependents.size == 1 then "s" else ""} on it; the migration " +
+            "never uses CASCADE."))
+          else Right(sql(one))
+        case several => Left(Vector(s"${kind.capitalize} $shown of $display matches ${several.size} objects " +
+          s"(${several.map(one => quoted(name(one))).mkString(", ")}); refusing to choose one."))
+    relationOid(connection, table) match
+      case None => Left(Vector(s"Database drift: table $display does not exist."))
+      case Some(oid) => operation match
+        case SchemaOperation.DropIndex(ref, _, _) =>
+          val wanted = columns.map(_.value).zip(ref.columns.map(_.descending))
+          bindOne("index", showIndex(wanted), plainIndexes(connection, oid).filter(_.columns == wanted),
+            _.name, _.oid, _.features)(index => PostgreSqlDialect.renderDropIndex(table.schema.get, SqlIdentifier(index.name)))
+        case SchemaOperation.DropUniqueKey(_, target, _) =>
+          val wanted = columns.map(_.value)
+          bindOne("unique key", wanted.map(quoted).mkString("(", ", ", ")"),
+            uniqueConstraints(connection, oid).filter(_.columns == wanted), _.name, _.index, _.features
+          )(key => PostgreSqlDialect.renderDropConstraint(target, SqlIdentifier(key.name)))
+        case other => Left(Vector(s"$other names no database object to bind."))
+
+  private def relationOid(connection: Connection, table: QualifiedName): Option[Long] =
+    query(connection,
+      """SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        |WHERE n.nspname = ? AND c.relname = ?""".stripMargin
+    ) { statement =>
+      statement.setString(1, table.schema.get.value)
+      statement.setString(2, table.name.value)
+    }(_.getLong(1)).headOption
+
+  /** The foreign keys, of any table, that reference through the given index. */
+  private def referencingKeys(connection: Connection, index: Long): Vector[String] =
+    query(connection,
+      """SELECT k.conname, n.nspname, c.relname FROM pg_catalog.pg_constraint k
+        |JOIN pg_catalog.pg_class c ON c.oid = k.conrelid JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        |WHERE k.contype = 'f' AND k.conindid = CAST(? AS pg_catalog.oid)
+        |ORDER BY n.nspname, c.relname, k.conname""".stripMargin
+    )(_.setLong(1, index)) { row =>
+      s"foreign key ${quoted(row.getString("conname"))} of ${quoted(row.getString("nspname"))}.${quoted(row.getString("relname"))}"
+    }
+
   /** Whether a relation exists, by its catalog entry, so that missing privileges on it are not
     * mistaken for its absence.
     */
@@ -538,15 +600,15 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
             }
       }
 
-  /** Unique constraints match by their ordered columns, never by constraint name. */
-  private def compareUniqueKeys(connection: Connection, oid: Long, display: String, expected: TableModel): Vector[String] =
-    def show(columns: Vector[String]) = columns.map(quoted).mkString("(", ", ", ")")
-    val expectedKeys = expected.uniqueKeys.map(_.columns.map(id => expected.columns.find(_.id == id).get.name.value))
+  /** A unique constraint as the catalog shows it; `index` is the oid of the index it owns. */
+  private final case class DatabaseUniqueKey(name: String, index: Long, columns: Vector[String], features: Vector[String])
+
+  private def uniqueConstraints(connection: Connection, oid: Long): Vector[DatabaseUniqueKey] =
     // PostgreSQL 15 added NULLS NOT DISTINCT; before, NULLs were always distinct.
     val nullsNotDistinct =
       if connection.getMetaData.getDatabaseMajorVersion >= 15 then "i.indnullsnotdistinct" else "false"
-    val actualKeys = query(connection,
-      s"""SELECT k.conname, k.condeferrable, i.indnatts <> i.indnkeyatts AS has_include,
+    query(connection,
+      s"""SELECT k.conname, k.conindid, k.condeferrable, i.indnatts <> i.indnkeyatts AS has_include,
          |       $nullsNotDistinct AS nulls_not_distinct,
          |       ARRAY(SELECT CAST(a.attname AS pg_catalog.text)
          |             FROM pg_catalog.unnest(k.conkey) WITH ORDINALITY AS u(attnum, position)
@@ -562,13 +624,19 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
         Option.when(row.getBoolean("has_include"))("INCLUDE columns"),
         Option.when(row.getBoolean("nulls_not_distinct"))("NULLS NOT DISTINCT")
       ).flatten
-      (row.getString("conname"), strings(row, "columns"), features)
+      DatabaseUniqueKey(row.getString("conname"), row.getLong("conindid"), strings(row, "columns"), features)
     }
-    actualKeys.flatMap { (name, _, features) =>
-      features.map(feature => s"Unique key ${quoted(name)} of $display has unsupported $feature.")
-    } ++ (expectedKeys diff actualKeys.map(_._2)).map { key =>
+
+  /** Unique constraints match by their ordered columns, never by constraint name. */
+  private def compareUniqueKeys(connection: Connection, oid: Long, display: String, expected: TableModel): Vector[String] =
+    def show(columns: Vector[String]) = columns.map(quoted).mkString("(", ", ", ")")
+    val expectedKeys = expected.uniqueKeys.map(_.columns.map(id => expected.columns.find(_.id == id).get.name.value))
+    val actualKeys = uniqueConstraints(connection, oid)
+    actualKeys.flatMap { key =>
+      key.features.map(feature => s"Unique key ${quoted(key.name)} of $display has unsupported $feature.")
+    } ++ (expectedKeys diff actualKeys.map(_.columns)).map { key =>
       s"Database drift: unique key ${show(key)} is missing from $display."
-    } ++ (actualKeys.map(_._2) diff expectedKeys).map { key =>
+    } ++ (actualKeys.map(_.columns) diff expectedKeys).map { key =>
       s"Database drift: unexpected unique key ${show(key)} in $display."
     }
 
@@ -647,19 +715,15 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
       )(_ => ())(row => row.getString("conname") -> row.getString("definition")).toMap
     finally execute(connection, s"DROP TABLE pg_temp.${quoted(probe.value)}")
 
-  /** Plain indexes match by their ordered columns and directions, never by name. Indexes of
-    * the primary key and of unique constraints are checked with those. Every other index must
-    * be a valid, non-unique B-tree over plain columns with default operator classes,
-    * collations and NULLS ordering.
+  /** A plain index as the catalog shows it: every index of the table that neither belongs to the
+    * primary key nor to a unique constraint, with each column's direction and what the model
+    * cannot represent.
     */
-  private def compareIndexes(connection: Connection, oid: Long, display: String, expected: TableModel): Vector[String] =
-    def show(columns: Vector[(String, Boolean)]) =
-      columns.map((name, descending) => quoted(name) + (if descending then " DESC" else "")).mkString("(", ", ", ")")
-    val expectedIndexes = expected.indexes.map(_.columns.map { column =>
-      expected.columns.find(_.id == column.column).get.name.value -> column.descending
-    })
-    val actualIndexes = query(connection,
-      """SELECT ic.relname AS index_name, i.indisunique, i.indisvalid AND i.indisready AS usable,
+  private final case class DatabaseIndex(name: String, oid: Long, columns: Vector[(String, Boolean)], features: Vector[String])
+
+  private def plainIndexes(connection: Connection, oid: Long): Vector[DatabaseIndex] =
+    query(connection,
+      """SELECT ic.relname AS index_name, i.indexrelid, i.indisunique, i.indisvalid AND i.indisready AS usable,
         |       i.indpred IS NOT NULL AS partial, i.indexprs IS NOT NULL AS expressions,
         |       i.indnatts <> i.indnkeyatts AS has_include, am.amname,
         |       ARRAY(SELECT CAST(a.attname AS pg_catalog.text)
@@ -702,14 +766,29 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
         Option.when(row.getBoolean("custom_collation"))("collation"),
         Option.when(options.exists(option => option != 0 && option != 3))("NULLS ordering")
       ).flatten
-      (row.getString("index_name"), strings(row, "columns").zip(options.map(option => (option & 1) == 1)), features)
+      DatabaseIndex(row.getString("index_name"), row.getLong("indexrelid"),
+        strings(row, "columns").zip(options.map(option => (option & 1) == 1)), features)
     }
-    actualIndexes.flatMap { (name, _, features) =>
-      features.map(feature => s"Index ${quoted(name)} of $display has unsupported $feature.")
-    } ++ (expectedIndexes diff actualIndexes.map(_._2)).map { index =>
-      s"Database drift: index ${show(index)} is missing from $display."
-    } ++ (actualIndexes.map(_._2) diff expectedIndexes).map { index =>
-      s"Database drift: unexpected index ${show(index)} in $display."
+
+  private def showIndex(columns: Vector[(String, Boolean)]): String =
+    columns.map((name, descending) => quoted(name) + (if descending then " DESC" else "")).mkString("(", ", ", ")")
+
+  /** Plain indexes match by their ordered columns and directions, never by name. Indexes of
+    * the primary key and of unique constraints are checked with those. Every other index must
+    * be a valid, non-unique B-tree over plain columns with default operator classes,
+    * collations and NULLS ordering.
+    */
+  private def compareIndexes(connection: Connection, oid: Long, display: String, expected: TableModel): Vector[String] =
+    val expectedIndexes = expected.indexes.map(_.columns.map { column =>
+      expected.columns.find(_.id == column.column).get.name.value -> column.descending
+    })
+    val actualIndexes = plainIndexes(connection, oid)
+    actualIndexes.flatMap { index =>
+      index.features.map(feature => s"Index ${quoted(index.name)} of $display has unsupported $feature.")
+    } ++ (expectedIndexes diff actualIndexes.map(_.columns)).map { index =>
+      s"Database drift: index ${showIndex(index)} is missing from $display."
+    } ++ (actualIndexes.map(_.columns) diff expectedIndexes).map { index =>
+      s"Database drift: unexpected index ${showIndex(index)} in $display."
     }
 
   /** Foreign keys match by columns and referenced columns, never by constraint name. Keys

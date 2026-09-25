@@ -2,8 +2,10 @@ package com.anjunar.hibernateddl.core
 
 /** Plans creation, added columns, new unique keys, indexes and foreign keys, changed column
   * checks, nullability changes, the widenings of [[TypeChangeRules]] on columns outside keys
-  * and identities, explicit-ID renames and drops of columns, tables and sequences; all other
-  * changes fail closed. A column's steps follow its rename, so they use its new name; a type
+  * and identities, explicit-ID renames and drops of columns, tables, sequences, and of unique
+  * keys and indexes whose columns remain; all other changes fail closed. A changed unique key
+  * or index is a new definition and a dropped old one; a table's new ones come before its
+  * dropped ones. A column's steps follow its rename, so they use its new name; a type
   * change removes the column's check first and sets the target check after it, and backfills
   * run after every type change. A new required column in an existing table is
   * added nullable and made required later. Foreign keys are added after every table exists,
@@ -126,14 +128,19 @@ object DiffEngine:
         operations += SchemaOperation.AddUniqueKey(id, newTable.name,
           key.columns.map(columnId => newTable.columns.find(_.id == columnId).get.name))
       }
-      (oldUniqueKeys -- newTable.uniqueKeys).filter(key => remaining(key.columns)).foreach { key =>
-        errors += s"Dropping unique key ${key.display} from table '${id.value}' is unsupported; manual migration required"
-      }
       val oldIndexes = oldTable.indexes.toSet
       operations ++= createIndexes(newTable, newTable.indexes.filterNot(oldIndexes.contains))
-      (oldIndexes -- newTable.indexes).filter(index => remaining(index.columns.map(_.column))).foreach { index =>
-        errors += s"Dropping index ${index.display} from table '${id.value}' is unsupported; manual migration required"
-      }
+      // Replacements exist before the old definitions go. Those over a dropped column go with it.
+      def name(columnId: SchemaId) = newTable.columns.find(_.id == columnId).get.name
+      (oldUniqueKeys -- newTable.uniqueKeys).filter(key => remaining(key.columns)).toVector.sortBy(_.columns.map(_.value))
+        .foreach { key =>
+          operations += SchemaOperation.DropUniqueKey(UniqueKeyRef(id, key.columns), newTable.name, key.columns.map(name))
+        }
+      (oldIndexes -- newTable.indexes).filter(index => remaining(index.columns.map(_.column))).toVector
+        .sortBy(_.columns.map(c => c.column.value -> c.descending))(using indexOrder).foreach { index =>
+          operations += SchemaOperation.DropIndex(IndexRef(id, index.columns), newTable.name,
+            index.columns.map(column => SchemaOperation.IndexedColumn(name(column.column), column.descending)))
+        }
 
       val oldKeys = oldTable.foreignKeys.map(key => key.columns -> key).toMap
       newTable.foreignKeys.foreach { key =>
@@ -175,9 +182,10 @@ object DiffEngine:
     val diagnostics = errors.result().distinct.sorted
     if diagnostics.nonEmpty then Left(diagnostics) else Right(operations.result())
 
+  private val indexOrder = Ordering.Implicits.seqOrdering[Vector, (String, Boolean)]
+
   private def createIndexes(table: TableModel, indexes: Vector[IndexModel]): Vector[SchemaOperation] =
-    val byColumnsAndDirection = Ordering.Implicits.seqOrdering[Vector, (String, Boolean)]
-    indexes.sortBy(_.columns.map(c => c.column.value -> c.descending))(using byColumnsAndDirection).map { index =>
+    indexes.sortBy(_.columns.map(c => c.column.value -> c.descending))(using indexOrder).map { index =>
       SchemaOperation.CreateIndex(table.id, table.name, index.columns.map { column =>
         SchemaOperation.IndexedColumn(table.columns.find(_.id == column.column).get.name, column.descending)
       })

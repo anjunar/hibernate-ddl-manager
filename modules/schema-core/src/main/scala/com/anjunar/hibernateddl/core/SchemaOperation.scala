@@ -78,6 +78,34 @@ object SchemaOperation:
   ) extends SchemaOperation:
     val risk: RiskLevel = RiskLevel.Locking
 
+  /** Drops a plain index the target no longer has while its columns remain. The database
+    * named it, so the SQL is bound at execution to the one index the catalog shows for the
+    * definition. `table` and `columns` are the names when the step runs.
+    */
+  final case class DropIndex(
+      ref: IndexRef,
+      table: QualifiedName,
+      columns: Vector[IndexedColumn]
+  ) extends SchemaOperation:
+    val risk: RiskLevel = RiskLevel.Locking
+
+  /** Drops a unique key the target no longer has while its columns remain; afterwards they
+    * may hold duplicates. Bound at execution like [[DropIndex]].
+    */
+  final case class DropUniqueKey(
+      ref: UniqueKeyRef,
+      table: QualifiedName,
+      columns: Vector[SqlIdentifier]
+  ) extends SchemaOperation:
+    val risk: RiskLevel = RiskLevel.Locking
+
+  /** Whether an operation's SQL names an object that only the database knows. Its rendered SQL
+    * is then a template that cannot run; the executor binds it under the migration lock.
+    */
+  def boundAtExecution(operation: SchemaOperation): Boolean = operation match
+    case _: DropIndex | _: DropUniqueKey => true
+    case _ => false
+
   /** Runs after every table exists, so new tables may reference each other or themselves. */
   final case class AddForeignKey(
       tableId: SchemaId,

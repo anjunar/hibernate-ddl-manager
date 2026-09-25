@@ -1,6 +1,6 @@
 package com.anjunar.hibernateddl.integration
 
-import com.anjunar.hibernateddl.core.SchemaId
+import com.anjunar.hibernateddl.core.{SchemaId, UniqueKeyRef}
 import com.anjunar.hibernateddl.executor.*
 import com.anjunar.hibernateddl.hibernate.*
 import com.anjunar.hibernateddl.postgresql.TestPostgres
@@ -244,5 +244,10 @@ class SchemaMigrationIntegrationSuite extends TestPostgres:
       approvals = Set(Approval.Drop(SchemaId("a/b")), Approval.RenameBack(SchemaId("c")), Approval.Revert(3)))))
     assertEquals(MigrationSettings.options(Map(MigrationSettings.LockTimeoutMillis -> "soon")).left.map(_.size), Left(1))
     assertEquals(MigrationSettings.options(Map(MigrationSettings.Approvals -> "revert:0")).left.map(_.size), Left(1))
+    // The same entry the API writes and a plan's message names; a signature holds no comma.
+    val unique = Approval.dropUniqueKey(UniqueKeyRef(SchemaId("t"), Vector(SchemaId("t/a"), SchemaId("t/b"))))
+    assertEquals(MigrationSettings.options(Map(MigrationSettings.Approvals -> s"drop:x, ${Approval.entry(unique)}"))
+      .map(_.approvals), Right(Set(Approval.Drop(SchemaId("x")), unique)))
+    assertEquals(MigrationSettings.options(Map(MigrationSettings.Approvals -> "drop-unique:email")).left.map(_.size), Left(1))
     assertEquals(MigrationSettings.enabled(Map(MigrationSettings.Enabled -> "yes")).left.map(_.size), Left(1))
   }

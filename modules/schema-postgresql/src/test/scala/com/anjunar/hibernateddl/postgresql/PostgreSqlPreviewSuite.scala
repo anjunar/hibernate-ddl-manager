@@ -317,3 +317,55 @@ class PostgreSqlPreviewSuite extends TestPostgres:
         ready.steps.map(_.sql).mkString(" | "))
     }
   }
+
+  test("a preview binds dropped unique keys and indexes by reading, names missing approvals as setting entries, checks duplicates") {
+    val kid = id.copy(id = SchemaId("K_ID"))
+    val mail = ColumnModel(SchemaId("K_MAIL"), SqlIdentifier("mail"), SqlType.Varchar(100))
+    val team = ColumnModel(SchemaId("K_TEAM"), SqlIdentifier("team"), SqlType.BigInt)
+    def keys(unique: Vector[Vector[SchemaId]], indexes: Vector[SchemaId]) = SchemaModel(Vector(TableModel(SchemaId("K"),
+      QualifiedName(SqlIdentifier("keys"), public), Vector(kid, mail, team), Vector(kid.id),
+      uniqueKeys = unique.map(UniqueKeyModel(_)), indexes = indexes.map(column => IndexModel(Vector(IndexColumn(column)))))))
+    val approval = Approval.dropUniqueKey(UniqueKeyRef(SchemaId("K"), Vector(mail.id)))
+    val approvedPreview = new JdbcMigrationPreview(PostgreSqlMigrationBackend, ExecutionOptions(approvals = Set(approval)))
+    withDatabase { ds =>
+      executor.migrate(ds, keys(Vector(Vector(mail.id)), Vector(team.id)))
+      execute(ds, "INSERT INTO public.keys VALUES (1, 'a@x', 1), (2, 'b@x', 1), (3, NULL, 2), (4, NULL, 2)")
+      val perTeam = keys(Vector(Vector(team.id, mail.id)), Vector.empty)
+      val blocked = preview.preview(ds, perTeam)
+      assertEquals(blocked.outcome, PreviewOutcome.Blocked)
+      assertEquals(blocked.steps.map(_.sql), Vector(
+        "ALTER TABLE \"public\".\"keys\" ADD UNIQUE (\"team\", \"mail\");",
+        "ALTER TABLE \"public\".\"keys\" DROP CONSTRAINT \"keys_mail_key\";",
+        "DROP INDEX \"public\".\"keys_team_idx\";"))
+      val finding = blocked.findings.head
+      assertEquals((finding.code, finding.step), (PlanProblem.ApprovalMissing, Some(2)))
+      assert(finding.message.contains(s"setting entry ${Approval.entry(approval)}"), finding.message)
+      assertEquals(blocked.missingApprovals, Vector(Approval.entry(approval)))
+      assertEquals(blocked.checks.filter(_.code == PreviewCheck.DropTargetFound).map(c => (c.step, c.status)),
+        Vector((Some(2), CheckStatus.Passed), (Some(3), CheckStatus.Passed)))
+      assertEquals(check(blocked, PreviewCheck.NoDuplicates).status, CheckStatus.Passed)
+      assert(blocked.steps(2).description.contains("queries that used it may become slower"), blocked.steps(2).description)
+
+      // Unique per team alone would find team 1 twice; NULL mails never collide.
+      val duplicated = approvedPreview.preview(ds, keys(Vector(Vector(team.id)), Vector.empty))
+      assertEquals(check(duplicated, PreviewCheck.NoDuplicates).status, CheckStatus.Failed)
+      val ready = approvedPreview.preview(ds, perTeam)
+      assertEquals(ready.outcome, PreviewOutcome.Ready, PreviewRendering.text(ready))
+      assertEquals(new JdbcMigrationExecutor(PostgreSqlMigrationBackend, ExecutionOptions(approvals = Set(approval)))
+        .migrate(ds, perTeam).status, MigrationStatus.Applied)
+      assertEquals(scalar(ds, "SELECT array_to_string(statements, ' | ') FROM __hibernate_ddl.schema_history WHERE revision = 2"),
+        ready.steps.map(_.sql).mkString(" | "))
+    }
+  }
+
+  test("a dropped column shows the unique keys and indexes that go with it, without steps or approvals of their own") {
+    withPeople { ds =>
+      val keyed = SchemaModel(Vector(people(first, last).copy(uniqueKeys = Vector(UniqueKeyModel(Vector(first.id, last.id))),
+        indexes = Vector(IndexModel(Vector(IndexColumn(last.id, descending = true)))))))
+      executor.migrate(ds, keyed)
+      val report = preview.preview(ds, SchemaModel(Vector(people(first))))
+      assertEquals(report.steps.map(_.description), Vector("Drop column public.people.last_name and its data, which also " +
+        "removes unique key (first_name, last_name), index (last_name DESC)"))
+      assertEquals(report.missingApprovals, Vector("drop:P_LAST"))
+    }
+  }

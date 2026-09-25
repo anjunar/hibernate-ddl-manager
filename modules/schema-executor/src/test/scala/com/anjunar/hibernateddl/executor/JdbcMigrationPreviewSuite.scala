@@ -46,6 +46,8 @@ class JdbcMigrationPreviewSuite extends munit.FunSuite:
       def typeChangeBlockers(actual: Connection, table: QualifiedName, column: SqlIdentifier): Vector[String] =
         event("dependents")
         Vector.empty
+      def bindDrop(actual: Connection, operation: SchemaOperation, table: QualifiedName,
+          columns: Vector[SqlIdentifier]): Either[Vector[String], String] = { event("bind"); Right("bound") }
 
   test("a preview reads inside a read-only transaction that it rolls back, and never commits") {
     val h = new Harness

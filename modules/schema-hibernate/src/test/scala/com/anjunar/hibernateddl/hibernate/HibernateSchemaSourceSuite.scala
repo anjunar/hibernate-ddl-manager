@@ -347,3 +347,12 @@ class HibernateSchemaSourceSuite extends munit.FunSuite:
     assert(refused.exists(_.contains("shortens VARCHAR from 100 to 50")), refused)
     assert(refused.exists(_.contains("changes the NUMERIC scale from 2 to 4")), refused)
   }
+
+  test("index and constraint names are no part of the target; removing one of two unique markings changes nothing") {
+    val original = read(classOf[CatalogItem]).fold(e => fail(e.mkString("\n")), identity)
+    assertEquals(read(classOf[CatalogItemRenamed]), Right(original))
+    assertEquals(original.tables.head.uniqueKeys, Vector(UniqueKeyModel(Vector(SchemaId("b8c9d0e1/2c3d4e5f")))))
+    val switched = read(classOf[CatalogItemSwitched]).fold(e => fail(e.mkString("\n")), identity)
+    assertEquals(DiffEngine.diff(original, switched).map(_.map(_.getClass.getSimpleName)),
+      Right(Vector("AddUniqueKey", "DropUniqueKey", "DropIndex")))
+  }

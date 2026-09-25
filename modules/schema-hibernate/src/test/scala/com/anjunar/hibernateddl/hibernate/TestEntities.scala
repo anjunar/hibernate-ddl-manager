@@ -390,3 +390,32 @@ class MembershipNarrowed:
   @SchemaId("4e5f6071") @Column(unique = true, length = 20) var tag: String = uninitialized
   @SchemaId("5f607182") @Enumerated(EnumType.STRING) @Column(length = 10) var status: Status = uninitialized
   @SchemaId("60718293") var score: java.lang.Integer = uninitialized
+
+/** A named index and a named unique constraint whose column is also marked unique. */
+@Entity
+@Table(name = "catalog_item", indexes = Array(new Index(name = "idx_code", columnList = "code")),
+  uniqueConstraints = Array(new UniqueConstraint(name = "uk_sku", columnNames = Array("sku"))))
+@SchemaId("b8c9d0e1")
+class CatalogItem:
+  @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+  @SchemaId("1b2c3d4e") var code: String = uninitialized
+  @SchemaId("2c3d4e5f") @Column(unique = true) var sku: String = uninitialized
+
+/** Other names, and one of the two unique markings on sku removed: the same target. */
+@Entity
+@Table(name = "catalog_item", indexes = Array(new Index(name = "idx_code_renamed", columnList = "code")),
+  uniqueConstraints = Array(new UniqueConstraint(name = "uk_sku_renamed", columnNames = Array("sku"))))
+@SchemaId("b8c9d0e1")
+class CatalogItemRenamed:
+  @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+  @SchemaId("1b2c3d4e") var code: String = uninitialized
+  @SchemaId("2c3d4e5f") var sku: String = uninitialized
+
+/** Code becomes unique through a unique index; sku is no longer unique. */
+@Entity
+@Table(name = "catalog_item", indexes = Array(new Index(name = "idx_code", columnList = "code", unique = true)))
+@SchemaId("b8c9d0e1")
+class CatalogItemSwitched:
+  @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+  @SchemaId("1b2c3d4e") var code: String = uninitialized
+  @SchemaId("2c3d4e5f") var sku: String = uninitialized

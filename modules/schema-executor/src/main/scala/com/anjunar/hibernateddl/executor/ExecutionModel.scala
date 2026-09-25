@@ -32,6 +32,30 @@ enum Approval:
   case RenameBack(id: SchemaId)
   /** Migrate to a target equal to the model of this earlier revision. */
   case Revert(revision: Long)
+  /** Drop the unique key with this [[UniqueKeyRef.signature]] while its columns remain, so
+    * that they may hold duplicates. Neither a drop nor a revert approval permits this.
+    */
+  case DropUniqueKey(signature: String)
+
+object Approval:
+  def dropUniqueKey(key: UniqueKeyRef): Approval = DropUniqueKey(key.signature)
+
+  /** The entry for this approval in a comma-separated list, as settings and the CLI take it. */
+  def entry(approval: Approval): String = approval match
+    case Drop(id) => s"drop:${id.value}"
+    case RenameBack(id) => s"rename-back:${id.value}"
+    case Revert(revision) => s"revert:$revision"
+    case DropUniqueKey(signature) => s"drop-unique:$signature"
+
+  /** Reads one entry as [[entry]] writes it. */
+  def parse(entry: String): Either[String, Approval] = entry.trim.split(":", 2) match
+    case Array("drop", id) if id.trim.nonEmpty => Right(Drop(SchemaId(id.trim)))
+    case Array("rename-back", id) if id.trim.nonEmpty => Right(RenameBack(SchemaId(id.trim)))
+    case Array("revert", revision) if revision.trim.toLongOption.exists(_ > 0) => Right(Revert(revision.trim.toLong))
+    case Array("drop-unique", signature) if signature.trim.matches("u[0-9]+-[0-9a-f]+") =>
+      Right(DropUniqueKey(signature.trim))
+    case _ => Left(s"'$entry' is no approval; expected drop:<id>, rename-back:<id>, revert:<revision> or " +
+      "drop-unique:<signature>")
 
 /** Adopted: an existing database matched the target and was recorded as revision 1.
   * ManuallyMigrated: the database matched a target migrated by hand and was recorded as the
@@ -123,12 +147,25 @@ trait PlanningBackend extends SchemaDialect:
   /** An UPDATE that fills the column's NULLs and binds every constant as a parameter. */
   def renderFill(fill: NullFill): Either[Vector[String], BoundStatement]
 
-/** What the database knows about a column beyond the model. */
-trait ColumnDependencies:
+/** What only the database's catalog knows about modeled objects. Every method only reads, so a
+  * preview may call it too; table and column names are those the database has before the
+  * migration.
+  */
+trait CatalogLookups:
   /** The objects outside the model, such as views, that depend on the column and keep its type
     * from changing; each described for a message. Neither a migration nor a preview removes them.
     */
   def typeChangeBlockers(connection: Connection, table: QualifiedName, column: SqlIdentifier): Vector[String]
+  /** The SQL of an operation that [[SchemaOperation.boundAtExecution]], naming the one database
+    * object that matches its definition, or why there is none: no match, several, or an object
+    * that depends on it, such as a foreign key.
+    */
+  def bindDrop(
+      connection: Connection,
+      operation: SchemaOperation,
+      table: QualifiedName,
+      columns: Vector[SqlIdentifier]
+  ): Either[Vector[String], String]
 
 /** What a read-only comparison of the database with a model found: differences, and what it
   * could not decide.
@@ -139,7 +176,7 @@ final case class Inspection(differences: Vector[String], undecided: Vector[Strin
   * `beginReadOnly` made read-only on the server; nothing is created, altered, written or
   * explicitly locked, and no migration lock is taken.
   */
-trait PreviewBackend extends PlanningBackend with ColumnDependencies:
+trait PreviewBackend extends PlanningBackend with CatalogLookups:
   def beginReadOnly(connection: Connection, options: ExecutionOptions): Unit
   /** The schema history, or None when its table does not exist. */
   def readHistoryIfPresent(connection: Connection): Option[Vector[HistoryEntry]]
@@ -162,7 +199,7 @@ trait PreviewBackend extends PlanningBackend with ColumnDependencies:
   * the lock. Implementations must support transactional DDL and never commit or close
   * the supplied connection.
   */
-trait TransactionalMigrationBackend extends PlanningBackend with ColumnDependencies:
+trait TransactionalMigrationBackend extends PlanningBackend with CatalogLookups:
   def acquireLock(connection: Connection, options: ExecutionOptions): Unit
   def initializeHistory(connection: Connection): Unit
   /** Every history entry, ordered by revision. */

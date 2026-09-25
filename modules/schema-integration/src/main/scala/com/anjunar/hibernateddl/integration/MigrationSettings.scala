@@ -1,11 +1,10 @@
 package com.anjunar.hibernateddl.integration
 
-import com.anjunar.hibernateddl.core.SchemaId
 import com.anjunar.hibernateddl.executor.{Approval, ExecutionOptions}
 
 /** Hibernate settings for the migration at server startup. Nothing happens unless `enabled` is
-  * true. `approvals` lists entries such as `drop:7f3a9c21/f34e45b6`,
-  * `rename-back:7f3a9c21` or `revert:3`, separated by commas.
+  * true. `approvals` lists entries such as `drop:7f3a9c21/f34e45b6`, `rename-back:7f3a9c21`,
+  * `revert:3` or `drop-unique:u1-…`, separated by commas.
   */
 object MigrationSettings:
   val Enabled = "hibernate.ddl_manager.enabled"
@@ -65,14 +64,12 @@ object MigrationSettings:
       parsed
     }
 
+  /** Entries as [[Approval.entry]] writes them, the same ones the API and the CLI take. */
   private def approvals(settings: collection.Map[String, Any], errors: collection.mutable.Growable[String]): Set[Approval] =
     text(settings, Approvals).toVector.flatMap(_.split(',').toVector.map(_.trim).filter(_.nonEmpty)).flatMap { entry =>
-      entry.split(":", 2) match
-        case Array("drop", id) if id.trim.nonEmpty => Some(Approval.Drop(SchemaId(id.trim)))
-        case Array("rename-back", id) if id.trim.nonEmpty => Some(Approval.RenameBack(SchemaId(id.trim)))
-        case Array("revert", revision) if revision.trim.toLongOption.exists(_ > 0) =>
-          Some(Approval.Revert(revision.trim.toLong))
-        case _ =>
-          errors += s"Setting $Approvals has the entry '$entry'; expected drop:<id>, rename-back:<id> or revert:<revision>"
+      Approval.parse(entry) match
+        case Right(approval) => Some(approval)
+        case Left(problem) =>
+          errors += s"Setting $Approvals has the entry $problem"
           None
     }.toSet

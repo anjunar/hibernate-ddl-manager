@@ -57,6 +57,7 @@ object PreviewCheck:
   val ReferencesResolve = "REFERENCES_RESOLVE"
   val CheckHolds = "CHECK_HOLDS"
   val NoDependents = "NO_DEPENDENTS"
+  val DropTargetFound = "DROP_TARGET_FOUND"
   val RowEstimate = "ROW_ESTIMATE"
 
 /** A plan problem, tied to the step and stable ID it concerns. */
@@ -121,18 +122,18 @@ object PreviewReport:
   /** Format 2 added `typeChange` to steps. */
   val Format: Int = 2
 
-  def approval(value: Approval): String = value match
-    case Approval.Drop(id) => s"drop:${id.value}"
-    case Approval.RenameBack(id) => s"rename-back:${id.value}"
-    case Approval.Revert(revision) => s"revert:$revision"
+  def approval(value: Approval): String = Approval.entry(value)
 
-  /** The steps of a plan, numbered from 1. */
-  def steps(plan: MigrationPlan): Vector[PreviewStep] =
+  /** The steps of a plan, numbered from 1. `bound` holds the SQL of steps bound to database
+    * objects, by index; the others show the plan's SQL, a template for a step not bound yet.
+    */
+  def steps(plan: MigrationPlan, bound: Map[Int, String] = Map.empty): Vector[PreviewStep] =
     plan.steps.zipWithIndex.map { (step, index) =>
       step match
         case PlanStep.Statement(operation, sql, approval, approved) =>
-          PreviewStep(index + 1, "ddl", describe(operation), subjects(operation), sql, Vector.empty,
-            Some(operation.risk.toString), approval.map(this.approval), approved, typeChange(plan, operation))
+          PreviewStep(index + 1, "ddl", describe(operation) + alsoRemoved(plan, operation), subjects(operation),
+            bound.getOrElse(index, sql), Vector.empty, Some(operation.risk.toString), approval.map(this.approval), approved,
+            typeChange(plan, operation))
         case PlanStep.Fill(backfill, column, statement) =>
           PreviewStep(index + 1, "fill", s"Fill the NULLs of column '${column.value}' with backfill '${backfill.id}'",
             Vector(column.value), statement.sql, statement.parameters.map(parameterType), None, None, true)
@@ -140,6 +141,29 @@ object PreviewReport:
           PreviewStep(index + 1, "null check", s"Check that no row of $column holds NULL", Vector(columnId.value), query,
             Vector.empty, None, None, true)
     }
+
+  /** What a dropped column or table takes with it: its unique keys, indexes and foreign keys,
+    * which get no steps and no approvals of their own.
+    */
+  private def alsoRemoved(plan: MigrationPlan, operation: SchemaOperation): String =
+    def structures(table: TableModel, touches: Vector[SchemaId] => Boolean): Vector[String] =
+      def names(ids: Vector[SchemaId]) = ids.map(id => table.columns.find(_.id == id).get.name.value).mkString("(", ", ", ")")
+      table.uniqueKeys.filter(key => touches(key.columns)).map(key => s"unique key ${names(key.columns)}") ++
+        table.indexes.filter(index => touches(index.columns.map(_.column))).map { index =>
+          "index " + index.columns.map { column =>
+            table.columns.find(_.id == column.column).get.name.value + (if column.descending then " DESC" else "")
+          }.mkString("(", ", ", ")")
+        } ++
+        table.foreignKeys.filter(key => touches(key.columns)).map(key => s"foreign key ${names(key.columns)}")
+    val removed = operation match
+      case SchemaOperation.DropColumn(tableId, _, columnId, _) =>
+        plan.previous.tables.find(_.id == tableId).toVector.flatMap(structures(_, _.contains(columnId)))
+      case SchemaOperation.DropTables(tables) =>
+        tables.flatMap(dropped => plan.previous.tables.find(_.id == dropped.tableId).toVector.flatMap { table =>
+          structures(table, _ => true).map(structure => s"$structure of ${table.name.display}")
+        })
+      case _ => Vector.empty
+    if removed.isEmpty then "" else s", which also removes ${removed.mkString(", ")}"
 
   private def typeChange(plan: MigrationPlan, operation: SchemaOperation): Option[PreviewTypeChange] = operation match
     case SchemaOperation.ChangeColumnType(tableId, _, columnId, _, from, to) =>
@@ -183,6 +207,8 @@ object PreviewReport:
     case SchemaOperation.RenameColumn(_, _, id, _, _) => Vector(id.value)
     case SchemaOperation.ChangeColumnType(_, _, id, _, _, _) => Vector(id.value)
     case SchemaOperation.AddUniqueKey(id, _, _) => Vector(id.value)
+    case SchemaOperation.DropIndex(ref, _, _) => Vector(ref.table.value)
+    case SchemaOperation.DropUniqueKey(ref, _, _) => Vector(ref.table.value, ref.signature)
     case SchemaOperation.ChangeCheck(_, _, id, _, _, _) => Vector(id.value)
     case SchemaOperation.CreateIndex(id, _, _) => Vector(id.value)
     case SchemaOperation.AddForeignKey(id, _, _, _, _) => Vector(id.value)
@@ -202,6 +228,11 @@ object PreviewReport:
     case SchemaOperation.ChangeColumnType(_, table, _, column, from, to) =>
       s"Change the type of column ${table.display}.${column.value} from $from to $to"
     case SchemaOperation.AddUniqueKey(_, table, columns) => s"Add unique key (${columns.map(_.value).mkString(", ")}) to ${table.display}"
+    case SchemaOperation.DropIndex(_, table, columns) =>
+      val keys = columns.map(column => column.name.value + (if column.descending then " DESC" else ""))
+      s"Drop index (${keys.mkString(", ")}) of ${table.display}; queries that used it may become slower"
+    case SchemaOperation.DropUniqueKey(_, table, columns) =>
+      s"Drop unique key (${columns.map(_.value).mkString(", ")}) of ${table.display}; its columns may then hold duplicates"
     case SchemaOperation.ChangeCheck(_, table, _, column, _, to) =>
       s"${if to.isEmpty then "Remove" else "Set"} the check of column ${table.display}.${column.value}"
     case SchemaOperation.CreateIndex(_, table, columns) => s"Create index (${columns.map(_.name.value).mkString(", ")}) on ${table.display}"

@@ -1,12 +1,14 @@
 # Arbeitspaket: Indizes und Unique-Constraints ändern und entfernen
 
-Status: Konzept zur Umsetzung, noch nicht implementiert.
+Status: umgesetzt. Die API- und Typnamen unten sind die verfügbaren; die
+Entscheidungen bei der Umsetzung stehen am Ende.
 
 Dieses Arbeitspaket ergänzt die [bestehende Architektur](architecture.md), das
 [Backfill-Konzept](backfills-and-not-null.md), die
 [Migrationsvorschau](migration-preview-and-preflight.md) und die
-[kontrollierten Typänderungen](controlled-type-changes.md). Neue Operations-,
-Referenz- und Freigabenamen sind Entwurfsvorschläge.
+[kontrollierten Typänderungen](controlled-type-changes.md). Umgesetzt sind die
+Referenzen `IndexRef` und `UniqueKeyRef`, die Operationen `DropIndex` und
+`DropUniqueKey` sowie die Freigabe `Approval.DropUniqueKey`.
 
 ## Ziel
 
@@ -322,47 +324,47 @@ Eine neue allgemeine Modulstruktur ist nicht notwendig.
 
 ## Abnahmekriterien
 
-- [ ] Normale Indizes lassen sich auf weiterhin vorhandenen Spalten entfernen.
-- [ ] Erweiterungen, veränderte Reihenfolge und ASC-/DESC-Änderungen erzeugen die
+- [x] Normale Indizes lassen sich auf weiterhin vorhandenen Spalten entfernen.
+- [x] Erweiterungen, veränderte Reihenfolge und ASC-/DESC-Änderungen erzeugen die
   richtige neue Definition und entfernen genau die alte.
-- [ ] Unique-Regeln lassen sich mit passender Freigabe entfernen oder ersetzen;
+- [x] Unique-Regeln lassen sich mit passender Freigabe entfernen oder ersetzen;
   eine fehlende oder auf eine andere Definition bezogene Freigabe blockiert vor DDL.
-- [ ] Neue Unique-Regeln scheitern bei echten Duplikaten. NULL-Werte und
+- [x] Neue Unique-Regeln scheitern bei echten Duplikaten. NULL-Werte und
   zusammengesetzte Schlüssel werden nach der unterstützten Semantik behandelt.
-- [ ] Unique → normaler Index und normaler Index → Unique funktionieren, ohne
+- [x] Unique → normaler Index und normaler Index → Unique funktionieren, ohne
   einen constraintgebundenen Index als normalen Index zu löschen.
-- [ ] Beim Aufheben einer Unique-Regel bleiben Zeilen und Spalten erhalten;
+- [x] Beim Aufheben einer Unique-Regel bleiben Zeilen und Spalten erhalten;
   danach können die vom neuen Zielmodell erlaubten Duplikate geschrieben werden.
-- [ ] Tatsächliche Namen aus Neuanlage, Übernahme oder früherer Umbenennung
+- [x] Tatsächliche Namen aus Neuanlage, Übernahme oder früherer Umbenennung
   werden korrekt aufgelöst. Gequotete Bezeichner und mehrere Schemas funktionieren.
-- [ ] Identische Definitionen auf unterschiedlichen Tabellen oder Schemas werden
+- [x] Identische Definitionen auf unterschiedlichen Tabellen oder Schemas werden
   nicht verwechselt. Fehlende oder mehrdeutige Katalogtreffer werden abgelehnt.
-- [ ] Primärschlüssel, ihre Indizes, fremde Abhängigkeiten und nicht unterstützte
+- [x] Primärschlüssel, ihre Indizes, fremde Abhängigkeiten und nicht unterstützte
   Indexarten werden nicht versehentlich entfernt. Abhängige FK-Regeln führen zu
   einer verständlichen Ablehnung ohne `CASCADE`.
-- [ ] Neue Ersatzobjekte können vor den alten entstehen, ohne Namenskollisionen
+- [x] Neue Ersatzobjekte können vor den alten entstehen, ohne Namenskollisionen
   oder eine anschließende Verwechslung beim Drop.
-- [ ] Tabellen- und Spaltenrenames erhalten die strukturelle Zuordnung und
+- [x] Tabellen- und Spaltenrenames erhalten die strukturelle Zuordnung und
   verwenden bei der Ausführung die richtigen physischen Namen.
-- [ ] Ein Spalten- oder Tabellen-Drop erzeugt keine zusätzlichen Drops für
+- [x] Ein Spalten- oder Tabellen-Drop erzeugt keine zusätzlichen Drops für
   automatisch mitentfernte Strukturen und verlangt dafür keine doppelte Freigabe.
-- [ ] Geänderte Namen im Hibernate-Mapping allein verändern keinen unveränderten
+- [x] Geänderte Namen im Hibernate-Mapping allein verändern keinen unveränderten
   Index- oder Unique-Zielzustand. Alle maßgeblichen Hibernate-Eindeutigkeitsquellen
   werden berücksichtigt; das Entfernen nur einer redundanten Angabe genügt nicht.
-- [ ] API und Einstellungssyntax erzeugen dieselbe spezifische Unique-Freigabe.
+- [x] API und Einstellungssyntax erzeugen dieselbe spezifische Unique-Freigabe.
   Neue Einträge kollidieren nicht mit der vorhandenen kommagetrennten Syntax.
-- [ ] Fehler beim Aufbau einer Ersatzstruktur oder nach einem Drop rollen bei
+- [x] Fehler beim Aufbau einer Ersatzstruktur oder nach einem Drop rollen bei
   bestätigtem Rollback Strukturen, Datenänderungen und Historie gemeinsam zurück.
-- [ ] Wiederholte und parallele Starts verändern eine abgeschlossene Migration
+- [x] Wiederholte und parallele Starts verändern eine abgeschlossene Migration
   nicht erneut; Commit- und Verbindungsfehler behalten die bestehenden Fehlerzustände.
-- [ ] Alte Modelle und Fingerprints bleiben lesbar und kompatibel. Die Historie
+- [x] Alte Modelle und Fingerprints bleiben lesbar und kompatibel. Die Historie
   enthält die tatsächlich ausgeführten, aufgelösten SQL-Anweisungen.
-- [ ] Unterstützte Kombinationen mit Backfills, NOT NULL und späteren
+- [x] Unterstützte Kombinationen mit Backfills, NOT NULL und späteren
   Typänderungen haben eine geprüfte Reihenfolge. Nicht unterstützte Kombinationen
   werden vorab erklärt und nicht teilweise übernommen.
-- [ ] Nach Umsetzung der Vorschau stimmen Entscheidungen und Freigaben mit dem
+- [x] Nach Umsetzung der Vorschau stimmen Entscheidungen und Freigaben mit dem
   Executor überein; ein späterer Lauf prüft Katalogbindungen und Daten erneut.
-- [ ] Bestehende Tests bleiben gültig, neue Integrationsfälle prüfen echte
+- [x] Bestehende Tests bleiben gültig, neue Integrationsfälle prüfen echte
   PostgreSQL-Objekte und Daten, und `sbt check` besteht.
 
 ## Betriebsgrenzen und Folgearbeiten
@@ -385,3 +387,36 @@ und [DROP INDEX](https://www.postgresql.org/docs/14/sql-dropindex.html).
 Weitere mögliche Folgearbeiten sind Spezialindizes, explizite Objektumbenennungen
 und koordinierte Änderungen von Fremd- und Primärschlüsseln. Das vorliegende Paket
 automatisiert weder fachliche Datenbereinigung noch die Auflösung doppelter Werte.
+
+## Entscheidungen bei der Umsetzung
+
+- `DropIndex` und `DropUniqueKey` tragen ihre strukturelle Referenz und die Tabellen- und
+  Spaltennamen zum Zeitpunkt ihres Schritts. Ihr gerendertes SQL ist eine Vorlage mit einem
+  Platzhalter in spitzen Klammern, der kein SQL ist; versehentlich ausgeführt könnte sie
+  nichts entfernen. `SchemaOperation.boundAtExecution` kennzeichnet solche Operationen.
+- Der Executor bindet sie unter den Sperren nach der Prüfung des Ausgangsschemas und der
+  Typänderungs-Abhängigkeiten, vor der ersten DDL, über `bindDrop` an genau ein Katalogobjekt.
+  Kein Treffer, mehrere Treffer, ein Treffer mit nicht unterstützten Eigenschaften und ein
+  abhängiger Fremdschlüssel (`pg_constraint.conindid`) lehnen die Migration ab. Die
+  Historie enthält das gebundene SQL. Zustandsprüfung und Bindung verwenden dieselben
+  Katalogabfragen.
+- Ein Index wird über den Namen im Schema seiner Tabelle entfernt, ein Unique-Constraint
+  über `ALTER TABLE` mit dem Tabellennamen zum Zeitpunkt des Schritts. Umbenennungen ändern
+  diese Namen nicht; Ersatzobjekte entstehen erst nach der Bindung und erhalten von
+  PostgreSQL freie Namen, etwa mit angehängter Ziffer.
+- Reihenfolge je Tabelle: neue Unique-Keys, neue Indizes, entfernte Unique-Keys, entfernte
+  Indizes; alles nach den Spaltenänderungen und vor Backfills und `SET NOT NULL`. Ein Backfill
+  läuft damit nie gegen eine alte Unique-Regel, die das Ziel entfernt, und muss keine
+  Kombination deshalb ablehnen. Eine neue Unique-Regel prüft die Werte eines Backfills
+  bereits beim Schreiben; das Ergebnis entspricht einer Prüfung danach.
+- Die Signatur einer Unique-Freigabe ist `u1-` gefolgt von 32 Hex-Ziffern aus SHA-256 über
+  Art, Tabellen-ID und geordnete Spalten-IDs mit Längenpräfixen. `Approval.dropUniqueKey(ref)`
+  erzeugt die Freigabe; `Approval.entry` und `Approval.parse` gelten für API, die Einstellung
+  `hibernate.ddl_manager.approvals` und die CLI-Option `--approval` gleichermaßen. Die
+  Meldung eines Plans nennt beide Schreibweisen.
+- Die Vorschau bindet rein lesend mit derselben Methode, zeigt das gebundene SQL im Schritt
+  und prüft jede Bindung als erforderliche Prüfung `DROP_TARGET_FOUND`. Mitentfernte
+  Strukturen eines Spalten- oder Tabellen-Drops stehen in dessen Beschreibung. Das
+  JSON-Format des Berichts bleibt 2.
+- Nicht umgesetzt, wie oben beschrieben: Umbenennen von Indizes und Constraints,
+  `CONCURRENTLY` und das Entfernen von Fremdschlüsseln bei bleibenden Spalten.

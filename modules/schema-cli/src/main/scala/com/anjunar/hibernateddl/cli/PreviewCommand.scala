@@ -22,7 +22,7 @@ object PreviewCommand:
 
   val usage: String =
     """preview --target FILE [--backfills FILE] [--format text|json] [--data-checks none|existence] [--counts]
-      |        [--approval drop:ID|rename-back:ID|revert:REVISION]... [--adopt-existing-schema]
+      |        [--approval drop:ID|rename-back:ID|revert:REVISION|drop-unique:SIGNATURE]... [--adopt-existing-schema]
       |        [--accept-manual-migration FINGERPRINT] [--lock-timeout-millis N] [--statement-timeout-millis N]
       |        Shows what the next server start would do to the database, without changing it.
       |        Connection: HIBERNATE_DDL_PREVIEW_JDBC_URL, HIBERNATE_DDL_PREVIEW_USER, HIBERNATE_DDL_PREVIEW_PASSWORD.
@@ -78,11 +78,7 @@ object PreviewCommand:
     case "--accept-manual-migration" +: fingerprint +: rest =>
       parse(rest, parsed.copy(options = parsed.options.copy(acceptManualMigration = Some(fingerprint))))
     case "--approval" +: approval +: rest =>
-      val parsedApproval = approval.split(":", 2) match
-        case Array("drop", id) if id.nonEmpty => Right(Approval.Drop(SchemaId(id)))
-        case Array("rename-back", id) if id.nonEmpty => Right(Approval.RenameBack(SchemaId(id)))
-        case Array("revert", revision) if revision.toLongOption.exists(_ > 0) => Right(Approval.Revert(revision.toLong))
-        case _ => Left(s"Invalid approval '$approval'")
+      val parsedApproval = Approval.parse(approval).left.map(problem => s"Invalid approval: $problem")
       parsedApproval.flatMap(value => parse(rest, parsed.copy(options = parsed.options.copy(approvals = parsed.options.approvals + value))))
     case "--lock-timeout-millis" +: value +: rest if value.toIntOption.nonEmpty =>
       parse(rest, parsed.copy(options = parsed.options.copy(lockTimeoutMillis = value.toInt)))
