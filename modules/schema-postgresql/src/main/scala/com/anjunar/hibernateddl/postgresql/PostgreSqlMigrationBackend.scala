@@ -321,15 +321,19 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
     }
 
   /** Check constraints match by the name the dialect derives from the column ID and the check,
-    * and must cover exactly that column. Their expression is not compared: PostgreSQL rewrites
-    * it, and the name already fixes the allowed values.
+    * must cover exactly that column and must have exactly the expected definition. PostgreSQL
+    * rewrites a check's expression, so the expected definition comes from the same server: the
+    * dialect creates the expected checks on a temporary probe table, and both definitions are
+    * compared as `pg_get_constraintdef` shows them.
     */
   private def compareChecks(connection: Connection, oid: Long, display: String, expected: TableModel): Vector[String] =
-    val expectedChecks = expected.columns.flatMap { column =>
-      column.check.map(check => PostgreSqlDialect.checkName(column.id, check).value -> column.name.value)
+    val checked = expected.columns.filter(_.check.nonEmpty)
+    val expectedChecks = checked.map { column =>
+      PostgreSqlDialect.checkName(column.id, column.check.get).value -> column.name.value
     }.toMap
+    val expectedDefinitions = if checked.isEmpty then Map.empty[String, String] else checkDefinitions(connection, checked)
     val actualChecks = query(connection,
-      """SELECT k.conname, k.convalidated,
+      """SELECT k.conname, k.convalidated, pg_catalog.pg_get_constraintdef(k.oid) AS definition,
         |       ARRAY(SELECT CAST(a.attname AS pg_catalog.text)
         |             FROM pg_catalog.unnest(k.conkey) AS u(attnum)
         |             JOIN pg_catalog.pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = u.attnum
@@ -337,19 +341,38 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend:
         |FROM pg_catalog.pg_constraint k
         |WHERE k.conrelid = CAST(? AS pg_catalog.oid) AND k.contype = 'c'
         |ORDER BY k.conname""".stripMargin
-    )(_.setLong(1, oid))(row => (row.getString("conname"), row.getBoolean("convalidated"), strings(row, "columns")))
+    )(_.setLong(1, oid)) { row =>
+      (row.getString("conname"), row.getBoolean("convalidated"), row.getString("definition"), strings(row, "columns"))
+    }
     val actualNames = actualChecks.map(_._1).toSet
-    actualChecks.flatMap { (name, validated, columns) =>
+    actualChecks.flatMap { (name, validated, definition, columns) =>
       Option.when(!validated)(s"Check constraint ${quoted(name)} of $display has unsupported NOT VALID state.").toVector ++
         (expectedChecks.get(name) match
           case None => Vector(s"Database drift: unexpected check constraint ${quoted(name)} in $display.")
           case Some(column) if columns != Vector(column) =>
             Vector(s"Database drift: check constraint ${quoted(name)} of $display covers " +
               s"${columns.map(quoted).mkString("(", ", ", ")")}; expected (${quoted(column)}).")
+          case Some(_) if validated && !expectedDefinitions.get(name).contains(definition) =>
+            Vector(s"Database drift: check constraint ${quoted(name)} of $display is $definition; " +
+              s"expected ${expectedDefinitions.getOrElse(name, "a definition PostgreSQL did not produce")}.")
           case Some(_) => Vector.empty)
     } ++ expectedChecks.toVector.sorted.filterNot((name, _) => actualNames.contains(name)).map { (name, column) =>
       s"Database drift: check constraint ${quoted(name)} on column ${quoted(column)} is missing from $display."
     }
+
+  /** The canonical definitions of the given columns' checks, by constraint name, from a
+    * temporary probe table that exists only during this call.
+    */
+  private def checkDefinitions(connection: Connection, columns: Vector[ColumnModel]): Map[String, String] =
+    val probe = SqlIdentifier("hibernate_ddl_check_probe")
+    execute(connection, PostgreSqlDialect.checkProbe(probe, columns))
+    try
+      query(connection,
+        """SELECT k.conname, pg_catalog.pg_get_constraintdef(k.oid) AS definition
+          |FROM pg_catalog.pg_constraint k
+          |WHERE k.conrelid = pg_catalog.to_regclass('pg_temp.hibernate_ddl_check_probe') AND k.contype = 'c'""".stripMargin
+      )(_ => ())(row => row.getString("conname") -> row.getString("definition")).toMap
+    finally execute(connection, s"DROP TABLE pg_temp.${quoted(probe.value)}")
 
   /** Plain indexes match by their ordered columns and directions, never by name. Indexes of
     * the primary key and of unique constraints are checked with those. Every other index must
