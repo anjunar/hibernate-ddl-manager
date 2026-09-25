@@ -271,19 +271,24 @@ class PostgreSqlExecutorSuite extends TestPostgres:
         ColumnModel(SchemaId("T_WEIGHT"), SqlIdentifier("weight"), SqlType.Real),
         ColumnModel(SchemaId("T_RATIO"), SqlIdentifier("ratio"), SqlType.DoublePrecision),
         ColumnModel(SchemaId("T_DAY"), SqlIdentifier("day"), SqlType.Date),
-        ColumnModel(SchemaId("T_DATA"), SqlIdentifier("data"), SqlType.Binary)
+        ColumnModel(SchemaId("T_DATA"), SqlIdentifier("data"), SqlType.Binary),
+        ColumnModel(SchemaId("T_LOB"), SqlIdentifier("document"), SqlType.LargeObject),
+        ColumnModel(SchemaId("T_JSON"), SqlIdentifier("settings"), SqlType.Json)
       )
       val typed = SchemaModel(Vector(TableModel(SchemaId("T"), QualifiedName(SqlIdentifier("typed"), Some(SqlIdentifier("public"))),
         columns, Vector(columns.head.id))))
       assertEquals(executor.migrate(ds, typed).status, MigrationStatus.Applied)
       execute(ds, "INSERT INTO public.typed VALUES (1, 'EUR', 12.345, 99999999999999999999, '08:30:15', 1.5, 0.25, " +
-        "'2026-09-24', '\\xcafe')")
+        "'2026-09-24', '\\xcafe', lo_from_bytea(0, 'large'), '{\"theme\": \"dark\"}')")
+      assertEquals(scalar(ds, "SELECT settings ->> 'theme' FROM public.typed"), "dark")
+      assertEquals(scalar(ds, "SELECT convert_from(lo_get(document), 'UTF8') FROM public.typed"), "large")
       assertEquals(scalar(ds, "SELECT concat_ws(' ', code, price, total, opens_at, weight, ratio, day, data) FROM public.typed"),
         "EUR 12.35 99999999999999999999 08:30:15 1.5 0.25 2026-09-24 \\xcafe")
       assertEquals(executor.migrate(ds, typed).status, MigrationStatus.AlreadyApplied)
-      execute(ds, "ALTER TABLE public.typed ALTER COLUMN price TYPE numeric(12,2)")
+      execute(ds, "ALTER TABLE public.typed ALTER COLUMN price TYPE numeric(12,2), ALTER COLUMN settings TYPE json")
       val error = intercept[MigrationException](executor.migrate(ds, typed))
       assert(error.getMessage.contains("expected Numeric(10,2)"), error.getMessage)
+      assert(error.getMessage.contains("column \"public\".\"typed\".\"settings\" type is pg_catalog.json"), error.getMessage)
     }
   }
 
@@ -564,7 +569,7 @@ class PostgreSqlExecutorSuite extends TestPostgres:
       classOf[Account], classOf[Shipment], classOf[Measurement], classOf[Letter], classOf[Purchase],
       classOf[Generated], classOf[Ticket], classOf[Voucher], classOf[Animal], classOf[Cat], classOf[Dog],
       classOf[Vehicle], classOf[Car], classOf[Payment], classOf[CardPayment], classOf[TransferPayment], classOf[Shelf],
-      classOf[Profile])
+      classOf[Profile], classOf[Document], classOf[Settings])
       .fold(errors => fail(errors.mkString("\n")), identity)
     withDatabase { ds =>
       val result = executor.migrate(ds, model)
@@ -689,7 +694,8 @@ class PostgreSqlExecutorSuite extends TestPostgres:
     import com.anjunar.hibernateddl.hibernate.*
     val classes = Seq(classOf[Purchase], classOf[Invoice], classOf[LegacyCustomer], classOf[Account], classOf[Shipment],
       classOf[Generated], classOf[Ticket], classOf[Voucher], classOf[Vehicle], classOf[Car],
-      classOf[Payment], classOf[CardPayment], classOf[TransferPayment], classOf[Profile])
+      classOf[Payment], classOf[CardPayment], classOf[TransferPayment], classOf[Profile], classOf[Document],
+      classOf[Settings])
     val model = TestMetadata.read(classes*).fold(errors => fail(errors.mkString("\n")), identity)
     withDatabase { ds =>
       execute(ds, TestMetadata.createScript(classes*))

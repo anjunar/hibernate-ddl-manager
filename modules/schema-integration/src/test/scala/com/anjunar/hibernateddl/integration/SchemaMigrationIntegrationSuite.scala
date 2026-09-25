@@ -97,6 +97,51 @@ class SchemaMigrationIntegrationSuite extends TestPostgres:
     }
   }
 
+  test("Hibernate writes and reads @Lob values in the large object columns the migration created") {
+    withDatabase { ds =>
+      withSessionFactory(ds, Seq(classOf[Document]), enabled, validate) { factory =>
+        factory.inTransaction { session =>
+          val document = new Document
+          document.id = 1L
+          document.body = "A long text"
+          document.scan = Array[Byte](1, 2, 3)
+          session.persist(document)
+        }
+        factory.inTransaction { session =>
+          val document = session.find(classOf[Document], 1L)
+          assertEquals(document.body, "A long text")
+          assertEquals(document.scan.toVector, Vector[Byte](1, 2, 3))
+        }
+      }
+      assertEquals(scalar(ds, "SELECT count(*) FROM pg_largeobject_metadata"), "2")
+    }
+  }
+
+  test("Hibernate writes and reads JSON columns, also an embeddable stored as one document") {
+    withDatabase { ds =>
+      withSessionFactory(ds, Seq(classOf[Settings]), enabled, validate) { factory =>
+        factory.inTransaction { session =>
+          val settings = new Settings
+          settings.id = 1L
+          settings.values = java.util.Map.of("size", Integer.valueOf(3))
+          settings.tags = java.util.List.of("a", "b")
+          settings.raw = "{\"free\": true}"
+          settings.preferences = new Preferences
+          settings.preferences.theme = "dark"
+          session.persist(settings)
+        }
+        factory.inTransaction { session =>
+          val settings = session.find(classOf[Settings], 1L)
+          assertEquals(settings.values.get("size"), Integer.valueOf(3))
+          assertEquals(settings.tags, java.util.List.of("a", "b"))
+          assertEquals(settings.preferences.theme, "dark")
+        }
+      }
+      assertEquals(scalar(ds, "SELECT concat_ws(' ', tags ->> 1, raw ->> 'free', pg_typeof(preferences)) FROM public.settings"),
+        "b true jsonb")
+    }
+  }
+
   test("settings carry approvals: removing an entity drops its table and sequence only when approved") {
     withDatabase { ds =>
       withSessionFactory(ds, entities, enabled)(_ => ())
