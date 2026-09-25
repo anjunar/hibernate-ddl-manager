@@ -124,6 +124,12 @@ there:
   takes the checks, keys and indexes over it. An entity's collection tables and sequence
   are objects of their own and need their own approvals. The refusal lists every missing
   approval; an approval whose change is not planned has no effect.
+- A change the executor cannot plan is refused together with the target's fingerprint. An
+  operator can migrate the database by hand and start once with
+  `ExecutionOptions.acceptManualMigration` set to that fingerprint: the executor checks the
+  database against the target exactly and records it as the next revision with no
+  statements. An option naming another target is refused. Earlier-revision, retired-ID and
+  drift checks still apply.
 - A dropped ID is retired: an ID that an earlier revision had and the latest does not may
   never appear again, not even with approvals. This rejects an ID copied from the version
   history of the code, which would attach the dropped object's identity to a new one.
