@@ -180,6 +180,16 @@ class PostgreSqlPreviewSuite extends TestPostgres:
     }
   }
 
+  test("a table a backfill fills gets an optional row estimate once PostgreSQL has one") {
+    withPeople { ds =>
+      val target = SchemaModel(Vector(people(first, last, display)))
+      assertEquals(check(preview.preview(ds, target, Vector(displayRule)), PreviewCheck.RowEstimate).rows, RowCount.Unknown)
+      execute(ds, "ANALYZE public.people")
+      val estimated = check(preview.preview(ds, target, Vector(displayRule)), PreviewCheck.RowEstimate)
+      assertEquals((estimated.rows, estimated.required), (RowCount.Estimate(3), false))
+    }
+  }
+
   test("sources dropped after the fill and renamed ones are read under their current names") {
     withPeople { ds =>
       val v3 = SchemaModel(Vector(people(display)))

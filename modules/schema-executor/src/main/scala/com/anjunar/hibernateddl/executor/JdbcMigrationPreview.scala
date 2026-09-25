@@ -193,7 +193,9 @@ final class JdbcMigrationPreview(
               details = taken.map(name => s"${name.display} is taken"))
           }
 
-  /** Data checks come with the plan's steps; see [[PreviewDataChecks]]. */
+  /** Data checks come with the plan's steps; see [[PreviewDataChecks]]. Each table a backfill
+    * fills also gets an optional, estimated row count.
+    */
   private def dataChecks(connection: Connection, plan: MigrationPlan, previewOptions: PreviewOptions, checks: Checks): Unit =
     PreviewDataChecks.planned(plan).foreach { planned =>
       if previewOptions.dataChecks == DataChecks.Skip || plan.mode != PlanMode.Migration || !plan.complete then
@@ -208,3 +210,14 @@ final class JdbcMigrationPreview(
           if previewOptions.includeExactCounts then RowCount.Exact(rows) else RowCount.Unknown)
       }
     }
+    if previewOptions.dataChecks != DataChecks.Skip && plan.mode == PlanMode.Migration && plan.complete then
+      plan.steps.zipWithIndex.collect { case (fill: PlanStep.Fill, index) => (fill, index + 1) }.foreach { (fill, step) =>
+        val table = plan.previous.tables.find(_.columns.exists(_.id == fill.column))
+          .orElse(plan.target.tables.find(_.columns.exists(_.id == fill.column))).get
+        val description = s"Rows of ${table.name.display} that backfill '${fill.backfill.id}' reads"
+        checks.run(PreviewCheck.RowEstimate, description, required = false, Some(step), Some(fill.column.value)) {
+          val rows = plan.previous.tables.find(_.id == table.id).flatMap(t => backend.estimateRows(connection, t.name))
+          PreviewCheck(PreviewCheck.RowEstimate, description, CheckStatus.Passed, false, Some(step), Some(fill.column.value),
+            rows = rows.fold(RowCount.Unknown)(RowCount.Estimate(_)))
+        }
+      }

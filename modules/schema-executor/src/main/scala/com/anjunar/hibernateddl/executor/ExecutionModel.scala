@@ -145,6 +145,8 @@ trait PreviewBackend extends PlanningBackend:
     * matching rows when `count` is set.
     */
   def dataCheck(connection: Connection, query: DataQuery, count: Boolean): Long
+  /** The table's row count as the database last estimated it, if it has one. */
+  def estimateRows(connection: Connection, table: QualifiedName): Option[Long]
 
 /** Connection-taking methods run inside one executor-owned transaction.
   * validate and render run before a connection is acquired or while planning under

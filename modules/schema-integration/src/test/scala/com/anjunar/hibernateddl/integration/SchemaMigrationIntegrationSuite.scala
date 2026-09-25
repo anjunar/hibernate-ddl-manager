@@ -164,6 +164,24 @@ class SchemaMigrationIntegrationSuite extends TestPostgres:
     }
   }
 
+  test("the preview uses the same options, target and backfills as the migration; the exports read back") {
+    withDatabase { ds =>
+      withMetadata(ds, Seq(classOf[Member]))(metadata => HibernateSchemaMigration.migrate(metadata, ds))
+      execute(ds, "INSERT INTO public.member VALUES (1, NULL)")
+      withMetadata(ds, Seq(classOf[RequiredMember])) { metadata =>
+        val report = HibernateSchemaMigration.preview(metadata, ds)
+        assertEquals(report.outcome, PreviewOutcome.Ready, PreviewRendering.text(report))
+        assertEquals(report.steps.map(_.kind), Vector("fill", "null check", "ddl"))
+        val target = HibernateSchemaSource.read(metadata).toOption.get
+        assertEquals(SchemaModelJson.decode(HibernateSchemaMigration.exportTarget(metadata)), Right(target))
+        assertEquals(BackfillJson.decode(HibernateSchemaMigration.exportBackfills(metadata)), Right(Vector(TestBackfills.nick)))
+        assert(intercept[MigrationException](HibernateSchemaMigration.preview(metadata, ds, backfills = Vector(TestBackfills.nick)))
+          .getMessage.contains("registered 2 times"))
+      }
+      assertEquals(scalar(ds, "SELECT count(*) FROM public.member WHERE nick IS NULL"), "1")
+    }
+  }
+
   test("settings carry approvals: removing an entity drops its table and sequence only when approved") {
     withDatabase { ds =>
       withSessionFactory(ds, entities, enabled)(_ => ())
