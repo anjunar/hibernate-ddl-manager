@@ -1,6 +1,6 @@
 package com.anjunar.hibernateddl.hibernate
 
-import com.anjunar.hibernateddl.hibernate.annotation.SchemaId
+import com.anjunar.hibernateddl.hibernate.annotation.{SchemaId, SecondaryTableId}
 import jakarta.persistence.*
 import org.hibernate.annotations.{NaturalId, OnDelete, OnDeleteAction}
 
@@ -179,6 +179,27 @@ class Shelf:
 class Folder:
   @SchemaId("a0b1c2d3") @ElementCollection var files: java.util.Set[String] = new java.util.HashSet[String]()
 
+/** A secondary table with its own stable ID, and large objects (@Lob) in both tables. */
+@Entity
+@SchemaId("29384a5b")
+@SecondaryTable(name = "profile_details")
+@SecondaryTableId(table = "profile_details", value = "3a4b5c6d")
+class Profile:
+  @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+  @SchemaId("1b2c3d4e") var name: String = uninitialized
+  @SchemaId("2c3d4e5f") @Column(table = "profile_details") var bio: String = uninitialized
+  @SchemaId("3d4e5f60") @Lob @Column(table = "profile_details") var essay: String = uninitialized
+  @SchemaId("4e5f6071") @Lob var picture: Array[Byte] = uninitialized
+
+/** A secondary table without @SecondaryTableId, and one that names no secondary table. */
+@Entity
+@SchemaId("4b5c6d7e")
+@SecondaryTable(name = "unlabelled_details")
+@SecondaryTableId(table = "elsewhere", value = "5c6d7e8f")
+class Unlabelled:
+  @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+  @SchemaId("1b2c3d4e") @Column(table = "unlabelled_details") var extra: String = uninitialized
+
 /** SINGLE_TABLE, the default: one table with a discriminator; subclasses add their columns. */
 @Entity
 @SchemaId("1a2b3c4e")
@@ -247,7 +268,7 @@ class Measurement:
 @Table(indexes = Array(new Index(columnList = "code", options = "WHERE code IS NOT NULL")))
 class Unsupported:
   @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
-  @SchemaId("4a1b2c3d") @Lob var document: String = uninitialized
+  @SchemaId("4a1b2c3d") @org.hibernate.annotations.JdbcTypeCode(org.hibernate.`type`.SqlTypes.JSON) var document: String = uninitialized
   @SchemaId("1a1b2c3d") @ManyToOne @OnDelete(action = OnDeleteAction.CASCADE) var customer: LegacyCustomer = uninitialized
   @SchemaId("2a1b2c3d") @Embedded var folder: Folder = uninitialized
   @SchemaId("3a1b2c3d") var code: String = uninitialized
