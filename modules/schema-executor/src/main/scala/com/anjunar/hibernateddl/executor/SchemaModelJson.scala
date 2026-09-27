@@ -9,10 +9,10 @@ import scala.util.control.NoStackTrace
   * the text survives any transport unchanged. Reading is strict: an unknown format version, a
   * missing or unknown field and an unknown type are errors, never skipped. Format 2 added
   * foreign keys, format 3 unique keys, format 4 indexes, format 5 column checks and format 6
-  * identity columns and sequences; the earlier formats are still read.
+  * identity columns and sequences, format 7 named table checks; the earlier formats are still read.
   */
 object SchemaModelJson:
-  val FormatVersion = 6
+  val FormatVersion = 7
   private val VarcharType = """varchar\((\d+)\)""".r
   private val TimestampType = """timestamp\((\d+)\)""".r
   private val TimestampWithTimeZoneType = """timestamp\((\d+)\) with time zone""".r
@@ -52,7 +52,8 @@ object SchemaModelJson:
         s""""columns":${list(columns)},"primaryKey":${ids(table.primaryKey)},""" +
         s""""foreignKeys":${list(table.foreignKeys.map(foreignKey))},""" +
         s""""uniqueKeys":${list(table.uniqueKeys.map(key => s"""{"columns":${ids(key.columns)}}"""))},""" +
-        s""""indexes":${list(table.indexes.map(index => s"""{"columns":${list(index.columns.map(indexColumn))}}"""))}}"""
+        s""""indexes":${list(table.indexes.map(index => s"""{"columns":${list(index.columns.map(indexColumn))}}"""))},""" +
+        s""""checks":${list(table.checks.map(check => s"""{"name":${string(check.name.value)},"expression":${string(check.expression)}}"""))}}"""
     }
     val sequences = model.sequences.map { sequence =>
       s"""{"id":${string(sequence.id.value)},"catalog":${optional(sequence.name.catalog)},""" +
@@ -133,7 +134,7 @@ object SchemaModelJson:
     val common = Set("id", "catalog", "schema", "name", "columns", "primaryKey")
     val table = fields(json, "Table",
       common ++ Option.when(format >= 2)("foreignKeys") ++ Option.when(format >= 3)("uniqueKeys") ++
-        Option.when(format >= 4)("indexes"))
+        Option.when(format >= 4)("indexes") ++ Option.when(format >= 7)("checks"))
     val id = string(table("id"), "Table id")
     def label(field: String) = s"Table '$id' $field"
     TableModel(
@@ -150,7 +151,11 @@ object SchemaModelJson:
         val label = s"Unique key in table '$id'"
         UniqueKeyModel(ids(fields(key, label, Set("columns"))("columns"), s"$label columns"))
       }),
-      table.get("indexes").fold(Vector.empty)(indexes => array(indexes, label("indexes")).map(readIndex(_, id)))
+      table.get("indexes").fold(Vector.empty)(indexes => array(indexes, label("indexes")).map(readIndex(_, id))),
+      table.get("checks").fold(Vector.empty)(checks => array(checks, label("checks")).map { check =>
+        val entry = fields(check, label("check"), Set("name", "expression"))
+        TableCheck(SqlIdentifier(string(entry("name"), label("check name"))), string(entry("expression"), label("check expression")))
+      })
     )
 
   private def readIndex(json: Json, tableId: String): IndexModel =

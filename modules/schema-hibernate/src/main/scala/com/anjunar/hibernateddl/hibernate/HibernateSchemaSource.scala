@@ -381,7 +381,14 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
       }
       val byColumn = owned.map(o => o.column -> o).toMap
       val columnIds = byColumn.view.mapValues(o => SchemaId(o.path.mkString("/"))).toMap
-      if !table.getChecks.isEmpty then errors += s"Table ${table.getName} of $description has check constraints; unsupported"
+      val tableChecks = table.getChecks.asScala.toVector.flatMap { check =>
+        val name = Option(check.getName).filterNot(_.isBlank)
+        if name.isEmpty then errors += s"Table ${table.getName} of $description has an unnamed check; give it an explicit name"
+        options(check.getOptions).foreach(value =>
+          errors += s"Check ${name.getOrElse("<unnamed>")} of $description has options '$value'; unsupported")
+        name.filter(_ => options(check.getOptions).isEmpty).map(value =>
+          TableCheck(SqlIdentifier(value), check.getConstraint))
+      }
       options(table.getOptions).foreach(options => errors += s"Table ${table.getName} of $description has options '$options'; unsupported")
       Option(table.getPrimaryKey).flatMap(key => options(key.getOptions)).foreach { options =>
         errors += s"Primary key of $description has options '$options'; unsupported"
@@ -409,7 +416,7 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
       }
       tableId.map { id =>
         Mapped(label, description, table, TableModel(SchemaId(id), qualifiedName(table), columnModels, primaryKey,
-          uniqueKeys = uniqueKeyModels, indexes = indexes(table, description, columnIds)), columnIds)
+          uniqueKeys = uniqueKeyModels, indexes = indexes(table, description, columnIds), checks = tableChecks), columnIds)
       }
 
     /** @Index becomes a plain index; @Index(unique = true) is a unique key in Hibernate's model. */
