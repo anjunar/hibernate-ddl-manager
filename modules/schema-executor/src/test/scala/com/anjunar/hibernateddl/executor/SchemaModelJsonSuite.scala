@@ -26,12 +26,12 @@ class SchemaModelJsonSuite extends munit.FunSuite:
 
   test("encoding is compact, readable and round-trips every type") {
     val json = SchemaModelJson.encode(model)
-    assert(json.startsWith("""{"format":6,"tables":[{"id":"7f3a9c21","catalog":null,"schema":"public","name":"customer","""), json)
+    assert(json.startsWith("""{"format":7,"tables":[{"id":"7f3a9c21","catalog":null,"schema":"public","name":"customer","""), json)
     assert(json.contains(""""type":"varchar(80)","nullable":true,"check":null,"identity":false"""), json)
     assert(json.contains(""""type":"timestamp(6)","nullable":false,"check":null,"identity":false"""), json)
     assert(json.contains(""""type":"timestamp(3) with time zone","nullable":true,"check":null,"identity":false"""), json)
     assert(json.contains(""""type":"uuid""""), json)
-    assert(json.endsWith(""""primaryKey":["7f3a9c21/0a1b2c3d"],"foreignKeys":[],"uniqueKeys":[],"indexes":[]}],"sequences":[]}"""), json)
+    assert(json.endsWith(""""primaryKey":["7f3a9c21/0a1b2c3d"],"foreignKeys":[],"uniqueKeys":[],"indexes":[],"checks":[]}],"sequences":[]}"""), json)
     assertEquals(SchemaModelJson.decode(json), Right(model))
     assertEquals(SchemaModelJson.decode(SchemaModelJson.encode(SchemaModel(Vector.empty))), Right(SchemaModel(Vector.empty)))
   }
@@ -199,10 +199,10 @@ class SchemaModelJsonSuite extends munit.FunSuite:
 
   test("other format versions, missing or unknown fields and unknown types are rejected") {
     val json = SchemaModelJson.encode(model)
-    assert(failure(json.replace("\"format\":6", "\"format\":7")).contains("format 7 is unsupported"))
-    assert(failure(json.replace("\"format\":6", "\"format\":0")).contains("format 0 is unsupported"))
+    assert(failure(json.replace("\"format\":7", "\"format\":8")).contains("format 8 is unsupported"))
+    assert(failure(json.replace("\"format\":7", "\"format\":0")).contains("format 0 is unsupported"))
     assert(failure(json.replace(",\"sequences\":[]", "")).contains("expected format, sequences, tables"))
-    assert(failure(json.replace(",\"foreignKeys\":[]", "")).contains("expected catalog, columns, foreignKeys"))
+    assert(failure(json.replace(",\"foreignKeys\":[]", "")).contains("expected catalog, checks, columns, foreignKeys"))
     assert(failure(json.replace("\"foreignKeys\":[]", "\"foreignKeys\":[{\"columns\":[]}]")).contains("referencedTable"))
     assert(failure("""{"tables":[]}""").contains("format is missing"))
     assert(failure(json.replace("\"catalog\":null,", "")).contains("expected catalog"))
