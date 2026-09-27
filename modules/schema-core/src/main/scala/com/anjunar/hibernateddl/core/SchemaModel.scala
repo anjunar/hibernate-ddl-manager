@@ -69,6 +69,12 @@ final case class IndexModel(columns: Vector[IndexColumn]):
   def display: String =
     columns.map(c => if c.descending then s"${c.column.value} DESC" else c.column.value).mkString("(", ", ", ")")
 
+/** A named table CHECK with a trusted SQL predicate from the application mapping.
+  * Its name and expression are retained in history. Changes to the predicate, or column
+  * renames/drops in its table, require a manual migration because the SQL is not parsed.
+  */
+final case class TableCheck(name: SqlIdentifier, expression: String)
+
 /** The primary key lists column IDs in key order, so column renames keep it intact. */
 final case class TableModel(
     id: SchemaId,
@@ -77,7 +83,8 @@ final case class TableModel(
     primaryKey: Vector[SchemaId] = Vector.empty,
     foreignKeys: Vector[ForeignKeyModel] = Vector.empty,
     uniqueKeys: Vector[UniqueKeyModel] = Vector.empty,
-    indexes: Vector[IndexModel] = Vector.empty
+    indexes: Vector[IndexModel] = Vector.empty,
+    checks: Vector[TableCheck] = Vector.empty
 )
 
 /** An ascending bigint sequence, as Hibernate uses for generated keys. Only the start and the
@@ -106,6 +113,15 @@ object SchemaValidation:
           "expected an ascending sequence starting at 1 or later"
     }
     model.tables.foreach { table =>
+      table.checks.groupBy(_.name).foreach { (name, checks) =>
+        if checks.size > 1 then errors += s"Duplicate check name '${name.value}' in table '${table.id.value}'"
+      }
+      table.checks.foreach { check =>
+        if check.expression == null || check.expression.trim.isEmpty then
+          errors += s"Check '${check.name.value}' of table '${table.id.value}' has no expression"
+        else if Vector("\u0000", ";", "--", "/*", "*/").exists(check.expression.contains) then
+          errors += s"Check '${check.name.value}' of table '${table.id.value}' contains a statement separator, comment or NUL; unsupported"
+      }
       table.columns.groupBy(_.name).foreach { (name, columns) =>
         if columns.size > 1 then
           errors += s"Duplicate physical column name '${name.value}' in table '${table.id.value}'"

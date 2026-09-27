@@ -122,7 +122,12 @@ object PostgreSqlDialect extends SchemaDialect:
       table.indexes.flatMap(_.columns.map(_.column)).filterNot(id => table.columns.exists(_.id == id)).map { id =>
         s"A $label index references unknown column '${id.value}'."
       } ++
-      Option.when(table.indexes.exists(_.columns.isEmpty))(s"A $label index has no columns.").toVector
+      Option.when(table.indexes.exists(_.columns.isEmpty))(s"A $label index has no columns.").toVector ++
+      table.checks.flatMap(check => validateIdentifier(check.name, s"$label check")) ++
+      table.checks.filter(check => table.columns.exists(column =>
+        column.check.exists(value => checkName(column.id, value) == check.name))).map(check =>
+        s"The $label check '${check.name.value}' collides with a generated column check.") ++
+      SchemaValidation.validate(SchemaModel(Vector(table.copy(foreignKeys = Vector.empty))))
 
   private def validateColumn(column: ColumnModel, label: String): Vector[String] =
     validateIdentifier(column.name, label) ++ column.check.toVector.flatMap(validateCheck(_, label)) ++
@@ -186,7 +191,7 @@ object PostgreSqlDialect extends SchemaDialect:
           val names = key.columns.map(id => quoted(table.columns.find(_.id == id).get.name))
           s"UNIQUE (${names.mkString(", ")})"
         }
-        val definitions = table.columns.map(renderColumn) ++ primaryKey ++ uniqueKeys
+        val definitions = table.columns.map(renderColumn) ++ primaryKey ++ uniqueKeys ++ table.checks.map(renderTableCheck)
         s"CREATE TABLE ${qualified(table.name)} (${definitions.mkString(", ")});"
       case SchemaOperation.AddColumn(_, table, column) =>
         s"ALTER TABLE ${qualified(table)} ADD COLUMN ${renderColumn(column)};"
@@ -342,11 +347,13 @@ object PostgreSqlDialect extends SchemaDialect:
   private[postgresql] def nullCount(table: QualifiedName, column: SqlIdentifier): String =
     s"SELECT count(*) FROM ${qualified(table)} WHERE ${quoted(column)} IS NULL"
 
-  /** A temporary table whose columns carry exactly the given columns' checks, as this dialect
-    * creates them, so that PostgreSQL can show their canonical definitions for comparison.
-    */
-  private[postgresql] def checkProbe(table: SqlIdentifier, columns: Vector[ColumnModel]): String =
-    val definitions = columns.map(column => renderColumn(column.copy(nullable = true, identity = false)))
+  private def renderTableCheck(check: TableCheck): String =
+    s"CONSTRAINT ${quoted(check.name)} CHECK (${check.expression})"
+
+  /** Recreates column and table checks on a temporary table for PostgreSQL normalization. */
+  private[postgresql] def checkProbe(table: SqlIdentifier, model: TableModel): String =
+    val definitions = model.columns.map(column => renderColumn(column.copy(nullable = true, identity = false))) ++
+      model.checks.map(renderTableCheck)
     s"CREATE TEMPORARY TABLE ${quoted(table)} (${definitions.mkString(", ")}) ON COMMIT DROP"
 
   /** Check constraints are named after the column ID and the check, so a plan can replace a

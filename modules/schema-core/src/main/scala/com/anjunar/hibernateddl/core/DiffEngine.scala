@@ -66,6 +66,14 @@ object DiffEngine:
 
       val oldColumns = oldTable.columns.map(c => c.id -> c).toMap
       val newColumns = newTable.columns.map(c => c.id -> c).toMap
+      if oldTable.checks.toSet != newTable.checks.toSet then
+        errors += s"Changing named table checks of table '${id.value}' is unsupported; manual migration required"
+      if oldTable.checks.nonEmpty &&
+          (oldColumns.keySet -- newColumns.keySet).nonEmpty then
+        errors += s"Dropping columns of table '${id.value}' with named table checks requires manual migration"
+      if oldTable.checks.nonEmpty &&
+          (oldColumns.keySet intersect newColumns.keySet).exists(columnId => oldColumns(columnId).name != newColumns(columnId).name) then
+        errors += s"Renaming columns of table '${id.value}' with named table checks requires manual migration"
       val dropped = (oldColumns.keySet -- newColumns.keySet).toVector.sortBy(_.value)
       dropped.foreach { columnId =>
         droppedColumns += SchemaOperation.DropColumn(id, newTable.name, columnId, oldColumns(columnId).name)

@@ -657,8 +657,9 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
     val checked = expected.columns.filter(_.check.nonEmpty)
     val byName = checked.map(column => PostgreSqlDialect.checkName(column.id, column.check.get).value -> column).toMap
     val expectedChecks = byName.view.mapValues(_.name.value).toMap
+    val tableChecks = expected.checks.map(check => check.name.value -> check).toMap
     val expectedDefinitions = mode match
-      case CheckMode.Probe if checked.nonEmpty => checkDefinitions(connection, checked)
+      case CheckMode.Probe if checked.nonEmpty || tableChecks.nonEmpty => checkDefinitions(connection, expected)
       case _ => Map.empty[String, String]
     val actualChecks = query(connection,
       """SELECT k.conname, k.convalidated, pg_catalog.pg_get_constraintdef(k.oid) AS definition,
@@ -675,7 +676,18 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
     val actualNames = actualChecks.map(_._1).toSet
     actualChecks.flatMap { (name, validated, definition, columns) =>
       Option.when(!validated)(s"Check constraint ${quoted(name)} of $display has unsupported NOT VALID state.").toVector ++
-        (expectedChecks.get(name) match
+        (tableChecks.get(name) match
+          case Some(_) if !validated => Vector.empty
+          case Some(_) => mode match
+            case CheckMode.Probe if !expectedDefinitions.get(name).contains(definition) =>
+              Vector(s"Database drift: check constraint ${quoted(name)} of $display is $definition; " +
+                s"expected ${expectedDefinitions.getOrElse(name, "a definition PostgreSQL did not produce")}.")
+            case CheckMode.Probe => Vector.empty
+            case CheckMode.Structural(undecided) =>
+              undecided += s"Named table check ${quoted(name)} of $display needs PostgreSQL normalization on a probe table; " +
+                "the read-only preview cannot verify its SQL predicate."
+              Vector.empty
+          case None => expectedChecks.get(name) match
           case None => Vector(s"Database drift: unexpected check constraint ${quoted(name)} in $display.")
           case Some(column) if columns != Vector(column) =>
             Vector(s"Database drift: check constraint ${quoted(name)} of $display covers " +
@@ -699,14 +711,16 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
                   Vector.empty)
     } ++ expectedChecks.toVector.sorted.filterNot((name, _) => actualNames.contains(name)).map { (name, column) =>
       s"Database drift: check constraint ${quoted(name)} on column ${quoted(column)} is missing from $display."
+    } ++ tableChecks.keys.toVector.sorted.filterNot(actualNames.contains).map { name =>
+      s"Database drift: named table check ${quoted(name)} is missing from $display."
     }
 
-  /** The canonical definitions of the given columns' checks, by constraint name, from a
+  /** The canonical definitions of the model's column and table checks, by constraint name, from a
     * temporary probe table that exists only during this call.
     */
-  private def checkDefinitions(connection: Connection, columns: Vector[ColumnModel]): Map[String, String] =
+  private def checkDefinitions(connection: Connection, model: TableModel): Map[String, String] =
     val probe = SqlIdentifier("hibernate_ddl_check_probe")
-    execute(connection, PostgreSqlDialect.checkProbe(probe, columns))
+    execute(connection, PostgreSqlDialect.checkProbe(probe, model))
     try
       query(connection,
         """SELECT k.conname, pg_catalog.pg_get_constraintdef(k.oid) AS definition
