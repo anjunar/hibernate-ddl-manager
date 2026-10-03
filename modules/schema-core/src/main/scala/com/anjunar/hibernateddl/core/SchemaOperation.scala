@@ -112,7 +112,8 @@ object SchemaOperation:
       table: QualifiedName,
       columns: Vector[SqlIdentifier],
       referencedTable: QualifiedName,
-      referencedColumns: Vector[SqlIdentifier]
+      referencedColumns: Vector[SqlIdentifier],
+      onDeleteCascade: Boolean = false
   ) extends SchemaOperation:
     val risk: RiskLevel = RiskLevel.Locking
 

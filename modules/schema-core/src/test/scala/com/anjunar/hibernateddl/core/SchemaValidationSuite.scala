@@ -73,6 +73,21 @@ class SchemaValidationSuite extends munit.FunSuite:
     assert(mistyped.exists(_.contains("has type Integer but references type BigInt")), mistyped)
   }
 
+  test("a cascading foreign key may reference an ordered unique key") {
+    val id = ColumnModel(SchemaId("parent/id"), SqlIdentifier("id"), SqlType.Uuid, nullable = false)
+    val tenant = ColumnModel(SchemaId("parent/tenant"), SqlIdentifier("tenant"), SqlType.Text, nullable = false)
+    val parent = TableModel(SchemaId("parent"), QualifiedName(SqlIdentifier("parent")),
+      Vector(id, tenant), Vector(id.id), uniqueKeys = Vector(UniqueKeyModel(Vector(id.id, tenant.id))))
+    val ref = ColumnModel(SchemaId("child/ref"), SqlIdentifier("parent_id"), SqlType.Uuid, nullable = false)
+    val scope = ColumnModel(SchemaId("child/tenant"), SqlIdentifier("tenant"), SqlType.Text, nullable = false)
+    val key = ForeignKeyModel(Vector(ref.id, scope.id), parent.id, Vector(id.id, tenant.id), onDeleteCascade = true)
+    val child = TableModel(SchemaId("child"), QualifiedName(SqlIdentifier("child")),
+      Vector(ref, scope), foreignKeys = Vector(key))
+    assertEquals(SchemaValidation.validate(SchemaModel(Vector(parent, child))), Vector.empty)
+    val missingUnique = SchemaValidation.validate(SchemaModel(Vector(parent.copy(uniqueKeys = Vector.empty), child)))
+    assert(missingUnique.exists(_.contains("must reference the primary key or a unique key")), missingUnique)
+  }
+
   test("unique keys list existing columns once and are not declared twice") {
     val column = table.columns.head
     def errors(keys: UniqueKeyModel*) = SchemaValidation.validate(SchemaModel(Vector(table.copy(uniqueKeys = keys.toVector))))

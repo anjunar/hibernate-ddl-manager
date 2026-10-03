@@ -61,6 +61,9 @@ class SchemaFingerprintSuite extends munit.FunSuite:
     val model = SchemaModel(Vector(table.copy(columns = Vector(table.columns.head, parent),
       foreignKeys = Vector(ForeignKeyModel(Vector(parent.id), table.id, table.primaryKey)))))
     assertEquals(SchemaFingerprint.of(model), "21ad02d6ea5bab3bdc4eac7924a109696d92ef1fc741f5070e04d581e5d18aa4")
+    val cascade = model.copy(tables = model.tables.map(t => t.copy(
+      foreignKeys = t.foreignKeys.map(_.copy(onDeleteCascade = true)))))
+    assertNotEquals(SchemaFingerprint.of(cascade), SchemaFingerprint.of(model))
   }
 
   test("models with unique keys but without indexes keep the fingerprints that earlier versions stored") {

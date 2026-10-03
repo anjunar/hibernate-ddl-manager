@@ -5,7 +5,7 @@ renames because every table and column carries a stable ID.
 
 | Version | Platform | Scala | License |
 | --- | --- | --- | --- |
-| 1.1.0 | JVM | 3.9 | MIT |
+| 1.2.0 | JVM | 3.9 | MIT |
 
 Documentation: [English](https://docs.anjunar.com/en/hibernate-ddl-manager) · [Deutsch](https://docs.anjunar.com/de/hibernate-ddl-manager)
 Website: [English](https://anjunar.com/en/hibernate-ddl-manager) · [Deutsch](https://anjunar.com/de/hibernate-ddl-manager)
@@ -16,14 +16,14 @@ Website: [English](https://anjunar.com/en/hibernate-ddl-manager) · [Deutsch](ht
 JDBC driver. The artifacts are built with Scala 3.9 for Java 17 or newer, so a Scala project needs Scala 3.9 or later.
 
 ```scala
-libraryDependencies += "com.anjunar.hibernateddl" %% "schema-integration" % "1.1.0"
+libraryDependencies += "com.anjunar.hibernateddl" %% "schema-integration" % "1.2.0"
 ```
 
 ```xml
 <dependency>
   <groupId>com.anjunar.hibernateddl</groupId>
   <artifactId>schema-integration_3</artifactId>
-  <version>1.1.0</version>
+  <version>1.2.0</version>
 </dependency>
 ```
 
@@ -90,7 +90,7 @@ Start with stable IDs and the startup migration; the other pages cover changes t
 
 ## Limits
 
-Version 1.1 targets PostgreSQL 14+ and Hibernate ORM 7.4, with a deliberately narrow scope.
+Version 1.2 targets PostgreSQL 14+ and Hibernate ORM 7.4, with a deliberately narrow scope.
 
 - **Mapped:** the common basic types, enums, generated keys (UUIDs, sequences, identity columns), inheritance with
   all three strategies, `@ManyToOne`, `@OneToOne` and `@ManyToMany`, element collections (sets, lists, ordered lists
@@ -107,9 +107,25 @@ Version 1.1 targets PostgreSQL 14+ and Hibernate ORM 7.4, with a deliberately na
 - `@Lob`, `Blob` and `Clob` become PostgreSQL large objects that are not deleted with their row. Run `vacuumlo`
   regularly; the `lo_manage` trigger is no option because the executor refuses triggers on managed tables.
 
+## Classless Hibernate entities
+
+Version 1.2.0 can read a Hibernate entity that has no Java mapped class when
+one `ClasslessEntitySchemaIdProvider` supplies stable IDs for its table and every
+physical column. Register the Scala provider through
+`META-INF/services/com.anjunar.hibernateddl.hibernate.ClasslessEntitySchemaIdProvider`.
+The schema reader rejects an unclaimed classless entity or missing column ID;
+it never silently excludes that table from migration history.
+
+The schema model also represents a foreign key to an ordered unique key and
+`ON DELETE CASCADE`. PostgreSQL migrations create and validate both. Changing
+an existing foreign key's target or delete action still requires a manual
+migration. For composite keys, schema reading follows Hibernate's
+column-ordering strategy, so an existing Hibernate-created table can pass
+strict adoption. Older schema-history JSON and fingerprints remain readable.
+
 ## Named table CHECK constraints
 
-Version 1.1.0 also reads explicitly named table checks from JPA `@Table(check = ...)`
+Version 1.1.0 added explicitly named table checks from JPA `@Table(check = ...)`
 and Hibernate `@Check`. For example:
 
 ```scala
@@ -129,9 +145,10 @@ New tables receive the checks; adoption and subsequent migrations compare their 
 against PostgreSQL's normalized definitions on a temporary table inside the migration
 transaction. A matching name alone never establishes that the rule matches.
 
-The history records names and expressions in model format 7. Formats 1–6 remain readable,
-and models without named table checks retain their existing fingerprints. Older library
-versions cannot read format 7 histories; do not downgrade after writing a new revision.
+Named checks entered history format 7; cascade foreign keys use format 8 in version 1.2.
+Formats 1–7 remain readable, and models without named checks or cascading foreign keys
+retain their existing fingerprints. Older library versions cannot read format 8 histories;
+do not downgrade after writing a new revision.
 
 Adding or widening columns keeps the checks. Changing their names or predicates, adding or
 removing a check on an existing table, and renaming or dropping columns in a checked table
@@ -144,9 +161,17 @@ It reports existing named table checks as inconclusive and its result as `INCOMP
 another finding blocks the plan. Execution verifies the definitions under the migration lock.
 
 Generated enum checks still use names derived from the column's stable ID and allowed values.
-When adopting a schema created outside this manager, rename those constraints to the names
-expected by the model before adoption. Renaming a constraint preserves its definition and data;
-named table checks retain their explicit names.
+When adopting a schema created outside this manager, constraint names must match the model.
+With `hibernate.hbm2ddl.auto=none` and complete Hibernate metadata, use
+`HibernateSchemaMigration.planHibernateCheckRenames(metadata, dataSource)` before adoption.
+It returns `ALTER TABLE ... RENAME CONSTRAINT ...` statements only for unambiguous, validated
+checks whose PostgreSQL definitions match exactly. It covers generated enum checks and named
+table checks. The plan creates a temporary probe table inside a transaction, rolls that
+transaction back, and writes no schema history. Review and apply the SQL separately, then call
+`migrate(metadata, dataSource, ExecutionOptions(adoptExistingSchema = true))`. The migration
+rechecks the entire schema; the plan never hides other drift. A different predicate, missing
+table or check, extra check, ambiguous match, or existing history stops planning. Renaming a
+constraint preserves its definition and data; no automatic startup rename is performed.
 
 ## Modules
 
@@ -205,7 +230,7 @@ Set the version in `build.sbt` and in this README (facts row and installation ex
 changes nothing and fails when the files disagree, as CI does on every push:
 
 ```bash
-scripts/set-version.sh 1.1.0
+scripts/set-version.sh 1.2.0
 scripts/set-version.sh --check
 ```
 

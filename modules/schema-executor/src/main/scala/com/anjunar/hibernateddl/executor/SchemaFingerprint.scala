@@ -75,6 +75,14 @@ object SchemaFingerprint:
         string(out, key.referencedTable.value)
         ids(out, key.referencedColumns)
       }
+    val cascades = foreignKeys.filter(_._2.onDeleteCascade)
+    if cascades.nonEmpty then
+      string(out, "foreign-key-delete-cascade")
+      out.writeInt(cascades.size)
+      cascades.foreach { (tableId, key) =>
+        string(out, tableId.value)
+        ids(out, key.columns)
+      }
     val uniqueKeys = tables.flatMap(table => table.uniqueKeys.sortBy(_.columns.map(_.value)).map(table.id -> _))
     if uniqueKeys.nonEmpty then
       string(out, "unique-keys")

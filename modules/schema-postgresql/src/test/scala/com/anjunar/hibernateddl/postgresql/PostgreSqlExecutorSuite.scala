@@ -387,12 +387,41 @@ class PostgreSqlExecutorSuite extends TestPostgres:
     }
   }
 
+  test("tenant-scoped unique target and ON DELETE CASCADE migrate and validate on restart") {
+    withDatabase { ds =>
+      val parentId = ColumnModel(SchemaId("parent/id"), SqlIdentifier("id"), SqlType.Uuid, nullable = false)
+      val parentTenant = ColumnModel(SchemaId("parent/tenant"), SqlIdentifier("tenant"), SqlType.Text, nullable = false)
+      val parent = TableModel(SchemaId("parent"), QualifiedName(SqlIdentifier("parent"), Some(SqlIdentifier("public"))),
+        Vector(parentId, parentTenant), Vector(parentId.id),
+        uniqueKeys = Vector(UniqueKeyModel(Vector(parentId.id, parentTenant.id))))
+      val ref = ColumnModel(SchemaId("translation/ref"), SqlIdentifier("page_id"), SqlType.Uuid, nullable = false)
+      val locale = ColumnModel(SchemaId("translation/locale"), SqlIdentifier("locale"), SqlType.Text, nullable = false)
+      val scope = ColumnModel(SchemaId("translation/tenant"), SqlIdentifier("tenant"), SqlType.Text, nullable = false)
+      val translation = TableModel(SchemaId("translation"),
+        QualifiedName(SqlIdentifier("translation"), Some(SqlIdentifier("public"))),
+        Vector(ref, locale, scope), Vector(ref.id, locale.id),
+        foreignKeys = Vector(ForeignKeyModel(Vector(ref.id, scope.id), parent.id,
+          Vector(parentId.id, parentTenant.id), onDeleteCascade = true)))
+      val model = SchemaModel(Vector(parent, translation))
+      assertEquals(executor.migrate(ds, model).status, MigrationStatus.Applied)
+      assertEquals(executor.migrate(ds, model).status, MigrationStatus.AlreadyApplied)
+      val id = "'00000000-0000-0000-0000-000000000001'"
+      execute(ds, s"INSERT INTO public.parent VALUES ($id, 'tenant-a')")
+      intercept[java.sql.SQLException](execute(ds,
+        s"INSERT INTO public.translation VALUES ($id, 'de', 'tenant-b')"))
+      execute(ds, s"INSERT INTO public.translation VALUES ($id, 'de', 'tenant-a')")
+      execute(ds, s"DELETE FROM public.parent WHERE id = $id")
+      assertEquals(scalar(ds, "SELECT count(*) FROM public.translation"), "0")
+      assertEquals(executor.migrate(ds, model).status, MigrationStatus.AlreadyApplied)
+    }
+  }
+
   test("missing, extra and cascading foreign keys and references from unmodeled tables block the start") {
     Vector(
       "ALTER TABLE public.invoice DROP CONSTRAINT invoice_customer_id_fkey" -> "is missing from",
       "ALTER TABLE public.invoice ADD FOREIGN KEY (customer_id) REFERENCES crm.customer (id)" -> "unexpected foreign key",
       "ALTER TABLE public.invoice DROP CONSTRAINT invoice_customer_id_fkey, " +
-        "ADD FOREIGN KEY (customer_id) REFERENCES crm.customer (id) ON DELETE CASCADE" -> "unsupported ON DELETE action",
+        "ADD FOREIGN KEY (customer_id) REFERENCES crm.customer (id) ON DELETE CASCADE" -> "unexpected foreign key",
       "CREATE TABLE public.audit (customer_id bigint REFERENCES crm.customer (id))" -> "unmodeled table \"public\".\"audit\""
     ).foreach { (change, message) =>
       withDatabase { ds =>
@@ -770,14 +799,26 @@ class PostgreSqlExecutorSuite extends TestPostgres:
       val checks = for table <- model.tables; column <- table.columns; check <- column.check yield (table, column, check)
       assertEquals(checks.map((t, c, _) => s"${t.name.name.value}.${c.name.value}").sorted,
         Vector("animal.dtype", "article_statuses.statuses", "letter.Stage", "letter.priority", "letter.status"))
-      for (table, column, check) <- checks do
-        val relation = s"\"${table.name.schema.get.value}\".\"${table.name.name.value}\""
-        val current = scalar(ds, "SELECT k.conname FROM pg_constraint k JOIN pg_attribute a " +
-          "ON a.attrelid = k.conrelid AND a.attnum = ALL (k.conkey) " +
-          s"WHERE k.conrelid = '$relation'::regclass AND k.contype = 'c' AND a.attname = '${column.name.value}'")
-        execute(ds, s"ALTER TABLE $relation RENAME CONSTRAINT \"$current\" TO " +
-          s"\"${PostgreSqlDialect.checkName(column.id, check).value}\"")
+      val renames = PostgreSqlMigrationBackend.planHibernateCheckRenames(ds, model)
+        .fold(errors => fail(errors.mkString("; ")), identity)
+      assertEquals(renames.size, checks.size)
+      noHistory(ds)
+      renames.foreach(execute(ds, _))
       assertEquals(adopting.migrate(ds, model), MigrationResult(1, MigrationStatus.Adopted, 0))
+    }
+  }
+
+  test("the check rename plan refuses a changed Hibernate constraint") {
+    import com.anjunar.hibernateddl.hibernate.*
+    val model = TestMetadata.read(classOf[Letter]).fold(errors => fail(errors.mkString("; ")), identity)
+    withDatabase { ds =>
+      execute(ds, TestMetadata.createScript(classOf[Letter]))
+      execute(ds, "ALTER TABLE public.letter DROP CONSTRAINT letter_status_check")
+      execute(ds, "ALTER TABLE public.letter ADD CONSTRAINT letter_status_check CHECK (status IN ('Draft'))")
+      val plan = PostgreSqlMigrationBackend.planHibernateCheckRenames(ds, model)
+      assert(plan.isLeft, plan)
+      assert(plan.swap.toOption.get.exists(_.contains("No equivalent check")), plan)
+      noHistory(ds)
     }
   }
 

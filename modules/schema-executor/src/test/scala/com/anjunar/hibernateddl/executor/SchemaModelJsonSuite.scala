@@ -26,7 +26,7 @@ class SchemaModelJsonSuite extends munit.FunSuite:
 
   test("encoding is compact, readable and round-trips every type") {
     val json = SchemaModelJson.encode(model)
-    assert(json.startsWith("""{"format":7,"tables":[{"id":"7f3a9c21","catalog":null,"schema":"public","name":"customer","""), json)
+    assert(json.startsWith("""{"format":8,"tables":[{"id":"7f3a9c21","catalog":null,"schema":"public","name":"customer","""), json)
     assert(json.contains(""""type":"varchar(80)","nullable":true,"check":null,"identity":false"""), json)
     assert(json.contains(""""type":"timestamp(6)","nullable":false,"check":null,"identity":false"""), json)
     assert(json.contains(""""type":"timestamp(3) with time zone","nullable":true,"check":null,"identity":false"""), json)
@@ -62,8 +62,24 @@ class SchemaModelJsonSuite extends munit.FunSuite:
       foreignKeys = Vector(ForeignKeyModel(Vector(parent.id), customer.id, customer.primaryKey)))
     val json = SchemaModelJson.encode(SchemaModel(Vector(linked)))
     assert(json.contains(""""foreignKeys":[{"columns":["7f3a9c21/7c8d9e0f"],"referencedTable":"7f3a9c21",""" +
-      """"referencedColumns":["7f3a9c21/0a1b2c3d"]}]"""), json)
+      """"referencedColumns":["7f3a9c21/0a1b2c3d"],"onDeleteCascade":false}]"""), json)
     assertEquals(SchemaModelJson.decode(json), Right(SchemaModel(Vector(linked))))
+  }
+
+  test("format 7 foreign keys default to no cascade; format 8 records cascade") {
+    val parent = ColumnModel(SchemaId("7f3a9c21/7c8d9e0f"), SqlIdentifier("parent_id"), SqlType.Uuid)
+    val oldKey = ForeignKeyModel(Vector(parent.id), customer.id, customer.primaryKey)
+    val plain = SchemaModel(Vector(customer.copy(columns = customer.columns :+ parent,
+      foreignKeys = Vector(oldKey))))
+    val written = SchemaModelJson.encode(plain)
+    val legacy = written.replace("\"format\":8", "\"format\":7")
+      .replace(",\"onDeleteCascade\":false", "")
+    assertEquals(SchemaModelJson.decode(legacy), Right(plain))
+    val cascading = plain.copy(tables = plain.tables.map(_.copy(
+      foreignKeys = Vector(oldKey.copy(onDeleteCascade = true)))))
+    assertEquals(SchemaModelJson.decode(SchemaModelJson.encode(cascading)), Right(cascading))
+    assert(failure(SchemaModelJson.encode(cascading).replace("\"onDeleteCascade\":true",
+      "\"onDeleteCascade\":null")).contains("onDeleteCascade must be true or false"))
   }
 
   test("every column type has a JSON name and round-trips") {
@@ -199,8 +215,8 @@ class SchemaModelJsonSuite extends munit.FunSuite:
 
   test("other format versions, missing or unknown fields and unknown types are rejected") {
     val json = SchemaModelJson.encode(model)
-    assert(failure(json.replace("\"format\":7", "\"format\":8")).contains("format 8 is unsupported"))
-    assert(failure(json.replace("\"format\":7", "\"format\":0")).contains("format 0 is unsupported"))
+    assert(failure(json.replace("\"format\":8", "\"format\":9")).contains("format 9 is unsupported"))
+    assert(failure(json.replace("\"format\":8", "\"format\":0")).contains("format 0 is unsupported"))
     assert(failure(json.replace(",\"sequences\":[]", "")).contains("expected format, sequences, tables"))
     assert(failure(json.replace(",\"foreignKeys\":[]", "")).contains("expected catalog, checks, columns, foreignKeys"))
     assert(failure(json.replace("\"foreignKeys\":[]", "\"foreignKeys\":[{\"columns\":[]}]")).contains("referencedTable"))

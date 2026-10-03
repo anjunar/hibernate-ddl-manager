@@ -45,14 +45,15 @@ final case class ColumnModel(
     identity: Boolean = false
 )
 
-/** A foreign key references the primary key of a table in the same model. Columns and
+/** A foreign key references the primary key or a unique key of a table in the same model. Columns and
   * referenced columns pair up in key order; both are IDs, so renames keep the key intact.
   * A table has at most one foreign key per column list, which is its identity.
   */
 final case class ForeignKeyModel(
     columns: Vector[SchemaId],
     referencedTable: SchemaId,
-    referencedColumns: Vector[SchemaId]
+    referencedColumns: Vector[SchemaId],
+    onDeleteCascade: Boolean = false
 ):
   def display: String = columns.map(_.value).mkString("(", ", ", ")")
 
@@ -220,8 +221,9 @@ object SchemaValidation:
       Option.when(key.columns.distinct.size != key.columns.size)(s"$label lists a column more than once"),
       Option.when(referenced.isEmpty)(s"$label references unknown table '${key.referencedTable.value}'"),
       referenced.flatMap { target =>
-        Option.when(target.primaryKey.isEmpty || key.referencedColumns != target.primaryKey)(
-          s"$label must reference the primary key of table '${target.id.value}'")
+        Option.when(key.referencedColumns != target.primaryKey &&
+          !target.uniqueKeys.exists(_.columns == key.referencedColumns))(
+          s"$label must reference the primary key or a unique key of table '${target.id.value}'")
       }
     ).flatten ++ key.columns.filterNot(id => table.columns.exists(_.id == id)).map { id =>
       s"$label references unknown column '${id.value}'"
