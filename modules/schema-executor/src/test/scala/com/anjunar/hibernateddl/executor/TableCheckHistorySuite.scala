@@ -8,7 +8,7 @@ class TableCheckHistorySuite extends FunSuite:
     Vector(ColumnModel(SchemaId("id"), SqlIdentifier("id"), SqlType.Integer)))
   private val check = TableCheck(SqlIdentifier("quoted \"check\""), "id > 0 AND 'é' = 'é'")
 
-  test("named checks round-trip with strict format 7 fields") {
+  test("named checks round-trip with strict format 8 fields") {
     val model = SchemaModel(Vector(table.copy(checks = Vector(check))))
     val json = SchemaModelJson.encode(model)
     assertEquals(SchemaModelJson.decode(json), Right(model))
@@ -18,7 +18,7 @@ class TableCheckHistorySuite extends FunSuite:
 
   test("format 6 models remain readable without table checks") {
     val model = SchemaModel(Vector(table))
-    val legacy = SchemaModelJson.encode(model).replace("\"format\":7", "\"format\":6")
+    val legacy = SchemaModelJson.encode(model).replace("\"format\":8", "\"format\":6")
       .replace(",\"checks\":[]", "")
     assertEquals(SchemaModelJson.decode(legacy), Right(model))
   }

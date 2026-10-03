@@ -4,6 +4,7 @@ import com.anjunar.hibernateddl.core.*
 import com.anjunar.hibernateddl.executor.*
 
 import java.sql.{Connection, PreparedStatement, ResultSet, SQLException}
+import javax.sql.DataSource
 import scala.util.Using
 
 /** Transactional migration for PostgreSQL 14 and newer.
@@ -96,6 +97,77 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
       val differences = tables.flatMap(table => inspectTable(connection, table, expected, CheckMode.Structural(undecided))) ++
         expected.sequences.flatMap(inspectSequence(connection, _))
       Inspection(differences.distinct.sorted, undecided.result().distinct.sorted)
+
+  /** Read-only plan for giving Hibernate-created checks the stable names required by adoption.
+    * The only DDL executed here is on temporary probe tables and is rolled back. The caller
+    * must review and apply the returned statements separately, then retry normal adoption.
+    * Ambiguous, unvalidated or differently defined checks are never renamed.
+    */
+  def planHibernateCheckRenames(dataSource: DataSource, expected: SchemaModel): Either[Vector[String], Vector[String]] =
+    val invalid = validateModel(expected)
+    if invalid.nonEmpty then Left(invalid)
+    else Using.resource(dataSource.getConnection) { connection =>
+      if !connection.getAutoCommit then Left(Vector("Check-rename planning requires a non-JTA auto-commit connection."))
+      else
+        connection.setAutoCommit(false)
+        try
+          checkServer(connection, ExecutionOptions())
+          if readHistoryIfPresent(connection).isDefined then
+            Left(Vector("Check names cannot be prepared after schema history has been created."))
+          else
+            final case class Actual(name: String, validated: Boolean, definition: String, columns: Vector[String])
+            val errors = Vector.newBuilder[String]
+            val statements = Vector.newBuilder[String]
+            expected.tables.sortBy(table => qualified(table.name)).foreach { table =>
+              val display = qualified(table.name)
+              relationOid(connection, table.name) match
+                case None => errors += s"Table $display does not exist."
+                case Some(oid) =>
+                  val wanted = table.columns.flatMap(column => column.check.map { check =>
+                    (PostgreSqlDialect.checkName(column.id, check).value, Some(Vector(column.name.value)))
+                  }) ++ table.checks.map(check => (check.name.value, None))
+                  val expectedDefinitions = if wanted.nonEmpty then checkDefinitions(connection, table) else Map.empty[String, String]
+                  val actual = query(connection,
+                    """SELECT k.conname, k.convalidated, pg_catalog.pg_get_constraintdef(k.oid) AS definition,
+                      |       ARRAY(SELECT CAST(a.attname AS pg_catalog.text)
+                      |             FROM pg_catalog.unnest(k.conkey) AS u(attnum)
+                      |             JOIN pg_catalog.pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = u.attnum
+                      |             ORDER BY a.attname) AS columns
+                      |FROM pg_catalog.pg_constraint k
+                      |WHERE k.conrelid = CAST(? AS pg_catalog.oid) AND k.contype = 'c'
+                      |ORDER BY k.conname""".stripMargin
+                  )(_.setLong(1, oid)) { row =>
+                    Actual(row.getString("conname"), row.getBoolean("convalidated"),
+                      row.getString("definition"), strings(row, "columns"))
+                  }
+                  val claimed = scala.collection.mutable.Set.empty[String]
+                  wanted.foreach { (name, columns) =>
+                    val definition = expectedDefinitions.get(name)
+                    if definition.isEmpty then errors += s"No PostgreSQL definition for check ${quoted(name)} of $display."
+                    else
+                      val sameName = actual.find(_.name == name)
+                      val candidates = sameName.toVector ++ actual.filter(check =>
+                        check.name != name && !claimed(check.name) && check.validated &&
+                          check.definition == definition.get && columns.forall(_ == check.columns))
+                      candidates match
+                        case Vector(check) if check.validated && check.definition == definition.get &&
+                            columns.forall(_ == check.columns) =>
+                          claimed += check.name
+                          if check.name != name then
+                            statements += s"ALTER TABLE $display RENAME CONSTRAINT ${quoted(check.name)} TO ${quoted(name)}"
+                        case Vector() => errors += s"No equivalent check for ${quoted(name)} of $display."
+                        case Vector(check) => errors += s"Check ${quoted(check.name)} of $display differs or is not validated."
+                        case _ => errors += s"More than one check matches ${quoted(name)} of $display."
+                  }
+                  actual.filterNot(check => claimed(check.name)).foreach(check =>
+                    errors += s"Unexpected check ${quoted(check.name)} of $display.")
+            }
+            val found = errors.result().distinct.sorted
+            if found.nonEmpty then Left(found) else Right(statements.result())
+        finally
+          connection.rollback()
+          connection.setAutoCommit(true)
+    }
 
   override def dataCheck(connection: Connection, query: DataQuery, count: Boolean): Long =
     val (sql, parameters) = PostgreSqlDialect.renderDataCheck(query, count)
@@ -818,7 +890,8 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
     def names(table: TableModel, ids: Vector[SchemaId]) = ids.map(id => table.columns.find(_.id == id).get.name.value)
     val expectedKeys = expected.foreignKeys.map { key =>
       val referenced = model.tables.find(_.id == key.referencedTable).get
-      ForeignKeyShape(names(expected, key.columns), qualified(referenced.name), names(referenced, key.referencedColumns))
+      ForeignKeyShape(names(expected, key.columns), qualified(referenced.name),
+        names(referenced, key.referencedColumns), key.onDeleteCascade)
     }
     val actualKeys = inspectForeignKeys(connection, oid)
     val modeledTables = model.tables.map(table => qualified(table.name)).toSet
@@ -832,9 +905,12 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
       s"Table $display is referenced by a foreign key of unmodeled table $referencing."
     }
 
-  private final case class ForeignKeyShape(columns: Vector[String], referencedTable: String, referencedColumns: Vector[String]):
+  private final case class ForeignKeyShape(columns: Vector[String], referencedTable: String,
+      referencedColumns: Vector[String], onDeleteCascade: Boolean):
     def show: String =
-      s"${columns.map(quoted).mkString("(", ", ", ")")} REFERENCES $referencedTable ${referencedColumns.map(quoted).mkString("(", ", ", ")")}"
+      s"${columns.map(quoted).mkString("(", ", ", ")")} REFERENCES $referencedTable " +
+        referencedColumns.map(quoted).mkString("(", ", ", ")") +
+        (if onDeleteCascade then " ON DELETE CASCADE" else "")
 
   private final case class DatabaseForeignKey(name: String, shape: ForeignKeyShape, features: Vector[String])
 
@@ -858,14 +934,15 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
     )(_.setLong(1, oid)) { row =>
       val features = Vector(
         Option.when(row.getString("confupdtype") != "a")("ON UPDATE action"),
-        Option.when(row.getString("confdeltype") != "a")("ON DELETE action"),
+        Option.when(!Set("a", "c")(row.getString("confdeltype")))("ON DELETE action"),
         Option.when(row.getString("confmatchtype") != "s")("MATCH FULL or PARTIAL"),
         Option.when(row.getBoolean("condeferrable"))("deferrable checking"),
         Option.when(!row.getBoolean("convalidated"))("NOT VALID state")
       ).flatten
       val referenced = quoted(row.getString("referenced_schema")) + "." + quoted(row.getString("referenced_table"))
       DatabaseForeignKey(row.getString("conname"),
-        ForeignKeyShape(strings(row, "columns"), referenced, strings(row, "referenced_columns")), features)
+        ForeignKeyShape(strings(row, "columns"), referenced, strings(row, "referenced_columns"),
+          row.getString("confdeltype") == "c"), features)
     }
 
   private def inspectReferencingTables(connection: Connection, oid: Long): Vector[String] =

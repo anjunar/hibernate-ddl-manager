@@ -178,7 +178,7 @@ object DiffEngine:
       val referenced = newTables(key.referencedTable)
       def names(owner: TableModel, ids: Vector[SchemaId]) = ids.map(id => owner.columns.find(_.id == id).get.name)
       operations += SchemaOperation.AddForeignKey(table.id, table.name, names(table, key.columns),
-        referenced.name, names(referenced, key.referencedColumns))
+        referenced.name, names(referenced, key.referencedColumns), key.onDeleteCascade)
     }
 
     operations ++= required.result()

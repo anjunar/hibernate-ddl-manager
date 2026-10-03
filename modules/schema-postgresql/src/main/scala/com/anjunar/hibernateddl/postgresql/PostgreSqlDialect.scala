@@ -63,7 +63,7 @@ object PostgreSqlDialect extends SchemaDialect:
         validateName(table, "table") ++
           columns.flatMap(validateIdentifier(_, "unique key column")) ++
           Option.when(columns.isEmpty || columns.size != ref.columns.size)("A dropped unique key needs its columns.").toVector
-      case SchemaOperation.AddForeignKey(_, table, columns, referencedTable, referencedColumns) =>
+      case SchemaOperation.AddForeignKey(_, table, columns, referencedTable, referencedColumns, _) =>
         validateName(table, "table") ++
           validateName(referencedTable, "referenced table") ++
           columns.flatMap(validateIdentifier(_, "foreign key column")) ++
@@ -213,9 +213,10 @@ object PostgreSqlDialect extends SchemaDialect:
       case SchemaOperation.DropUniqueKey(_, table, columns) =>
         s"ALTER TABLE ${qualified(table)} DROP CONSTRAINT <the unique key (${columns.map(quoted).mkString(", ")}), " +
           "found under the migration lock>;"
-      case SchemaOperation.AddForeignKey(_, table, columns, referencedTable, referencedColumns) =>
+      case SchemaOperation.AddForeignKey(_, table, columns, referencedTable, referencedColumns, onDeleteCascade) =>
         s"ALTER TABLE ${qualified(table)} ADD FOREIGN KEY (${columns.map(quoted).mkString(", ")}) " +
-          s"REFERENCES ${qualified(referencedTable)} (${referencedColumns.map(quoted).mkString(", ")});"
+          s"REFERENCES ${qualified(referencedTable)} (${referencedColumns.map(quoted).mkString(", ")})" +
+          (if onDeleteCascade then " ON DELETE CASCADE;" else ";")
       case SchemaOperation.RenameTable(_, from, to) =>
         s"ALTER TABLE ${qualified(from)} RENAME TO ${quoted(to.name)};"
       case SchemaOperation.RenameColumn(_, table, _, from, to) =>

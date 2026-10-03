@@ -9,10 +9,11 @@ import scala.util.control.NoStackTrace
   * the text survives any transport unchanged. Reading is strict: an unknown format version, a
   * missing or unknown field and an unknown type are errors, never skipped. Format 2 added
   * foreign keys, format 3 unique keys, format 4 indexes, format 5 column checks and format 6
-  * identity columns and sequences, format 7 named table checks; the earlier formats are still read.
+  * identity columns and sequences, format 7 named table checks, format 8 cascade foreign keys;
+  * the earlier formats are still read.
   */
 object SchemaModelJson:
-  val FormatVersion = 7
+  val FormatVersion = 8
   private val VarcharType = """varchar\((\d+)\)""".r
   private val TimestampType = """timestamp\((\d+)\)""".r
   private val TimestampWithTimeZoneType = """timestamp\((\d+)\) with time zone""".r
@@ -40,7 +41,7 @@ object SchemaModelJson:
       s"""{"id":${string(column.column.value)},"descending":${column.descending}}"""
     def foreignKey(key: ForeignKeyModel) =
       s"""{"columns":${ids(key.columns)},"referencedTable":${string(key.referencedTable.value)},""" +
-        s""""referencedColumns":${ids(key.referencedColumns)}}"""
+        s""""referencedColumns":${ids(key.referencedColumns)},"onDeleteCascade":${key.onDeleteCascade}}"""
     val tables = model.tables.map { table =>
       val columns = table.columns.map { column =>
         s"""{"id":${string(column.id.value)},"name":${string(column.name.value)},""" +
@@ -146,7 +147,7 @@ object SchemaModelJson:
       ),
       array(table("columns"), label("columns")).map(readColumn(_, id, format)),
       ids(table("primaryKey"), label("primary key")),
-      table.get("foreignKeys").fold(Vector.empty)(keys => array(keys, label("foreign keys")).map(readForeignKey(_, id))),
+      table.get("foreignKeys").fold(Vector.empty)(keys => array(keys, label("foreign keys")).map(readForeignKey(_, id, format))),
       table.get("uniqueKeys").fold(Vector.empty)(keys => array(keys, label("unique keys")).map { key =>
         val label = s"Unique key in table '$id'"
         UniqueKeyModel(ids(fields(key, label, Set("columns"))("columns"), s"$label columns"))
@@ -168,13 +169,19 @@ object SchemaModelJson:
       IndexColumn(SchemaId(string(entry("id"), s"$label column id")), descending)
     })
 
-  private def readForeignKey(json: Json, tableId: String): ForeignKeyModel =
-    val key = fields(json, s"Foreign key in table '$tableId'", Set("columns", "referencedTable", "referencedColumns"))
+  private def readForeignKey(json: Json, tableId: String, format: Int): ForeignKeyModel =
+    val key = fields(json, s"Foreign key in table '$tableId'",
+      Set("columns", "referencedTable", "referencedColumns") ++ Option.when(format >= 8)("onDeleteCascade"))
     val label = s"Foreign key in table '$tableId'"
+    val cascade = key.get("onDeleteCascade") match
+      case None => false
+      case Some(Json.Bool(value)) => value
+      case Some(_) => invalid(s"$label onDeleteCascade must be true or false")
     ForeignKeyModel(
       ids(key("columns"), s"$label columns"),
       SchemaId(string(key("referencedTable"), s"$label referenced table")),
-      ids(key("referencedColumns"), s"$label referenced columns")
+      ids(key("referencedColumns"), s"$label referenced columns"),
+      cascade
     )
 
   private def ids(json: Json, label: String): Vector[SchemaId] =

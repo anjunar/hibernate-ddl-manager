@@ -69,7 +69,7 @@ object PreviewDataChecks:
     val existing = plan.operations.flatMap {
       case SchemaOperation.SetNotNull(tableId, _, _, _) => Some(tableId)
       case SchemaOperation.AddUniqueKey(tableId, _, _) => Some(tableId)
-      case SchemaOperation.AddForeignKey(tableId, _, _, _, _) => Some(tableId)
+      case SchemaOperation.AddForeignKey(tableId, _, _, _, _, _) => Some(tableId)
       case SchemaOperation.ChangeCheck(tableId, _, _, _, _, Some(_)) => Some(tableId)
       case _ => None
     }.distinct.filter(previous.contains)
@@ -102,7 +102,7 @@ object PreviewDataChecks:
         }
         PlannedDataCheck(PreviewCheck.ReferencesResolve,
           s"Foreign key ${keyNames(key.columns)} of ${table.display} finds every referenced row",
-          stepOf { case PlanStep.Statement(SchemaOperation.AddForeignKey(`tableId`, _, _, _, _), _, _, _) => true; case _ => false }
+          stepOf { case PlanStep.Statement(SchemaOperation.AddForeignKey(`tableId`, _, _, _, _, _), _, _, _) => true; case _ => false }
             .filter(_ => newKeys.contains(key)), Some(tableId.value),
           DataQuery.Unresolved(table, key.columns.map(projected), referenced),
           s"Rows of ${table.display} would reference missing rows through ${keyNames(key.columns)}")

@@ -211,7 +211,7 @@ object PreviewReport:
     case SchemaOperation.DropUniqueKey(ref, _, _) => Vector(ref.table.value, ref.signature)
     case SchemaOperation.ChangeCheck(_, _, id, _, _, _) => Vector(id.value)
     case SchemaOperation.CreateIndex(id, _, _) => Vector(id.value)
-    case SchemaOperation.AddForeignKey(id, _, _, _, _) => Vector(id.value)
+    case SchemaOperation.AddForeignKey(id, _, _, _, _, _) => Vector(id.value)
     case SchemaOperation.SetNotNull(_, _, id, _) => Vector(id.value)
     case SchemaOperation.DropNotNull(_, _, id, _) => Vector(id.value)
     case SchemaOperation.DropColumn(_, _, id, _) => Vector(id.value)
@@ -236,7 +236,7 @@ object PreviewReport:
     case SchemaOperation.ChangeCheck(_, table, _, column, _, to) =>
       s"${if to.isEmpty then "Remove" else "Set"} the check of column ${table.display}.${column.value}"
     case SchemaOperation.CreateIndex(_, table, columns) => s"Create index (${columns.map(_.name.value).mkString(", ")}) on ${table.display}"
-    case SchemaOperation.AddForeignKey(_, table, columns, referenced, _) =>
+    case SchemaOperation.AddForeignKey(_, table, columns, referenced, _, _) =>
       s"Add foreign key (${columns.map(_.value).mkString(", ")}) from ${table.display} to ${referenced.display}"
     case SchemaOperation.SetNotNull(_, table, _, column) => s"Make column ${table.display}.${column.value} required"
     case SchemaOperation.DropNotNull(_, table, _, column) => s"Make column ${table.display}.${column.value} optional"

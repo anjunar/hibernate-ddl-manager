@@ -55,6 +55,14 @@ object HibernateSchemaMigration:
   def exportTarget(metadata: Metadata): String =
     SchemaModelJson.encode(resolve(metadata, ExecutionOptions(), Vector.empty)._2)
 
+  /** Read-only SQL plan for renaming structurally identical Hibernate-created checks before
+    * adopting a database without manager history. Review and apply the statements explicitly;
+    * this method never changes persistent database objects or records a revision.
+    */
+  def planHibernateCheckRenames(metadata: Metadata, dataSource: DataSource): Vector[String] =
+    val (_, target, _) = resolve(metadata, ExecutionOptions(), Vector.empty)
+    PostgreSqlMigrationBackend.planHibernateCheckRenames(dataSource, target).fold(refuse, identity)
+
   /** The providers' backfills plus `backfills` in their JSON form, for `schema-cli preview --backfills`. */
   def exportBackfills(metadata: Metadata, backfills: Vector[Backfill] = Vector.empty): String =
     BackfillJson.encode(resolve(metadata, ExecutionOptions(), backfills)._3)

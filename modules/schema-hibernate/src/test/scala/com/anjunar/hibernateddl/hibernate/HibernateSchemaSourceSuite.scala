@@ -197,7 +197,6 @@ class HibernateSchemaSourceSuite extends munit.FunSuite:
     assert(diagnostics.exists(_.contains("Unsupported.guarded keeps name, status with a check or NOT NULL inside its " +
       "JSON column; Hibernate guards them with a table check that the model cannot represent; unsupported")), diagnostics)
     assert(diagnostics.exists(_.contains("Unsupported.tags has SQL type 'varchar(255) array'")), diagnostics)
-    assert(diagnostics.exists(_.contains("of entity Unsupported has ON DELETE CASCADE; unsupported")), diagnostics)
     assert(diagnostics.exists(_.contains("Unsupported.folder.files is not a direct property")), diagnostics)
     assert(diagnostics.exists(_.contains("of entity Unsupported has options 'WHERE code IS NOT NULL'; unsupported")), diagnostics)
   }

@@ -3,7 +3,9 @@ package com.anjunar.hibernateddl.hibernate
 import com.anjunar.hibernateddl.core.*
 import com.anjunar.hibernateddl.hibernate.annotation.{SchemaId as StableId, SecondaryTableId}
 import org.hibernate.boot.Metadata
+import org.hibernate.boot.spi.MetadataImplementor
 import org.hibernate.boot.model.naming.Identifier
+import org.hibernate.boot.registry.classloading.spi.ClassLoaderService
 import org.hibernate.cfg.MappingSettings
 import org.hibernate.engine.config.spi.{ConfigurationService, StandardConverters}
 import org.hibernate.annotations.OnDeleteAction
@@ -28,7 +30,7 @@ import scala.util.control.NonFatal
   * single-table hierarchy shares its root's table, joined and table-per-class subclasses have
   * their own.
   * An association's join column is a column like any other; its foreign key references the
-  * other entity's table and primary key by ID. A collection table (element collection or
+  * other entity's table and primary or unique key by ID. A collection table (element collection or
   * many-to-many join table) uses the ID `entity/property`.
   * Physical names are taken after Hibernate's naming strategies and folded the way the
   * configured dialect folds unquoted identifiers. Tables without a schema use
@@ -107,6 +109,27 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
 
     def read(): SchemaModel =
       val entities = metadata.getEntityBindings.asScala.toVector.sortBy(_.getEntityName)
+      val providers = database.getServiceRegistry.requireService(classOf[ClassLoaderService])
+        .loadJavaServices(classOf[ClasslessEntitySchemaIdProvider]).asScala.toVector
+      val classless = entities.filter(_.getClassName == null).flatMap { entity =>
+        var providerFailed = false
+        val matches = providers.flatMap { provider =>
+          try provider.identify(entity, metadata)
+          catch case NonFatal(error) =>
+            providerFailed = true
+            errors += s"Classless entity ${entityLabel(entity)} provider ${provider.getClass.getName} failed: ${error.getMessage}"
+            None
+        }
+        matches match
+          case Vector(ids) => Some(entity -> ids)
+          case Vector() if !providerFailed =>
+            errors += s"Classless entity ${entityLabel(entity)} has no ClasslessEntitySchemaIdProvider"
+            None
+          case Vector() => None
+          case _ =>
+            errors += s"Classless entity ${entityLabel(entity)} has more than one ClasslessEntitySchemaIdProvider"
+            None
+      }.toMap
       val entityTables = entities.map(_.getTable).toSet ++ entities.flatMap(_.getJoins.asScala.map(_.getTable))
       // Inverse sides and foreign-key one-to-many collections own no table of their own.
       val collections = metadata.getCollectionBindings.asScala.toVector
@@ -125,12 +148,15 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
         errors += s"Auxiliary database object ${auxiliary.getExportIdentifier} is unsupported"
       }
       // Entity IDs are checked for every entity, including those that share their table.
-      val entityIds = entities.map(entity => entity -> stableId(Vector(entity.getMappedClass), s"Entity ${entityLabel(entity)}")).toMap
+      val entityIds = entities.map { entity =>
+        entity -> (if entity.getClassName == null then classless.get(entity).map(_.tableId.value)
+          else stableId(Vector(entity.getMappedClass), s"Entity ${entityLabel(entity)}"))
+      }.toMap
       entities.filter(entityIds(_).nonEmpty).groupBy(entityIds(_).get).foreach { (id, owners) =>
         if owners.size > 1 then
           errors += s"Entities ${owners.map(entityLabel).sorted.mkString(", ")} share @SchemaId(\"$id\")"
       }
-      entities.foreach { entity =>
+      entities.filter(_.getClassName != null).foreach { entity =>
         val joined = entity.getJoins.asScala.map(_.getTable.getName.toLowerCase(Locale.ROOT)).toSet
         entity.getMappedClass.getAnnotationsByType(classOf[SecondaryTableId]).filterNot(id =>
           joined(id.table.toLowerCase(Locale.ROOT))).foreach { id =>
@@ -138,13 +164,14 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
         }
       }
       val tableOwners = entities.filterNot(_.isInstanceOf[SingleTableSubclass])
-      val mapped = tableOwners.flatMap(readEntityTable(_, entities, entityIds)) ++
-        entities.flatMap(entity => entity.getJoins.asScala.toVector.flatMap(readSecondaryTable(entity, _, entityIds))) ++
+      val mapped = tableOwners.flatMap(readEntityTable(_, entities, entityIds, classless)) ++
+        entities.filter(_.getClassName != null)
+          .flatMap(entity => entity.getJoins.asScala.toVector.flatMap(readSecondaryTable(entity, _, entityIds))) ++
         collections.filterNot(c => sharedTables.contains(c.getCollectionTable)).flatMap(readCollection(_, entityIds))
       val byTable = mapped.map(entity => entity.table -> entity).toMap
       SchemaModel(
         mapped.map(entity => entity.model.copy(foreignKeys = foreignKeys(entity, byTable, entityTables ++ collectionTables))),
-        sequences(entities.collect { case root: RootClass => root }, entityIds)
+        sequences(entities.collect { case root: RootClass if root.getClassName != null => root }, entityIds)
       )
 
     /** Every Hibernate sequence must generate the key of exactly one entity hierarchy. It takes
@@ -203,7 +230,7 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
             None
       }
 
-    /** Foreign keys of associations, referencing the primary key of another mapped entity. Keys
+    /** Foreign keys of associations, referencing a primary or unique key of another mapped entity. Keys
       * Hibernate does not create, such as those to a table-per-class root, are not modeled.
       */
     private def foreignKeys(entity: Mapped, byTable: Map[Table, Mapped], ownedTables: Set[Table]): Vector[ForeignKeyModel] =
@@ -212,17 +239,25 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
         val label = s"Foreign key ${columns.map(_.getName).mkString("(", ", ", ")")} of ${entity.description}"
         val referenced = byTable.get(key.getReferencedTable)
         val problems = Vector(
-          Option.when(!key.isReferenceToPrimaryKey)("references columns other than the primary key"),
           options(key.getOptions).map(options => s"has options '$options'"),
-          Option(key.getOnDeleteAction).filter(_ != OnDeleteAction.NO_ACTION).map(action => s"has ON DELETE $action"),
+          Option(key.getOnDeleteAction).filter(action =>
+            action != OnDeleteAction.NO_ACTION && action != OnDeleteAction.CASCADE)
+            .map(action => s"has ON DELETE $action"),
           Option.when(referenced.isEmpty && !ownedTables.contains(key.getReferencedTable))(
             s"references table ${key.getReferencedTable.getName}, which belongs to no entity")
         ).flatten
         problems.foreach(problem => errors += s"$label $problem; unsupported")
         // An unreadable referenced entity or a column without an ID origin is reported on its own.
         val ids = columns.flatMap(entity.columnIds.get)
-        referenced.filter(_ => problems.isEmpty && ids.size == columns.size).map { target =>
-          ForeignKeyModel(ids, target.model.id, target.model.primaryKey)
+        referenced.filter(_ => problems.isEmpty && ids.size == columns.size).flatMap { target =>
+          val referencedColumns =
+            if key.isReferenceToPrimaryKey then target.model.primaryKey
+            else key.getReferencedColumns.asScala.toVector.flatMap(target.columnIds.get)
+          if referencedColumns.size != columns.size then
+            errors += s"$label has referenced columns without @SchemaId origin; unsupported"
+            None
+          else Some(ForeignKeyModel(ids, target.model.id, referencedColumns,
+            key.getOnDeleteAction == OnDeleteAction.CASCADE))
         }
       }
 
@@ -234,7 +269,8 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
     private def readEntityTable(
         entity: PersistentClass,
         entities: Vector[PersistentClass],
-        entityIds: Map[PersistentClass, Option[String]]
+        entityIds: Map[PersistentClass, Option[String]],
+        classless: Map[PersistentClass, ClasslessEntitySchemaIds]
     ): Option[Mapped] =
       val label = entityLabel(entity)
       val table = entity.getTable
@@ -248,6 +284,19 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
         None
       else
         val own = entity match
+          case _: RootClass if entity.getClassName == null =>
+            val provided = classless.get(entity)
+            provided.foreach { ids =>
+              ids.columnIds.keys.filterNot(name => table.getColumns.asScala.exists(_.getName == name))
+                .foreach(name => errors += s"Classless entity $label gives a schema ID for unmapped column $name")
+            }
+            table.getColumns.asScala.toVector.map { column =>
+              val stable = provided.flatMap(_.columnIds.get(column.getName)).map(_.value).getOrElse {
+                errors += s"Column ${column.getName} of classless entity $label has no stable schema ID"
+                Unknown
+              }
+              Owned(column, Vector(stable), s"$label.${column.getName}")
+            }
           case root: RootClass =>
             val discriminator = Option(root.getDiscriminator).toVector.flatMap(_.getSelectables.asScala).collect {
               case column: Column => Owned(column, Vector(id, "discriminator"), s"$label discriminator")
@@ -401,7 +450,19 @@ object HibernateSchemaSource extends DesiredSchemaSource[Metadata]:
             errors += s"Column ${column.getName} of $description has no @SchemaId origin (e.g. a join column); unsupported"
             None
       }
-      val primaryKey = Option(table.getPrimaryKey).toVector.flatMap(_.getColumns.asScala).flatMap(columnIds.get)
+      // Hibernate orders composite keys during schema export, including collection tables.
+      // Reproduce that ordering without mutating shared boot metadata so adoption reads the
+      // same key Hibernate created.
+      val keyColumns = Option(table.getPrimaryKey).toVector.flatMap(_.getColumns.asScala)
+      val orderedKeyColumns = if keyColumns.size > 1 then
+        metadata match
+          case boot: MetadataImplementor =>
+            Option(boot.getMetadataBuildingOptions.getColumnOrderingStrategy
+              .orderConstraintColumns(table.getPrimaryKey, metadata))
+              .map(_.asScala.toVector).getOrElse(keyColumns)
+          case _ => keyColumns
+      else keyColumns
+      val primaryKey = orderedKeyColumns.flatMap(columnIds.get)
       // @UniqueConstraint and @NaturalId become unique keys; @Column(unique) and @OneToOne only mark the column.
       val uniqueKeys = table.getUniqueKeys.asScala.values.toVector.flatMap { key =>
         val ordered = key.getColumnOrderMap.asScala.values.forall(order => order == null || order.isBlank ||
