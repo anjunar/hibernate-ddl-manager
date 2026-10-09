@@ -1,0 +1,1052 @@
+package com.anjunar.hibernateddl.postgresql
+
+import com.anjunar.hibernateddl.core.*
+import com.anjunar.hibernateddl.executor.*
+
+import java.sql.{Connection, PreparedStatement, ResultSet, SQLException}
+import javax.sql.DataSource
+import scala.util.Using
+
+/** Transactional migration for PostgreSQL 14 and newer.
+  *
+  * The initial execution envelope is deliberately narrow: explicitly qualified,
+  * permanent ordinary tables containing only the modeled native types, nullability,
+  * identity columns (BY DEFAULT), unowned bigint sequences, a non-deferrable primary key, plain unique constraints, plain B-tree indexes and
+  * plain foreign keys (no actions, MATCH SIMPLE, not deferrable). Defaults, identities,
+  * generated columns, custom collations, inheritance, partitions, other constraints,
+  * other indexes, triggers, rules and RLS require a richer schema model before
+  * execution is supported. Unmanaged tables outside the supplied model are allowed,
+  * but must not reference a modeled table. Every modeled table is locked before catalog
+  * inspection, exclusively unless the executor only checks an applied schema; callers must
+  * retain this transaction until the migration and its history entry have both committed.
+  *
+  * The history table stores every applied model as jsonb, together with the executed
+  * statements. A history table with another column layout was created by another version
+  * and is refused, never altered.
+  */
+object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with PreviewBackend:
+  private val HistorySchema = "__hibernate_ddl"
+  private val HistoryTable = "\"__hibernate_ddl\".\"schema_history\""
+  // One transaction lock per database, independent of the migrated schemas.
+  private val AdvisoryLockKey = 0x4844444c4d475231L
+  private val HistoryColumns = Vector("revision", "previous_fingerprint", "target_fingerprint", "model", "statements")
+  private val BackfillTable = "\"__hibernate_ddl\".\"backfill_history\""
+  private val BackfillColumns = Vector("backfill_id", "definition_format", "definition_checksum", "target_column", "revision",
+    "previous_fingerprint", "target_fingerprint", "result", "updated_rows")
+  private val BackfillResults = Map(BackfillResult.Executed -> "executed",
+    BackfillResult.NotRequiredOnCreation -> "not required on creation", BackfillResult.Adopted -> "adopted")
+
+  override def render(
+      operations: Vector[SchemaOperation]
+  ): Either[Vector[String], Vector[String]] = PostgreSqlDialect.render(operations)
+
+  override def validate(model: SchemaModel): Vector[String] = validateModel(model)
+
+  override def nullCount(table: QualifiedName, column: SqlIdentifier): String = PostgreSqlDialect.nullCount(table, column)
+
+  override def renderFill(fill: NullFill): Either[Vector[String], BoundStatement] =
+    PostgreSqlDialect.renderFill(fill).map(BoundStatement(_, _))
+
+  override def acquireLock(connection: Connection, options: ExecutionOptions): Unit =
+    if connection.getAutoCommit then
+      throw new SQLException("PostgreSQL migration execution requires an active transaction.")
+    checkServer(connection, options)
+    configure(connection, options)
+    query(connection, "SELECT pg_catalog.pg_advisory_xact_lock(?)")(
+      _.setLong(1, AdvisoryLockKey)
+    )(_ => ())
+    ()
+
+  /** Makes the transaction read-only and REPEATABLE READ on the server, which PostgreSQL only
+    * allows as the transaction's first statement, and checks that it took effect. Takes no
+    * migration lock.
+    */
+  override def beginReadOnly(connection: Connection, options: ExecutionOptions): Unit =
+    if connection.getAutoCommit then
+      throw new SQLException("A PostgreSQL preview requires an active transaction.")
+    checkServer(connection, options)
+    execute(connection, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+    configure(connection, options)
+    val settings = query(connection,
+      "SELECT pg_catalog.current_setting('transaction_read_only'), pg_catalog.current_setting('transaction_isolation')"
+    )(_ => ())(row => row.getString(1) -> row.getString(2)).head
+    if settings != ("on" -> "repeatable read") then
+      throw new SQLException(s"The preview transaction is not read-only and repeatable read: $settings")
+
+  override def readHistoryIfPresent(connection: Connection): Option[Vector[HistoryEntry]] =
+    Option.when(relationExists(connection, HistorySchema, "schema_history")) {
+      checkLayout(connection, HistoryTable, HistoryColumns :+ "applied_at")
+      readHistory(connection)
+    }
+
+  override def readBackfillsIfPresent(connection: Connection): Vector[BackfillRecord] =
+    if !relationExists(connection, HistorySchema, "backfill_history") then Vector.empty
+    else
+      checkLayout(connection, BackfillTable, BackfillColumns :+ "applied_at")
+      readBackfills(connection)
+
+  /** Compares like [[lockAndValidate]], but without locks and without a probe table: check
+    * constraints are compared structurally, and what cannot be compared is undecided.
+    */
+  override def inspect(connection: Connection, expected: SchemaModel): Inspection =
+    val validation = validateModel(expected)
+    if validation.nonEmpty then Inspection(validation, Vector.empty)
+    else
+      val undecided = Vector.newBuilder[String]
+      val tables = expected.tables.sortBy(table => qualified(table.name))
+      val differences = tables.flatMap(table => inspectTable(connection, table, expected, CheckMode.Structural(undecided))) ++
+        expected.sequences.flatMap(inspectSequence(connection, _))
+      Inspection(differences.distinct.sorted, undecided.result().distinct.sorted)
+
+  /** Read-only plan for giving Hibernate-created checks the stable names required by adoption.
+    * The only DDL executed here is on temporary probe tables and is rolled back. The caller
+    * must review and apply the returned statements separately, then retry normal adoption.
+    * Ambiguous, unvalidated or differently defined checks are never renamed.
+    */
+  def planHibernateCheckRenames(dataSource: DataSource, expected: SchemaModel): Either[Vector[String], Vector[String]] =
+    val invalid = validateModel(expected)
+    if invalid.nonEmpty then Left(invalid)
+    else Using.resource(dataSource.getConnection) { connection =>
+      if !connection.getAutoCommit then Left(Vector("Check-rename planning requires a non-JTA auto-commit connection."))
+      else
+        connection.setAutoCommit(false)
+        try
+          checkServer(connection, ExecutionOptions())
+          if readHistoryIfPresent(connection).isDefined then
+            Left(Vector("Check names cannot be prepared after schema history has been created."))
+          else
+            final case class Actual(name: String, validated: Boolean, definition: String, columns: Vector[String])
+            val errors = Vector.newBuilder[String]
+            val statements = Vector.newBuilder[String]
+            expected.tables.sortBy(table => qualified(table.name)).foreach { table =>
+              val display = qualified(table.name)
+              relationOid(connection, table.name) match
+                case None => errors += s"Table $display does not exist."
+                case Some(oid) =>
+                  val wanted = table.columns.flatMap(column => column.check.map { check =>
+                    (PostgreSqlDialect.checkName(column.id, check).value, Some(Vector(column.name.value)))
+                  }) ++ table.checks.map(check => (check.name.value, None))
+                  val expectedDefinitions = if wanted.nonEmpty then checkDefinitions(connection, table) else Map.empty[String, String]
+                  val actual = query(connection,
+                    """SELECT k.conname, k.convalidated, pg_catalog.pg_get_constraintdef(k.oid) AS definition,
+                      |       ARRAY(SELECT CAST(a.attname AS pg_catalog.text)
+                      |             FROM pg_catalog.unnest(k.conkey) AS u(attnum)
+                      |             JOIN pg_catalog.pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = u.attnum
+                      |             ORDER BY a.attname) AS columns
+                      |FROM pg_catalog.pg_constraint k
+                      |WHERE k.conrelid = CAST(? AS pg_catalog.oid) AND k.contype = 'c'
+                      |ORDER BY k.conname""".stripMargin
+                  )(_.setLong(1, oid)) { row =>
+                    Actual(row.getString("conname"), row.getBoolean("convalidated"),
+                      row.getString("definition"), strings(row, "columns"))
+                  }
+                  val claimed = scala.collection.mutable.Set.empty[String]
+                  wanted.foreach { (name, columns) =>
+                    val definition = expectedDefinitions.get(name)
+                    if definition.isEmpty then errors += s"No PostgreSQL definition for check ${quoted(name)} of $display."
+                    else
+                      val sameName = actual.find(_.name == name)
+                      val candidates = sameName.toVector ++ actual.filter(check =>
+                        check.name != name && !claimed(check.name) && check.validated &&
+                          check.definition == definition.get && columns.forall(_ == check.columns))
+                      candidates match
+                        case Vector(check) if check.validated && check.definition == definition.get &&
+                            columns.forall(_ == check.columns) =>
+                          claimed += check.name
+                          if check.name != name then
+                            statements += s"ALTER TABLE $display RENAME CONSTRAINT ${quoted(check.name)} TO ${quoted(name)}"
+                        case Vector() => errors += s"No equivalent check for ${quoted(name)} of $display."
+                        case Vector(check) => errors += s"Check ${quoted(check.name)} of $display differs or is not validated."
+                        case _ => errors += s"More than one check matches ${quoted(name)} of $display."
+                  }
+                  actual.filterNot(check => claimed(check.name)).foreach(check =>
+                    errors += s"Unexpected check ${quoted(check.name)} of $display.")
+            }
+            val found = errors.result().distinct.sorted
+            if found.nonEmpty then Left(found) else Right(statements.result())
+        finally
+          connection.rollback()
+          connection.setAutoCommit(true)
+    }
+
+  override def dataCheck(connection: Connection, query: DataQuery, count: Boolean): Long =
+    val (sql, parameters) = PostgreSqlDialect.renderDataCheck(query, count)
+    Using.resource(connection.prepareStatement(sql)) { statement =>
+      parameters.zipWithIndex.foreach((value, index) => statement.setObject(index + 1, value))
+      Using.resource(statement.executeQuery()) { rows =>
+        if !rows.next() then throw new SQLException("A data check returned no row.")
+        rows.getLong(1)
+      }
+    }
+
+  /** PostgreSQL's estimate from the last VACUUM or ANALYZE; -1 means never estimated. */
+  override def estimateRows(connection: Connection, table: QualifiedName): Option[Long] =
+    query(connection,
+      """SELECT CAST(c.reltuples AS pg_catalog.int8) FROM pg_catalog.pg_class c
+        |JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ? AND c.relname = ?""".stripMargin
+    ) { statement =>
+      statement.setString(1, table.schema.get.value)
+      statement.setString(2, table.name.value)
+    }(_.getLong(1)).headOption.filter(_ >= 0)
+
+  /** The size of the table with its indexes and TOAST data, from the catalog. */
+  override def tableSize(connection: Connection, table: QualifiedName): Option[Long] =
+    query(connection,
+      """SELECT pg_catalog.pg_total_relation_size(c.oid) FROM pg_catalog.pg_class c
+        |JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ? AND c.relname = ?""".stripMargin
+    ) { statement =>
+      statement.setString(1, table.schema.get.value)
+      statement.setString(2, table.name.value)
+    }(_.getLong(1)).headOption
+
+  /** Objects that make PostgreSQL refuse `ALTER COLUMN TYPE` because they depend on the column
+    * and cannot be rebuilt with it: views and rules, triggers, policies and SQL-standard
+    * function bodies. Indexes and constraints of the table itself are rebuilt and not listed.
+    * The descriptions are built from the catalogs, since `pg_describe_object` follows the
+    * server's message language.
+    */
+  override def typeChangeBlockers(connection: Connection, table: QualifiedName, column: SqlIdentifier): Vector[String] =
+    query(connection,
+      """SELECT DISTINCT CASE d.classid
+        |  WHEN CAST('pg_catalog.pg_rewrite' AS pg_catalog.regclass) THEN
+        |    (SELECT CASE WHEN r.rulename <> '_RETURN' THEN 'rule ' || pg_catalog.quote_ident(r.rulename) || ' on '
+        |                 WHEN v.relkind = 'm' THEN 'materialized view ' ELSE 'view ' END
+        |            || pg_catalog.quote_ident(vn.nspname) || '.' || pg_catalog.quote_ident(v.relname)
+        |     FROM pg_catalog.pg_rewrite r
+        |     JOIN pg_catalog.pg_class v ON v.oid = r.ev_class
+        |     JOIN pg_catalog.pg_namespace vn ON vn.oid = v.relnamespace
+        |     WHERE r.oid = d.objid)
+        |  WHEN CAST('pg_catalog.pg_trigger' AS pg_catalog.regclass) THEN
+        |    (SELECT 'trigger ' || pg_catalog.quote_ident(t.tgname) FROM pg_catalog.pg_trigger t WHERE t.oid = d.objid)
+        |  WHEN CAST('pg_catalog.pg_policy' AS pg_catalog.regclass) THEN
+        |    (SELECT 'policy ' || pg_catalog.quote_ident(p.polname) FROM pg_catalog.pg_policy p WHERE p.oid = d.objid)
+        |  ELSE
+        |    (SELECT 'function ' || pg_catalog.quote_ident(fn.nspname) || '.' || pg_catalog.quote_ident(f.proname)
+        |     FROM pg_catalog.pg_proc f JOIN pg_catalog.pg_namespace fn ON fn.oid = f.pronamespace WHERE f.oid = d.objid)
+        |  END AS description
+        |FROM pg_catalog.pg_depend d
+        |JOIN pg_catalog.pg_class c ON c.oid = d.refobjid
+        |JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        |JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = d.refobjsubid
+        |WHERE d.refclassid = CAST('pg_catalog.pg_class' AS pg_catalog.regclass)
+        |  AND n.nspname = ? AND c.relname = ? AND a.attname = ?
+        |  AND d.classid IN (CAST('pg_catalog.pg_rewrite' AS pg_catalog.regclass),
+        |                    CAST('pg_catalog.pg_trigger' AS pg_catalog.regclass),
+        |                    CAST('pg_catalog.pg_policy' AS pg_catalog.regclass),
+        |                    CAST('pg_catalog.pg_proc' AS pg_catalog.regclass))
+        |ORDER BY description""".stripMargin
+    ) { statement =>
+      statement.setString(1, table.schema.get.value)
+      statement.setString(2, table.name.value)
+      statement.setString(3, column.value)
+    }(_.getString("description"))
+
+  /** Finds the one plain index or unique constraint of the table with exactly the dropped
+    * definition: ordered column names, directions and nothing the model cannot represent.
+    * Nothing is chosen by name, by a partial column list or among several matches, and a
+    * foreign key that depends on the object refuses the drop, since there is no CASCADE. The
+    * statement uses the name the catalog shows, which later renames do not change.
+    */
+  override def bindDrop(
+      connection: Connection,
+      operation: SchemaOperation,
+      table: QualifiedName,
+      columns: Vector[SqlIdentifier]
+  ): Either[Vector[String], String] =
+    val display = qualified(table)
+    def bindOne[A](kind: String, shown: String, found: Vector[A], name: A => String, index: A => Long,
+        features: A => Vector[String])(sql: A => String): Either[Vector[String], String] =
+      found match
+        case Vector() => Left(Vector(s"Database drift: $kind $shown of $display, which the target drops, does not exist."))
+        case Vector(one) if features(one).nonEmpty =>
+          Left(Vector(s"${kind.capitalize} ${quoted(name(one))} of $display has unsupported " +
+            s"${features(one).mkString(", ")}; it is not dropped."))
+        case Vector(one) =>
+          val dependents = referencingKeys(connection, index(one))
+          if dependents.nonEmpty then Left(Vector(s"${kind.capitalize} ${quoted(name(one))} of $display cannot be dropped " +
+            s"while ${dependents.mkString(", ")} depend${if dependents.size == 1 then "s" else ""} on it; the migration " +
+            "never uses CASCADE."))
+          else Right(sql(one))
+        case several => Left(Vector(s"${kind.capitalize} $shown of $display matches ${several.size} objects " +
+          s"(${several.map(one => quoted(name(one))).mkString(", ")}); refusing to choose one."))
+    relationOid(connection, table) match
+      case None => Left(Vector(s"Database drift: table $display does not exist."))
+      case Some(oid) => operation match
+        case SchemaOperation.DropIndex(ref, _, _) =>
+          val wanted = columns.map(_.value).zip(ref.columns.map(_.descending))
+          bindOne("index", showIndex(wanted), plainIndexes(connection, oid).filter(_.columns == wanted),
+            _.name, _.oid, _.features)(index => PostgreSqlDialect.renderDropIndex(table.schema.get, SqlIdentifier(index.name)))
+        case SchemaOperation.DropUniqueKey(_, target, _) =>
+          val wanted = columns.map(_.value)
+          bindOne("unique key", wanted.map(quoted).mkString("(", ", ", ")"),
+            uniqueConstraints(connection, oid).filter(_.columns == wanted), _.name, _.index, _.features
+          )(key => PostgreSqlDialect.renderDropConstraint(target, SqlIdentifier(key.name)))
+        case other => Left(Vector(s"$other names no database object to bind."))
+
+  private def relationOid(connection: Connection, table: QualifiedName): Option[Long] =
+    query(connection,
+      """SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        |WHERE n.nspname = ? AND c.relname = ?""".stripMargin
+    ) { statement =>
+      statement.setString(1, table.schema.get.value)
+      statement.setString(2, table.name.value)
+    }(_.getLong(1)).headOption
+
+  /** The foreign keys, of any table, that reference through the given index. */
+  private def referencingKeys(connection: Connection, index: Long): Vector[String] =
+    query(connection,
+      """SELECT k.conname, n.nspname, c.relname FROM pg_catalog.pg_constraint k
+        |JOIN pg_catalog.pg_class c ON c.oid = k.conrelid JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        |WHERE k.contype = 'f' AND k.conindid = CAST(? AS pg_catalog.oid)
+        |ORDER BY n.nspname, c.relname, k.conname""".stripMargin
+    )(_.setLong(1, index)) { row =>
+      s"foreign key ${quoted(row.getString("conname"))} of ${quoted(row.getString("nspname"))}.${quoted(row.getString("relname"))}"
+    }
+
+  /** Whether a relation exists, by its catalog entry, so that missing privileges on it are not
+    * mistaken for its absence.
+    */
+  private def relationExists(connection: Connection, schema: String, name: String): Boolean =
+    query(connection,
+      """SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        |WHERE n.nspname = ? AND c.relname = ?""".stripMargin
+    ) { statement =>
+      statement.setString(1, schema)
+      statement.setString(2, name)
+    }(_ => ()).nonEmpty
+
+  private def checkServer(connection: Connection, options: ExecutionOptions): Unit =
+    val metadata = connection.getMetaData
+    if metadata.getDatabaseProductName != "PostgreSQL" || metadata.getDatabaseMajorVersion < 14 then
+      throw new SQLException("This migration backend requires PostgreSQL 14 or newer.")
+    if !metadata.supportsTransactions() ||
+        !metadata.supportsDataDefinitionAndDataManipulationTransactions() ||
+        metadata.dataDefinitionCausesTransactionCommit() ||
+        metadata.dataDefinitionIgnoredInTransactions()
+    then throw new SQLException("The connection does not support transactional PostgreSQL DDL.")
+    if options.lockTimeoutMillis <= 0 || options.statementTimeoutMillis <= 0 then
+      throw new SQLException("Migration lock and statement timeouts must be positive.")
+
+  /** Timeouts, search path and string syntax for this transaction only. */
+  private def configure(connection: Connection, options: ExecutionOptions): Unit =
+    query(connection,
+      "SELECT pg_catalog.set_config('lock_timeout', ?, true), " +
+        "pg_catalog.set_config('statement_timeout', ?, true), " +
+        "pg_catalog.set_config('search_path', 'pg_catalog', true), " +
+        // Check constraints quote their values with doubled single quotes only.
+        "pg_catalog.set_config('standard_conforming_strings', 'on', true)"
+    ) { statement =>
+      statement.setString(1, s"${options.lockTimeoutMillis}ms")
+      statement.setString(2, s"${options.statementTimeoutMillis}ms")
+    }(_ => ())
+    val identifierLimit = query(connection,
+      "SELECT pg_catalog.current_setting('max_identifier_length')"
+    )(_ => ())(_.getInt(1)).head
+    if identifierLimit != 63 then
+      throw new SQLException("This backend requires PostgreSQL's standard 63-byte identifier limit.")
+
+  override def initializeHistory(connection: Connection): Unit =
+    execute(connection, "CREATE SCHEMA IF NOT EXISTS \"__hibernate_ddl\"")
+    execute(connection,
+      s"""CREATE TABLE IF NOT EXISTS $HistoryTable (
+         |  revision BIGINT PRIMARY KEY CHECK (revision > 0),
+         |  previous_fingerprint CHAR(64) NOT NULL,
+         |  target_fingerprint CHAR(64) NOT NULL,
+         |  model JSONB NOT NULL,
+         |  statements TEXT[] NOT NULL,
+         |  applied_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT pg_catalog.clock_timestamp()
+         |)""".stripMargin
+    )
+    checkLayout(connection, HistoryTable, HistoryColumns :+ "applied_at")
+    // Each backfill is recorded once, by the migration of one schema revision.
+    execute(connection,
+      s"""CREATE TABLE IF NOT EXISTS $BackfillTable (
+         |  backfill_id TEXT PRIMARY KEY,
+         |  definition_format INTEGER NOT NULL,
+         |  definition_checksum CHAR(64) NOT NULL,
+         |  target_column TEXT NOT NULL,
+         |  revision BIGINT NOT NULL REFERENCES $HistoryTable (revision),
+         |  previous_fingerprint CHAR(64) NOT NULL,
+         |  target_fingerprint CHAR(64) NOT NULL,
+         |  result TEXT NOT NULL CHECK (result IN ('executed', 'not required on creation', 'adopted')),
+         |  updated_rows BIGINT CHECK ((result = 'executed') = (updated_rows IS NOT NULL)),
+         |  applied_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT pg_catalog.clock_timestamp()
+         |)""".stripMargin
+    )
+    checkLayout(connection, BackfillTable, BackfillColumns :+ "applied_at")
+
+  /** A history table with another column layout was created by another version and is
+    * refused, never altered.
+    */
+  private def checkLayout(connection: Connection, table: String, expected: Vector[String]): Unit =
+    val name = table.split("\\.").last.drop(1).dropRight(1)
+    val columns = query(connection,
+      """SELECT a.attname
+        |FROM pg_catalog.pg_attribute a
+        |JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+        |JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        |WHERE n.nspname = ? AND c.relname = ? AND a.attnum > 0 AND NOT a.attisdropped
+        |ORDER BY a.attnum""".stripMargin
+    ) { statement =>
+      statement.setString(1, HistorySchema)
+      statement.setString(2, name)
+    }(_.getString("attname"))
+    if columns != expected then
+      throw new SQLException(s"History table $table has the columns ${columns.mkString(", ")}; " +
+        s"expected ${expected.mkString(", ")}. It was created by another version of Hibernate DDL Manager.")
+
+  override def readHistory(connection: Connection): Vector[HistoryEntry] =
+    query(connection,
+      s"SELECT revision, previous_fingerprint, target_fingerprint, CAST(model AS pg_catalog.text) AS model, statements " +
+        s"FROM $HistoryTable ORDER BY revision"
+    )(_ => ()) { row =>
+      HistoryEntry(row.getLong("revision"), row.getString("previous_fingerprint"),
+        row.getString("target_fingerprint"), row.getString("model"), strings(row, "statements"))
+    }
+
+  override def existingRelations(connection: Connection, model: SchemaModel): Vector[QualifiedName] =
+    (model.tables.map(_.name) ++ model.sequences.map(_.name)).filter { name =>
+      query(connection,
+        """SELECT 1
+          |FROM pg_catalog.pg_class c
+          |JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          |WHERE n.nspname = ? AND c.relname = ?""".stripMargin
+      ) { statement =>
+        statement.setString(1, name.schema.get.value)
+        statement.setString(2, name.name.value)
+      }(_ => ()).nonEmpty
+    }
+
+  override def readBackfills(connection: Connection): Vector[BackfillRecord] =
+    query(connection, s"SELECT ${BackfillColumns.mkString(", ")} FROM $BackfillTable ORDER BY revision, backfill_id")(_ => ()) {
+      row =>
+        val result = row.getString("result")
+        BackfillRecord(row.getString("backfill_id"), row.getInt("definition_format"), row.getString("definition_checksum"),
+          SchemaId(row.getString("target_column")), row.getLong("revision"), row.getString("previous_fingerprint"),
+          row.getString("target_fingerprint"),
+          BackfillResults.collectFirst { case (value, name) if name == result => value }.getOrElse(
+            throw new SQLException(s"Backfill history has the unknown result '$result'.")),
+          Option(row.getObject("updated_rows")).map(_ => row.getLong("updated_rows")))
+    }
+
+  override def recordBackfill(connection: Connection, record: BackfillRecord): Unit =
+    Using.resource(connection.prepareStatement(
+      s"INSERT INTO $BackfillTable (${BackfillColumns.mkString(", ")}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )) { statement =>
+      statement.setString(1, record.id)
+      statement.setInt(2, record.format)
+      statement.setString(3, record.checksum)
+      statement.setString(4, record.target.value)
+      statement.setLong(5, record.revision)
+      statement.setString(6, record.previousFingerprint)
+      statement.setString(7, record.targetFingerprint)
+      statement.setString(8, BackfillResults(record.result))
+      record.updatedRows match
+        case Some(rows) => statement.setLong(9, rows)
+        case None => statement.setNull(9, java.sql.Types.BIGINT)
+      if statement.executeUpdate() != 1 then
+        throw new SQLException("Recording the backfill did not insert exactly one history entry.")
+    }
+
+  override def recordHistory(connection: Connection, entry: HistoryEntry): Unit =
+    Using.resource(connection.prepareStatement(
+      s"INSERT INTO $HistoryTable (${HistoryColumns.mkString(", ")}) VALUES (?, ?, ?, CAST(? AS pg_catalog.jsonb), ?)"
+    )) { statement =>
+      val statements = connection.createArrayOf("text", entry.statements.toArray[AnyRef])
+      try
+        statement.setLong(1, entry.revision)
+        statement.setString(2, entry.previousFingerprint)
+        statement.setString(3, entry.targetFingerprint)
+        statement.setString(4, entry.model)
+        statement.setArray(5, statements)
+        if statement.executeUpdate() != 1 then
+          throw new SQLException("Recording the migration did not insert exactly one history entry.")
+      finally statements.free()
+    }
+
+  override def lockAndValidate(connection: Connection, expected: SchemaModel, lock: TableLock): Vector[String] =
+    val validation = validateModel(expected)
+    if validation.nonEmpty then validation
+    else
+      val tables = expected.tables.sortBy(table => qualified(table.name))
+      // Lock every table before inspecting any of them. ONLY avoids recursively
+      // locking an unmodeled inheritance tree, which inspection will reject. ACCESS SHARE
+      // conflicts only with ACCESS EXCLUSIVE, which most DDL takes.
+      val mode = lock match
+        case TableLock.Exclusive => "ACCESS EXCLUSIVE"
+        case TableLock.Shared => "ACCESS SHARE"
+      tables.foreach { table =>
+        execute(connection, s"LOCK TABLE ONLY ${qualified(table.name)} IN $mode MODE")
+      }
+      // Sequences cannot be locked; the advisory lock already keeps other migrations out.
+      (tables.flatMap(table => inspectTable(connection, table, expected, CheckMode.Probe)) ++
+        expected.sequences.flatMap(inspectSequence(connection, _))).distinct.sorted
+
+  private def validateModel(model: SchemaModel): Vector[String] =
+    val dialectErrors = model.tables.flatMap { table =>
+      PostgreSqlDialect.validateTable(table).map(message => s"Table '${table.id.value}': $message")
+    }
+    // The history stores models as jsonb, which cannot hold NUL.
+    val idErrors = (model.tables.flatMap(table => table.id +: table.columns.map(_.id)) ++ model.sequences.map(_.id))
+      .filter(_.value.contains('\u0000')).map(id => s"Stable ID '${id.value.replace('\u0000', '?')}' must not contain NUL.")
+    val sequenceErrors = model.sequences.flatMap { sequence =>
+      PostgreSqlDialect.render(Vector(SchemaOperation.CreateSequence(sequence))).left.toOption.toVector.flatten
+        .map(message => s"Sequence '${sequence.id.value}': $message")
+    }
+    val relations = model.tables.map(t => ("Table", t.id, t.name)) ++ model.sequences.map(s => ("Sequence", s.id, s.name))
+    val namespaceErrors = relations.flatMap { (kind, id, name) =>
+      Vector(
+        Option.when(name.schema.isEmpty)(s"$kind '${id.value}' must have an explicit schema for execution."),
+        Option.when(name.schema.exists(_.value == HistorySchema))(
+          s"$kind '${id.value}' uses the reserved history schema '$HistorySchema'."
+        )
+      ).flatten
+    }
+    (SchemaValidation.validate(model) ++ dialectErrors ++ sequenceErrors ++ idErrors ++ namespaceErrors).distinct.sorted
+
+  /** A sequence must be an unowned bigint sequence with the modeled start and increment and
+    * PostgreSQL's defaults otherwise: minimum 1, maximum 2^63 - 1, cache 1 and no cycling.
+    */
+  private def inspectSequence(connection: Connection, expected: SequenceModel): Vector[String] =
+    val display = qualified(expected.name)
+    query(connection,
+      """SELECT c.relkind, CAST(CAST(s.seqtypid AS pg_catalog.regtype) AS pg_catalog.text) AS type_name,
+        |       s.seqstart, s.seqincrement, s.seqmin, s.seqmax, s.seqcache, s.seqcycle,
+        |       EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
+        |               WHERE d.classid = CAST('pg_catalog.pg_class' AS pg_catalog.regclass) AND d.objid = c.oid
+        |                 AND d.refobjsubid > 0 AND d.deptype IN ('a', 'i')) AS owned
+        |FROM pg_catalog.pg_class c
+        |JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        |LEFT JOIN pg_catalog.pg_sequence s ON s.seqrelid = c.oid
+        |WHERE n.nspname = ? AND c.relname = ?""".stripMargin
+    ) { statement =>
+      statement.setString(1, expected.name.schema.get.value)
+      statement.setString(2, expected.name.name.value)
+    } { row =>
+      if row.getString("relkind") != "S" then Vector(s"Database drift: $display is not a sequence.")
+      else
+        def drift(attribute: String, actual: Any, wanted: Any) =
+          Option.when(actual != wanted)(s"Database drift: sequence $display has $attribute $actual; expected $wanted.")
+        Vector(
+          drift("type", row.getString("type_name"), "bigint"),
+          drift("start", row.getLong("seqstart"), expected.start),
+          drift("increment", row.getLong("seqincrement"), expected.increment),
+          drift("minimum", row.getLong("seqmin"), 1L),
+          drift("maximum", row.getLong("seqmax"), Long.MaxValue),
+          drift("cache", row.getLong("seqcache"), 1L),
+          drift("cycling", row.getBoolean("seqcycle"), false),
+          Option.when(row.getBoolean("owned"))(s"Sequence $display has unsupported ownership by a column.")
+        ).flatten
+    }.headOption.getOrElse(Vector(s"Database drift: sequence $display does not exist."))
+
+  /** How check definitions are compared: exactly, with a probe table the migration may
+    * create, or structurally, which a read-only preview does and which may leave some undecided.
+    */
+  private enum CheckMode:
+    case Probe
+    case Structural(undecided: collection.mutable.Growable[String])
+
+  private def inspectTable(connection: Connection, expected: TableModel, model: SchemaModel, mode: CheckMode): Vector[String] =
+    val display = qualified(expected.name)
+    val relations = query(connection,
+      """SELECT c.oid, c.relkind, c.relispartition, c.relpersistence, c.reloftype,
+        |       c.relrowsecurity, c.relforcerowsecurity,
+        |       EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i
+        |               WHERE i.inhrelid = c.oid OR i.inhparent = c.oid) AS has_inheritance,
+        |       EXISTS (SELECT 1 FROM pg_catalog.pg_constraint k
+        |               WHERE k.conrelid = c.oid AND k.contype NOT IN ('c', 'f', 'u')
+        |                 AND NOT (k.contype = 'n' AND k.convalidated)
+        |                 AND NOT (k.contype = 'p' AND NOT k.condeferrable)
+        |              ) AS has_constraints,
+        |       EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t
+        |               WHERE t.tgrelid = c.oid AND NOT t.tgisinternal) AS has_triggers,
+        |       EXISTS (SELECT 1 FROM pg_catalog.pg_rewrite r
+        |               WHERE r.ev_class = c.oid) AS has_rules,
+        |       EXISTS (SELECT 1 FROM pg_catalog.pg_policy p
+        |               WHERE p.polrelid = c.oid) AS has_policies
+        |FROM pg_catalog.pg_class c
+        |JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        |WHERE n.nspname = ? AND c.relname = ?""".stripMargin
+    ) { statement =>
+      statement.setString(1, expected.name.schema.get.value)
+      statement.setString(2, expected.name.name.value)
+    } { row =>
+      val features = Vector(
+        Option.when(row.getString("relkind") != "r")("not an ordinary table"),
+        Option.when(row.getBoolean("relispartition") || row.getBoolean("has_inheritance"))(
+          "partitioning or inheritance"
+        ),
+        Option.when(row.getString("relpersistence") != "p")("non-permanent storage"),
+        Option.when(row.getLong("reloftype") != 0)("typed table"),
+        Option.when(row.getBoolean("has_constraints"))("unmodeled constraints"),
+        Option.when(row.getBoolean("has_triggers"))("triggers"),
+        Option.when(row.getBoolean("has_rules"))("rules"),
+        Option.when(row.getBoolean("relrowsecurity") || row.getBoolean("relforcerowsecurity") ||
+          row.getBoolean("has_policies"))("row-level security")
+      ).flatten
+      (row.getLong("oid"), features)
+    }
+    relations.headOption match
+      case None => Vector(s"Database drift: table $display does not exist.")
+      case Some((oid, features)) =>
+        val errors = Vector.newBuilder[String]
+        features.foreach(feature => errors += s"Table $display has unsupported $feature.")
+        val actual = inspectColumns(connection, oid)
+        val actualByName = actual.map(column => column.name -> column).toMap
+        val expectedNames = expected.columns.map(_.name.value).toSet
+        val actualNames = actualByName.keySet
+        (expectedNames -- actualNames).toVector.sorted.foreach { column =>
+          errors += s"Database drift: column ${quoted(column)} is missing from $display."
+        }
+        (actualNames -- expectedNames).toVector.sorted.foreach { column =>
+          errors += s"Database drift: unexpected column ${quoted(column)} in $display."
+        }
+        expected.columns.foreach { column =>
+          actualByName.get(column.name.value).foreach { databaseColumn =>
+            val columnDisplay = s"$display.${quoted(column.name.value)}"
+            if !databaseColumn.dataType.contains(column.dataType) then
+              errors += s"Database drift: column $columnDisplay type is ${databaseColumn.typeDescription}; expected ${column.dataType}."
+            if databaseColumn.nullable != column.nullable then
+              errors += s"Database drift: column $columnDisplay nullable=${databaseColumn.nullable}; expected ${column.nullable}."
+            if (databaseColumn.identity == "d") != column.identity then
+              errors += s"Database drift: column $columnDisplay identity=${databaseColumn.identity == "d"}; expected ${column.identity}."
+            databaseColumn.features.foreach { feature =>
+              errors += s"Column $columnDisplay has unsupported $feature."
+            }
+          }
+        }
+        errors ++= compareIdentitySequences(connection, oid, display, expected, actualByName)
+        val expectedKey = expected.primaryKey.flatMap(id => expected.columns.find(_.id == id)).map(_.name.value)
+        val actualKey = inspectPrimaryKey(connection, oid)
+        if actualKey != expectedKey then
+          def show(key: Vector[String]) = if key.isEmpty then "none" else key.map(quoted).mkString("(", ", ", ")")
+          errors += s"Database drift: primary key of $display is ${show(actualKey)}; expected ${show(expectedKey)}."
+        errors ++= compareUniqueKeys(connection, oid, display, expected)
+        errors ++= compareIndexes(connection, oid, display, expected)
+        errors ++= compareChecks(connection, oid, display, expected, mode)
+        errors ++= compareForeignKeys(connection, oid, display, expected, model)
+        errors.result()
+
+  /** An identity column generates from an internal sequence, which must have PostgreSQL's
+    * defaults for the column's type, as `GENERATED BY DEFAULT AS IDENTITY` creates it: start 1,
+    * increment 1, minimum 1, the type's maximum, cache 1 and no cycling.
+    */
+  private def compareIdentitySequences(
+      connection: Connection,
+      oid: Long,
+      display: String,
+      expected: TableModel,
+      actual: Map[String, DatabaseColumn]
+  ): Vector[String] =
+    val identities = expected.columns.filter(column => column.identity && actual.get(column.name.value).exists(_.identity == "d"))
+    if identities.isEmpty then Vector.empty
+    else
+      val sequences = query(connection,
+        """SELECT a.attname, CAST(CAST(s.seqtypid AS pg_catalog.regtype) AS pg_catalog.text) AS type_name,
+          |       s.seqstart, s.seqincrement, s.seqmin, s.seqmax, s.seqcache, s.seqcycle
+          |FROM pg_catalog.pg_depend d
+          |JOIN pg_catalog.pg_sequence s ON s.seqrelid = d.objid
+          |JOIN pg_catalog.pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
+          |WHERE d.classid = CAST('pg_catalog.pg_class' AS pg_catalog.regclass)
+          |  AND d.refclassid = CAST('pg_catalog.pg_class' AS pg_catalog.regclass)
+          |  AND d.refobjid = CAST(? AS pg_catalog.oid) AND d.deptype = 'i'""".stripMargin
+      )(_.setLong(1, oid)) { row =>
+        row.getString("attname") -> Vector(
+          "type" -> row.getString("type_name"), "start" -> row.getLong("seqstart"),
+          "increment" -> row.getLong("seqincrement"), "minimum" -> row.getLong("seqmin"),
+          "maximum" -> row.getLong("seqmax"), "cache" -> row.getLong("seqcache"), "cycling" -> row.getBoolean("seqcycle"))
+      }.toMap
+      identities.flatMap { column =>
+        val columnDisplay = s"$display.${quoted(column.name.value)}"
+        val (typeName, maximum) = column.dataType match
+          case SqlType.SmallInt => ("smallint", Short.MaxValue.toLong)
+          case SqlType.Integer => ("integer", Int.MaxValue.toLong)
+          case _ => ("bigint", Long.MaxValue)
+        val wanted = Vector("type" -> typeName, "start" -> 1L, "increment" -> 1L, "minimum" -> 1L,
+          "maximum" -> maximum, "cache" -> 1L, "cycling" -> false)
+        sequences.get(column.name.value) match
+          case None => Vector(s"Database drift: identity column $columnDisplay has no identity sequence.")
+          case Some(actualValues) =>
+            wanted.zip(actualValues).collect { case ((attribute, value), (_, found)) if value != found =>
+              s"Database drift: identity column $columnDisplay generates with $attribute $found; expected $value."
+            }
+      }
+
+  /** A unique constraint as the catalog shows it; `index` is the oid of the index it owns. */
+  private final case class DatabaseUniqueKey(name: String, index: Long, columns: Vector[String], features: Vector[String])
+
+  private def uniqueConstraints(connection: Connection, oid: Long): Vector[DatabaseUniqueKey] =
+    // PostgreSQL 15 added NULLS NOT DISTINCT; before, NULLs were always distinct.
+    val nullsNotDistinct =
+      if connection.getMetaData.getDatabaseMajorVersion >= 15 then "i.indnullsnotdistinct" else "false"
+    query(connection,
+      s"""SELECT k.conname, k.conindid, k.condeferrable, i.indnatts <> i.indnkeyatts AS has_include,
+         |       $nullsNotDistinct AS nulls_not_distinct,
+         |       ARRAY(SELECT CAST(a.attname AS pg_catalog.text)
+         |             FROM pg_catalog.unnest(k.conkey) WITH ORDINALITY AS u(attnum, position)
+         |             JOIN pg_catalog.pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = u.attnum
+         |             ORDER BY u.position) AS columns
+         |FROM pg_catalog.pg_constraint k
+         |JOIN pg_catalog.pg_index i ON i.indexrelid = k.conindid
+         |WHERE k.conrelid = CAST(? AS pg_catalog.oid) AND k.contype = 'u'
+         |ORDER BY k.conname""".stripMargin
+    )(_.setLong(1, oid)) { row =>
+      val features = Vector(
+        Option.when(row.getBoolean("condeferrable"))("deferrable checking"),
+        Option.when(row.getBoolean("has_include"))("INCLUDE columns"),
+        Option.when(row.getBoolean("nulls_not_distinct"))("NULLS NOT DISTINCT")
+      ).flatten
+      DatabaseUniqueKey(row.getString("conname"), row.getLong("conindid"), strings(row, "columns"), features)
+    }
+
+  /** Unique constraints match by their ordered columns, never by constraint name. */
+  private def compareUniqueKeys(connection: Connection, oid: Long, display: String, expected: TableModel): Vector[String] =
+    def show(columns: Vector[String]) = columns.map(quoted).mkString("(", ", ", ")")
+    val expectedKeys = expected.uniqueKeys.map(_.columns.map(id => expected.columns.find(_.id == id).get.name.value))
+    val actualKeys = uniqueConstraints(connection, oid)
+    actualKeys.flatMap { key =>
+      key.features.map(feature => s"Unique key ${quoted(key.name)} of $display has unsupported $feature.")
+    } ++ (expectedKeys diff actualKeys.map(_.columns)).map { key =>
+      s"Database drift: unique key ${show(key)} is missing from $display."
+    } ++ (actualKeys.map(_.columns) diff expectedKeys).map { key =>
+      s"Database drift: unexpected unique key ${show(key)} in $display."
+    }
+
+  /** Check constraints match by the name the dialect derives from the column ID and the check,
+    * must cover exactly that column and must have exactly the expected definition. PostgreSQL
+    * rewrites a check's expression, so for a migration the expected definition comes from the
+    * same server: the dialect creates the expected checks on a temporary probe table, and both
+    * definitions are compared as `pg_get_constraintdef` shows them. A preview compares
+    * structurally instead.
+    */
+  private def compareChecks(
+      connection: Connection,
+      oid: Long,
+      display: String,
+      expected: TableModel,
+      mode: CheckMode
+  ): Vector[String] =
+    val checked = expected.columns.filter(_.check.nonEmpty)
+    val byName = checked.map(column => PostgreSqlDialect.checkName(column.id, column.check.get).value -> column).toMap
+    val expectedChecks = byName.view.mapValues(_.name.value).toMap
+    val tableChecks = expected.checks.map(check => check.name.value -> check).toMap
+    val expectedDefinitions = mode match
+      case CheckMode.Probe if checked.nonEmpty || tableChecks.nonEmpty => checkDefinitions(connection, expected)
+      case _ => Map.empty[String, String]
+    val actualChecks = query(connection,
+      """SELECT k.conname, k.convalidated, pg_catalog.pg_get_constraintdef(k.oid) AS definition,
+        |       ARRAY(SELECT CAST(a.attname AS pg_catalog.text)
+        |             FROM pg_catalog.unnest(k.conkey) AS u(attnum)
+        |             JOIN pg_catalog.pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = u.attnum
+        |             ORDER BY a.attname) AS columns
+        |FROM pg_catalog.pg_constraint k
+        |WHERE k.conrelid = CAST(? AS pg_catalog.oid) AND k.contype = 'c'
+        |ORDER BY k.conname""".stripMargin
+    )(_.setLong(1, oid)) { row =>
+      (row.getString("conname"), row.getBoolean("convalidated"), row.getString("definition"), strings(row, "columns"))
+    }
+    val actualNames = actualChecks.map(_._1).toSet
+    actualChecks.flatMap { (name, validated, definition, columns) =>
+      Option.when(!validated)(s"Check constraint ${quoted(name)} of $display has unsupported NOT VALID state.").toVector ++
+        (tableChecks.get(name) match
+          case Some(_) if !validated => Vector.empty
+          case Some(_) => mode match
+            case CheckMode.Probe if !expectedDefinitions.get(name).contains(definition) =>
+              Vector(s"Database drift: check constraint ${quoted(name)} of $display is $definition; " +
+                s"expected ${expectedDefinitions.getOrElse(name, "a definition PostgreSQL did not produce")}.")
+            case CheckMode.Probe => Vector.empty
+            case CheckMode.Structural(undecided) =>
+              undecided += s"Named table check ${quoted(name)} of $display needs PostgreSQL normalization on a probe table; " +
+                "the read-only preview cannot verify its SQL predicate."
+              Vector.empty
+          case None => expectedChecks.get(name) match
+          case None => Vector(s"Database drift: unexpected check constraint ${quoted(name)} in $display.")
+          case Some(column) if columns != Vector(column) =>
+            Vector(s"Database drift: check constraint ${quoted(name)} of $display covers " +
+              s"${columns.map(quoted).mkString("(", ", ", ")")}; expected (${quoted(column)}).")
+          case Some(_) if !validated => Vector.empty
+          case Some(_) => mode match
+            case CheckMode.Probe if !expectedDefinitions.get(name).contains(definition) =>
+              Vector(s"Database drift: check constraint ${quoted(name)} of $display is $definition; " +
+                s"expected ${expectedDefinitions.getOrElse(name, "a definition PostgreSQL did not produce")}.")
+            case CheckMode.Probe => Vector.empty
+            case CheckMode.Structural(undecided) =>
+              val column = byName(name)
+              PostgreSqlCheckDefinitions.compare(definition, column, column.check.get) match
+                case PostgreSqlCheckDefinitions.Comparison.Equal => Vector.empty
+                case PostgreSqlCheckDefinitions.Comparison.Different(_) =>
+                  Vector(s"Database drift: check constraint ${quoted(name)} of $display is $definition; " +
+                    s"expected ${column.check.get}.")
+                case PostgreSqlCheckDefinitions.Comparison.Undecidable =>
+                  undecided += s"Check constraint ${quoted(name)} of $display is $definition, which cannot be compared " +
+                    s"with ${column.check.get} without a probe table."
+                  Vector.empty)
+    } ++ expectedChecks.toVector.sorted.filterNot((name, _) => actualNames.contains(name)).map { (name, column) =>
+      s"Database drift: check constraint ${quoted(name)} on column ${quoted(column)} is missing from $display."
+    } ++ tableChecks.keys.toVector.sorted.filterNot(actualNames.contains).map { name =>
+      s"Database drift: named table check ${quoted(name)} is missing from $display."
+    }
+
+  /** The canonical definitions of the model's column and table checks, by constraint name, from a
+    * temporary probe table that exists only during this call.
+    */
+  private def checkDefinitions(connection: Connection, model: TableModel): Map[String, String] =
+    val probe = SqlIdentifier("hibernate_ddl_check_probe")
+    execute(connection, PostgreSqlDialect.checkProbe(probe, model))
+    try
+      query(connection,
+        """SELECT k.conname, pg_catalog.pg_get_constraintdef(k.oid) AS definition
+          |FROM pg_catalog.pg_constraint k
+          |WHERE k.conrelid = pg_catalog.to_regclass('pg_temp.hibernate_ddl_check_probe') AND k.contype = 'c'""".stripMargin
+      )(_ => ())(row => row.getString("conname") -> row.getString("definition")).toMap
+    finally execute(connection, s"DROP TABLE pg_temp.${quoted(probe.value)}")
+
+  /** A plain index as the catalog shows it: every index of the table that neither belongs to the
+    * primary key nor to a unique constraint, with each column's direction and what the model
+    * cannot represent.
+    */
+  private final case class DatabaseIndex(name: String, oid: Long, columns: Vector[(String, Boolean)], features: Vector[String])
+
+  private def plainIndexes(connection: Connection, oid: Long): Vector[DatabaseIndex] =
+    query(connection,
+      """SELECT ic.relname AS index_name, i.indexrelid, i.indisunique, i.indisvalid AND i.indisready AS usable,
+        |       i.indpred IS NOT NULL AS partial, i.indexprs IS NOT NULL AS expressions,
+        |       i.indnatts <> i.indnkeyatts AS has_include, am.amname,
+        |       ARRAY(SELECT CAST(a.attname AS pg_catalog.text)
+        |             FROM pg_catalog.unnest(CAST(i.indkey AS pg_catalog.int2[])) WITH ORDINALITY AS k(attnum, position)
+        |             JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+        |             ORDER BY k.position) AS columns,
+        |       ARRAY(SELECT CAST(o.option AS pg_catalog.int4)
+        |             FROM pg_catalog.unnest(CAST(i.indoption AS pg_catalog.int2[])) WITH ORDINALITY AS o(option, position)
+        |             ORDER BY o.position) AS options,
+        |       EXISTS (SELECT 1 FROM pg_catalog.unnest(CAST(i.indclass AS pg_catalog.oid[])) AS c(opclass)
+        |               JOIN pg_catalog.pg_opclass opc ON opc.oid = c.opclass
+        |               WHERE NOT opc.opcdefault) AS custom_opclass,
+        |       EXISTS (SELECT 1 FROM ROWS FROM (pg_catalog.unnest(CAST(i.indkey AS pg_catalog.int2[])),
+        |                                        pg_catalog.unnest(CAST(i.indcollation AS pg_catalog.oid[])))
+        |                             AS k(attnum, collation_oid)
+        |               JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+        |               WHERE k.collation_oid <> a.attcollation) AS custom_collation
+        |FROM pg_catalog.pg_index i
+        |JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
+        |JOIN pg_catalog.pg_am am ON am.oid = ic.relam
+        |WHERE i.indrelid = CAST(? AS pg_catalog.oid) AND NOT i.indisprimary
+        |  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint k
+        |                  WHERE k.conindid = i.indexrelid AND k.contype = 'u')
+        |ORDER BY ic.relname""".stripMargin
+    )(_.setLong(1, oid)) { row =>
+      val options = {
+        val array = row.getArray("options")
+        try array.getArray.asInstanceOf[Array[Integer]].toVector.map(_.intValue)
+        finally array.free()
+      }
+      // indoption bit 1 is DESC, bit 2 NULLS FIRST; the defaults are 0 (ASC) and 3 (DESC).
+      val features = Vector(
+        Option.when(row.getBoolean("indisunique"))("uniqueness without a unique constraint"),
+        Option.when(!row.getBoolean("usable"))("invalid state"),
+        Option.when(row.getBoolean("partial"))("partial predicate"),
+        Option.when(row.getBoolean("expressions"))("expressions"),
+        Option.when(row.getBoolean("has_include"))("INCLUDE columns"),
+        Option.when(row.getString("amname") != "btree")(s"access method ${row.getString("amname")}"),
+        Option.when(row.getBoolean("custom_opclass"))("operator class"),
+        Option.when(row.getBoolean("custom_collation"))("collation"),
+        Option.when(options.exists(option => option != 0 && option != 3))("NULLS ordering")
+      ).flatten
+      DatabaseIndex(row.getString("index_name"), row.getLong("indexrelid"),
+        strings(row, "columns").zip(options.map(option => (option & 1) == 1)), features)
+    }
+
+  private def showIndex(columns: Vector[(String, Boolean)]): String =
+    columns.map((name, descending) => quoted(name) + (if descending then " DESC" else "")).mkString("(", ", ", ")")
+
+  /** Plain indexes match by their ordered columns and directions, never by name. Indexes of
+    * the primary key and of unique constraints are checked with those. Every other index must
+    * be a valid, non-unique B-tree over plain columns with default operator classes,
+    * collations and NULLS ordering.
+    */
+  private def compareIndexes(connection: Connection, oid: Long, display: String, expected: TableModel): Vector[String] =
+    val expectedIndexes = expected.indexes.map(_.columns.map { column =>
+      expected.columns.find(_.id == column.column).get.name.value -> column.descending
+    })
+    val actualIndexes = plainIndexes(connection, oid)
+    actualIndexes.flatMap { index =>
+      index.features.map(feature => s"Index ${quoted(index.name)} of $display has unsupported $feature.")
+    } ++ (expectedIndexes diff actualIndexes.map(_.columns)).map { index =>
+      s"Database drift: index ${showIndex(index)} is missing from $display."
+    } ++ (actualIndexes.map(_.columns) diff expectedIndexes).map { index =>
+      s"Database drift: unexpected index ${showIndex(index)} in $display."
+    }
+
+  /** Foreign keys match by columns and referenced columns, never by constraint name. Keys
+    * referencing this table must come from modeled tables, whose own check covers them.
+    */
+  private def compareForeignKeys(
+      connection: Connection,
+      oid: Long,
+      display: String,
+      expected: TableModel,
+      model: SchemaModel
+  ): Vector[String] =
+    def names(table: TableModel, ids: Vector[SchemaId]) = ids.map(id => table.columns.find(_.id == id).get.name.value)
+    val expectedKeys = expected.foreignKeys.map { key =>
+      val referenced = model.tables.find(_.id == key.referencedTable).get
+      ForeignKeyShape(names(expected, key.columns), qualified(referenced.name),
+        names(referenced, key.referencedColumns), key.onDeleteCascade)
+    }
+    val actualKeys = inspectForeignKeys(connection, oid)
+    val modeledTables = model.tables.map(table => qualified(table.name)).toSet
+    actualKeys.flatMap { key =>
+      key.features.map(feature => s"Foreign key ${quoted(key.name)} of $display has unsupported $feature.")
+    } ++ (expectedKeys diff actualKeys.map(_.shape)).map { key =>
+      s"Database drift: foreign key ${key.show} is missing from $display."
+    } ++ (actualKeys.map(_.shape) diff expectedKeys).map { key =>
+      s"Database drift: unexpected foreign key ${key.show} in $display."
+    } ++ inspectReferencingTables(connection, oid).filterNot(modeledTables.contains).map { referencing =>
+      s"Table $display is referenced by a foreign key of unmodeled table $referencing."
+    }
+
+  private final case class ForeignKeyShape(columns: Vector[String], referencedTable: String,
+      referencedColumns: Vector[String], onDeleteCascade: Boolean):
+    def show: String =
+      s"${columns.map(quoted).mkString("(", ", ", ")")} REFERENCES $referencedTable " +
+        referencedColumns.map(quoted).mkString("(", ", ", ")") +
+        (if onDeleteCascade then " ON DELETE CASCADE" else "")
+
+  private final case class DatabaseForeignKey(name: String, shape: ForeignKeyShape, features: Vector[String])
+
+  private def inspectForeignKeys(connection: Connection, oid: Long): Vector[DatabaseForeignKey] =
+    query(connection,
+      """SELECT k.conname, k.confupdtype, k.confdeltype, k.confmatchtype, k.condeferrable, k.convalidated,
+        |       n.nspname AS referenced_schema, r.relname AS referenced_table,
+        |       ARRAY(SELECT CAST(a.attname AS pg_catalog.text)
+        |             FROM pg_catalog.unnest(k.conkey) WITH ORDINALITY AS u(attnum, position)
+        |             JOIN pg_catalog.pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = u.attnum
+        |             ORDER BY u.position) AS columns,
+        |       ARRAY(SELECT CAST(a.attname AS pg_catalog.text)
+        |             FROM pg_catalog.unnest(k.confkey) WITH ORDINALITY AS u(attnum, position)
+        |             JOIN pg_catalog.pg_attribute a ON a.attrelid = k.confrelid AND a.attnum = u.attnum
+        |             ORDER BY u.position) AS referenced_columns
+        |FROM pg_catalog.pg_constraint k
+        |JOIN pg_catalog.pg_class r ON r.oid = k.confrelid
+        |JOIN pg_catalog.pg_namespace n ON n.oid = r.relnamespace
+        |WHERE k.conrelid = CAST(? AS pg_catalog.oid) AND k.contype = 'f'
+        |ORDER BY k.conname""".stripMargin
+    )(_.setLong(1, oid)) { row =>
+      val features = Vector(
+        Option.when(row.getString("confupdtype") != "a")("ON UPDATE action"),
+        Option.when(!Set("a", "c")(row.getString("confdeltype")))("ON DELETE action"),
+        Option.when(row.getString("confmatchtype") != "s")("MATCH FULL or PARTIAL"),
+        Option.when(row.getBoolean("condeferrable"))("deferrable checking"),
+        Option.when(!row.getBoolean("convalidated"))("NOT VALID state")
+      ).flatten
+      val referenced = quoted(row.getString("referenced_schema")) + "." + quoted(row.getString("referenced_table"))
+      DatabaseForeignKey(row.getString("conname"),
+        ForeignKeyShape(strings(row, "columns"), referenced, strings(row, "referenced_columns"),
+          row.getString("confdeltype") == "c"), features)
+    }
+
+  private def inspectReferencingTables(connection: Connection, oid: Long): Vector[String] =
+    query(connection,
+      """SELECT DISTINCT n.nspname, c.relname
+        |FROM pg_catalog.pg_constraint k
+        |JOIN pg_catalog.pg_class c ON c.oid = k.conrelid
+        |JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        |WHERE k.confrelid = CAST(? AS pg_catalog.oid) AND k.contype = 'f'""".stripMargin
+    )(_.setLong(1, oid))(row => quoted(row.getString("nspname")) + "." + quoted(row.getString("relname")))
+
+  private def strings(row: ResultSet, column: String): Vector[String] =
+    val array = row.getArray(column)
+    try array.getArray.asInstanceOf[Array[String]].toVector
+    finally array.free()
+
+  private final case class DatabaseColumn(
+      name: String,
+      dataType: Option[SqlType],
+      typeDescription: String,
+      nullable: Boolean,
+      identity: String,
+      features: Vector[String]
+  )
+
+  private def inspectColumns(connection: Connection, oid: Long): Vector[DatabaseColumn] =
+    query(connection,
+      """SELECT a.attname, a.attnotnull, a.atttypmod, a.attndims, a.atthasdef,
+        |       a.attidentity, a.attgenerated, a.attcollation, t.typcollation,
+        |       t.typname, t.typtype, n.nspname AS type_schema
+        |FROM pg_catalog.pg_attribute a
+        |JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+        |JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+        |WHERE a.attrelid = CAST(? AS pg_catalog.oid) AND a.attnum > 0 AND NOT a.attisdropped
+        |ORDER BY a.attnum""".stripMargin
+    )(_.setLong(1, oid)) { row =>
+      val typeName = row.getString("typname")
+      val typeSchema = row.getString("type_schema")
+      val typmod = row.getInt("atttypmod")
+      val nativeType = typeSchema == "pg_catalog" && row.getString("typtype") == "b" &&
+        row.getInt("attndims") == 0
+      val dataType = if !nativeType then None else typeName match
+        case "int4" if typmod == -1 => Some(SqlType.Integer)
+        case "int8" if typmod == -1 => Some(SqlType.BigInt)
+        case "bool" if typmod == -1 => Some(SqlType.Boolean)
+        case "text" if typmod == -1 => Some(SqlType.Text)
+        case "uuid" if typmod == -1 => Some(SqlType.Uuid)
+        case "varchar" if typmod > 4 => Some(SqlType.Varchar(typmod - 4))
+        // Without an explicit precision typmod is -1, which the model never creates.
+        case "timestamp" if typmod >= 0 => Some(SqlType.Timestamp(typmod))
+        case "timestamptz" if typmod >= 0 => Some(SqlType.TimestampWithTimeZone(typmod))
+        case "time" if typmod >= 0 => Some(SqlType.Time(typmod))
+        case "int2" if typmod == -1 => Some(SqlType.SmallInt)
+        case "float4" if typmod == -1 => Some(SqlType.Real)
+        case "float8" if typmod == -1 => Some(SqlType.DoublePrecision)
+        case "date" if typmod == -1 => Some(SqlType.Date)
+        case "bytea" if typmod == -1 => Some(SqlType.Binary)
+        case "oid" if typmod == -1 => Some(SqlType.LargeObject)
+        case "jsonb" if typmod == -1 => Some(SqlType.Json)
+        case "bpchar" if typmod > 4 => Some(SqlType.Char(typmod - 4))
+        // typmod - 4 holds the precision in the upper 16 bits and an 11-bit signed scale.
+        case "numeric" if typmod >= 4 && ((typmod - 4) & 0x400) == 0 =>
+          Some(SqlType.Numeric(((typmod - 4) >> 16) & 0xffff, (typmod - 4) & 0x7ff))
+        case _ => None
+      val features = Vector(
+        Option.when(row.getBoolean("atthasdef"))("default or generation expression"),
+        Option.when(row.getString("attidentity") == "a")("GENERATED ALWAYS identity"),
+        Option.when(row.getString("attgenerated").nonEmpty)("generated expression"),
+        Option.when(row.getLong("attcollation") != row.getLong("typcollation"))("custom collation")
+      ).flatten
+      DatabaseColumn(row.getString("attname"), dataType,
+        s"$typeSchema.$typeName (typmod=$typmod)", !row.getBoolean("attnotnull"), row.getString("attidentity"), features)
+    }
+
+  /** Primary key columns in key order; INCLUDE columns are listed too and therefore never match. */
+  private def inspectPrimaryKey(connection: Connection, oid: Long): Vector[String] =
+    query(connection,
+      """SELECT a.attname
+        |FROM pg_catalog.pg_index i
+        |CROSS JOIN LATERAL pg_catalog.unnest(CAST(i.indkey AS pg_catalog.int2[])) WITH ORDINALITY AS k(attnum, position)
+        |JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+        |WHERE i.indrelid = CAST(? AS pg_catalog.oid) AND i.indisprimary
+        |ORDER BY k.position""".stripMargin
+    )(_.setLong(1, oid))(_.getString("attname"))
+
+  private def query[A](connection: Connection, sql: String)(bind: PreparedStatement => Unit)(
+      read: ResultSet => A
+  ): Vector[A] =
+    Using.resource(connection.prepareStatement(sql)) { statement =>
+      bind(statement)
+      Using.resource(statement.executeQuery()) { rows =>
+        val values = Vector.newBuilder[A]
+        while rows.next() do values += read(rows)
+        values.result()
+      }
+    }
+
+  private def execute(connection: Connection, sql: String): Unit =
+    Using.resource(connection.createStatement()) { statement =>
+      statement.execute(sql)
+      ()
+    }
+
+  private def qualified(name: QualifiedName): String =
+    (name.schema.toVector :+ name.name).map(identifier => quoted(identifier.value)).mkString(".")
+
+  private def quoted(identifier: String): String = "\"" + identifier.replace("\"", "\"\"") + "\""

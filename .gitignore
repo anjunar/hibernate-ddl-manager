@@ -1,0 +1,19 @@
+# Build output (including nested sbt builds)
+target/
+project/project/
+
+# IDEs and Scala tooling
+.idea/
+*.iml
+.bsp/
+.bloop/
+.metals/
+.scala-build/
+
+# Local configuration
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+Thumbs.db
