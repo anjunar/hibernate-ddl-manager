@@ -1,5 +1,6 @@
 package com.anjunar.hibernateddl.core
 
-trait DatabaseIntrospector:
-  def inspect(connection: java.sql.Connection): Either[Vector[String], SchemaModel]
+import java.sql.Connection
 
+trait DatabaseIntrospector:
+  def inspect(connection: Connection): Either[Vector[String], SchemaModel]

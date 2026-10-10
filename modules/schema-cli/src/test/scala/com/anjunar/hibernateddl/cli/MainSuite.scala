@@ -1,6 +1,8 @@
 package com.anjunar.hibernateddl.cli
 
-class MainSuite extends munit.FunSuite:
+import munit.FunSuite
+
+class MainSuite extends FunSuite:
   test("demo produces the expected rename statement end to end") {
     val output = Main.run(Vector("demo")).toOption.get
     assert(output.contains("Stable ID: 7f3a9c21/f34e45b6"))

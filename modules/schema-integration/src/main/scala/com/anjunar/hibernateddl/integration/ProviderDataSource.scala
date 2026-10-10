@@ -33,28 +33,31 @@ private final class ProviderDataSource(provider: ConnectionProvider) extends Dat
       if !autoCommit then
         raw.rollback()
         raw.setAutoCommit(true)
-      Proxy.newProxyInstance(classOf[Connection].getClassLoader, Array(classOf[Connection]), new InvocationHandler:
-        private var closed = false
-        def invoke(proxy: AnyRef, method: Method, args: Array[AnyRef]): AnyRef =
-          method.getName match
-            case "close" =>
-              if !closed then
-                closed = true
-                try
-                  // The executor ends its transaction first, or aborts the connection.
-                  if !raw.isClosed && raw.getAutoCommit != autoCommit then raw.setAutoCommit(autoCommit)
-                catch
-                  case NonFatal(error) =>
-                    resetFailure = Some(error)
-                    try raw.abort((command: Runnable) => command.run())
-                    catch case NonFatal(abortError) => error.addSuppressed(abortError)
-                    throw error
-                finally provider.closeConnection(raw)
-              null
-            case "isClosed" => Boolean.box(closed || raw.isClosed)
-            case _ =>
-              try method.invoke(raw, Option(args).getOrElse(Array.empty[AnyRef])*)
-              catch case error: InvocationTargetException => throw error.getCause
+      Proxy.newProxyInstance(
+        classOf[Connection].getClassLoader,
+        Array(classOf[Connection]),
+        new InvocationHandler:
+          private var closed = false
+          def invoke(proxy: AnyRef, method: Method, args: Array[AnyRef]): AnyRef =
+            method.getName match
+              case "close" =>
+                if !closed then
+                  closed = true
+                  try
+                    // The executor ends its transaction first, or aborts the connection.
+                    if !raw.isClosed && raw.getAutoCommit != autoCommit then raw.setAutoCommit(autoCommit)
+                  catch
+                    case NonFatal(error) =>
+                      resetFailure = Some(error)
+                      try raw.abort((command: Runnable) => command.run())
+                      catch case NonFatal(abortError) => error.addSuppressed(abortError)
+                      throw error
+                  finally provider.closeConnection(raw)
+                null
+              case "isClosed" => Boolean.box(closed || raw.isClosed)
+              case _          =>
+                try method.invoke(raw, Option(args).getOrElse(Array.empty[AnyRef])*)
+                catch case error: InvocationTargetException => throw error.getCause
       ).asInstanceOf[Connection]
     catch
       case NonFatal(error) =>

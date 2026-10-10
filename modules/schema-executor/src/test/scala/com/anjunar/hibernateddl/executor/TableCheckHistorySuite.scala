@@ -4,8 +4,11 @@ import com.anjunar.hibernateddl.core.*
 import munit.FunSuite
 
 class TableCheckHistorySuite extends FunSuite:
-  private val table = TableModel(SchemaId("post"), QualifiedName(SqlIdentifier("post")),
-    Vector(ColumnModel(SchemaId("id"), SqlIdentifier("id"), SqlType.Integer)))
+  private val table = TableModel(
+    SchemaId("post"),
+    QualifiedName(SqlIdentifier("post")),
+    Vector(ColumnModel(SchemaId("id"), SqlIdentifier("id"), SqlType.Integer))
+  )
   private val check = TableCheck(SqlIdentifier("quoted \"check\""), "id > 0 AND 'é' = 'é'")
 
   test("named checks round-trip with strict format 8 fields") {

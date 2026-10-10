@@ -6,6 +6,6 @@ import org.hibernate.annotations.{JdbcTypeCode, NaturalId, OnDelete, OnDeleteAct
 import org.hibernate.`type`.SqlTypes
 
 import scala.compiletime.uninitialized
-enum Status extends java.lang.Enum[Status]:
+import java.lang.Enum
+enum Status extends Enum[Status]:
   case Draft, Sent, Paid
-

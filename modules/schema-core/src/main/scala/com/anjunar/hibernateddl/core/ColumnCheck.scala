@@ -6,4 +6,3 @@ package com.anjunar.hibernateddl.core
 enum ColumnCheck:
   case AllowedValues(values: Vector[String])
   case Range(min: Long, max: Long)
-

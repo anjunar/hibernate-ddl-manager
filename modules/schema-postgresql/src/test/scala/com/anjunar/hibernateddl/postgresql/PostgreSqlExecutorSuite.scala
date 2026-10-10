@@ -5,12 +5,14 @@ import com.anjunar.hibernateddl.executor.*
 import java.util.concurrent.{Callable, CountDownLatch, Executors, TimeUnit}
 import javax.sql.DataSource
 import scala.util.Using
+import java.sql.SQLException
 
 class PostgreSqlExecutorSuite extends TestPostgres:
   private val executor = new JdbcMigrationExecutor(PostgreSqlMigrationBackend)
 
   private val login = ColumnModel(SchemaId("USER_LOGIN"), SqlIdentifier("username"), SqlType.Varchar(100), false)
-  private val users = TableModel(SchemaId("USER"), QualifiedName(SqlIdentifier("users"), Some(SqlIdentifier("public"))), Vector(login))
+  private val users =
+    TableModel(SchemaId("USER"), QualifiedName(SqlIdentifier("users"), Some(SqlIdentifier("public"))), Vector(login))
   private val renamed = users.copy(
     name = users.name.copy(name = SqlIdentifier("accounts")),
     columns = Vector(login.copy(name = SqlIdentifier("login_name")))
@@ -35,9 +37,14 @@ class PostgreSqlExecutorSuite extends TestPostgres:
       assertEquals(scalar(ds, "SELECT username FROM public.users"), "patrick")
       assertEquals(executor.migrate(ds, initial), MigrationResult(1, MigrationStatus.AlreadyApplied, 0))
       assertEquals(revisions(ds), "1")
-      assertEquals(scalar(ds, "SELECT model #>> '{tables,0,columns,0,name}' FROM __hibernate_ddl.schema_history"), "username")
-      assertEquals(scalar(ds, "SELECT statements[1] FROM __hibernate_ddl.schema_history"),
-        "CREATE TABLE \"public\".\"users\" (\"username\" varchar(100) NOT NULL);")
+      assertEquals(
+        scalar(ds, "SELECT model #>> '{tables,0,columns,0,name}' FROM __hibernate_ddl.schema_history"),
+        "username"
+      )
+      assertEquals(
+        scalar(ds, "SELECT statements[1] FROM __hibernate_ddl.schema_history"),
+        "CREATE TABLE \"public\".\"users\" (\"username\" varchar(100) NOT NULL);"
+      )
     }
   }
 
@@ -46,7 +53,10 @@ class PostgreSqlExecutorSuite extends TestPostgres:
       fixture(ds)
       assertEquals(executor.migrate(ds, target), MigrationResult(2, MigrationStatus.Applied, 2))
       assertEquals(scalar(ds, "SELECT login_name FROM public.accounts"), "patrick")
-      assertEquals(scalar(ds, "SELECT string_agg(revision::text, ',' ORDER BY revision) FROM __hibernate_ddl.schema_history"), "1,2")
+      assertEquals(
+        scalar(ds, "SELECT string_agg(revision::text, ',' ORDER BY revision) FROM __hibernate_ddl.schema_history"),
+        "1,2"
+      )
       assertEquals(executor.migrate(ds, target).status, MigrationStatus.AlreadyApplied)
       assertEquals(revisions(ds), "2")
     }
@@ -56,7 +66,8 @@ class PostgreSqlExecutorSuite extends TestPostgres:
     withDatabase { ds =>
       fixture(ds)
       val biography = ColumnModel(SchemaId("USER_BIO"), SqlIdentifier("biography"), SqlType.Text)
-      val latest = SchemaModel(Vector(renamed.copy(columns = Vector(login.copy(name = SqlIdentifier("handle")), biography))))
+      val latest =
+        SchemaModel(Vector(renamed.copy(columns = Vector(login.copy(name = SqlIdentifier("handle")), biography))))
       assertEquals(executor.migrate(ds, latest), MigrationResult(2, MigrationStatus.Applied, 3))
       assertEquals(scalar(ds, "SELECT handle FROM public.accounts WHERE biography IS NULL"), "patrick")
     }
@@ -81,8 +92,14 @@ class PostgreSqlExecutorSuite extends TestPostgres:
       val unsafe = SchemaModel(Vector(users.copy(columns = users.columns :+ required)))
       assert(intercept[MigrationException](executor.migrate(ds, unsafe)).getMessage.contains("backfill"))
       assertEquals(scalar(ds, "SELECT username FROM public.users"), "patrick")
-      assertEquals(scalar(ds, "SELECT to_regclass('public.users') IS NOT NULL AND NOT EXISTS (SELECT 1 FROM pg_attribute " +
-        "WHERE attrelid = 'public.users'::regclass AND attname = 'biography')"), "t")
+      assertEquals(
+        scalar(
+          ds,
+          "SELECT to_regclass('public.users') IS NOT NULL AND NOT EXISTS (SELECT 1 FROM pg_attribute " +
+            "WHERE attrelid = 'public.users'::regclass AND attname = 'biography')"
+        ),
+        "t"
+      )
       assertEquals(revisions(ds), "1")
     }
   }
@@ -109,8 +126,11 @@ class PostgreSqlExecutorSuite extends TestPostgres:
 
   test("a later DDL failure rolls back earlier DDL and history atomically") {
     withDatabase { ds =>
-      val other = TableModel(SchemaId("Z_OTHER"), QualifiedName(SqlIdentifier("z_other"), Some(SqlIdentifier("public"))),
-        Vector(ColumnModel(SchemaId("Z_VALUE"), SqlIdentifier("value"), SqlType.Text)))
+      val other = TableModel(
+        SchemaId("Z_OTHER"),
+        QualifiedName(SqlIdentifier("z_other"), Some(SqlIdentifier("public"))),
+        Vector(ColumnModel(SchemaId("Z_VALUE"), SqlIdentifier("value"), SqlType.Text))
+      )
       fixture(ds, SchemaModel(Vector(users, other)))
       execute(ds, "CREATE SEQUENCE public.occupied")
       val failure = SchemaModel(Vector(renamed, other.copy(name = other.name.copy(name = SqlIdentifier("occupied")))))
@@ -130,8 +150,7 @@ class PostgreSqlExecutorSuite extends TestPostgres:
         val runs = Vector.fill(2)(pool.submit(new Callable[MigrationResult]:
           def call(): MigrationResult =
             start.await()
-            executor.migrate(ds, target)
-        ))
+            executor.migrate(ds, target)))
         start.countDown()
         val statuses = runs.map(_.get(15, TimeUnit.SECONDS).status).toSet
         assertEquals(statuses, Set(MigrationStatus.Applied, MigrationStatus.AlreadyApplied))
@@ -149,8 +168,10 @@ class PostgreSqlExecutorSuite extends TestPostgres:
         blocker.setAutoCommit(false)
         try
           PostgreSqlMigrationBackend.acquireLock(blocker, ExecutionOptions())
-          val impatient = new JdbcMigrationExecutor(PostgreSqlMigrationBackend,
-            ExecutionOptions(lockTimeoutMillis = 100, statementTimeoutMillis = 2000))
+          val impatient = new JdbcMigrationExecutor(
+            PostgreSqlMigrationBackend,
+            ExecutionOptions(lockTimeoutMillis = 100, statementTimeoutMillis = 2000)
+          )
           assertEquals(intercept[MigrationException](impatient.migrate(ds, target)).state, FailureState.RolledBack)
         finally blocker.rollback()
       }
@@ -163,8 +184,10 @@ class PostgreSqlExecutorSuite extends TestPostgres:
   test("checking an applied schema lets a running application keep writing; a migration waits for it") {
     withDatabase { ds =>
       fixture(ds)
-      val impatient = new JdbcMigrationExecutor(PostgreSqlMigrationBackend,
-        ExecutionOptions(lockTimeoutMillis = 200, statementTimeoutMillis = 2000))
+      val impatient = new JdbcMigrationExecutor(
+        PostgreSqlMigrationBackend,
+        ExecutionOptions(lockTimeoutMillis = 200, statementTimeoutMillis = 2000)
+      )
       Using.resource(ds.getConnection) { application =>
         application.setAutoCommit(false)
         try
@@ -181,28 +204,38 @@ class PostgreSqlExecutorSuite extends TestPostgres:
 
   test("a column becomes required when no row holds NULL, and optional again") {
     val nick = ColumnModel(SchemaId("USER_NICK"), SqlIdentifier("nick"), SqlType.Text)
-    def withNick(nullable: Boolean) = SchemaModel(Vector(users.copy(columns = Vector(login, nick.copy(nullable = nullable)))))
+    def withNick(nullable: Boolean) =
+      SchemaModel(Vector(users.copy(columns = Vector(login, nick.copy(nullable = nullable)))))
     def nickColumns(ds: DataSource) =
       scalar(ds, "SELECT count(*) FROM pg_attribute WHERE attrelid = 'public.users'::regclass AND attname = 'nick'")
     withDatabase { ds =>
       fixture(ds)
       val refused = intercept[MigrationException](executor.migrate(ds, withNick(false)))
       assertEquals(refused.state, FailureState.RolledBack)
-      assert(refused.getMessage.contains("Column 'USER_NICK' (public.users.nick) becomes required, but 1 row holds NULL"),
-        refused.getMessage)
+      assert(
+        refused.getMessage.contains("Column 'USER_NICK' (public.users.nick) becomes required, but 1 row holds NULL"),
+        refused.getMessage
+      )
       assertEquals(nickColumns(ds), "0")
       assertEquals(executor.migrate(ds, withNick(true)).revision, 2L)
       execute(ds, "UPDATE public.users SET nick = 'pat'")
       assertEquals(executor.migrate(ds, withNick(false)), MigrationResult(3, MigrationStatus.Applied, 1))
-      intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.users VALUES ('ada', NULL)"))
-      val loosen = new JdbcMigrationExecutor(PostgreSqlMigrationBackend, ExecutionOptions(approvals = Set(Approval.Revert(2))))
+      intercept[SQLException](execute(ds, "INSERT INTO public.users VALUES ('ada', NULL)"))
+      val loosen =
+        new JdbcMigrationExecutor(PostgreSqlMigrationBackend, ExecutionOptions(approvals = Set(Approval.Revert(2))))
       assertEquals(loosen.migrate(ds, withNick(true)), MigrationResult(4, MigrationStatus.Applied, 1))
       execute(ds, "INSERT INTO public.users VALUES ('ada', NULL)")
     }
     withDatabase { ds =>
       assertEquals(executor.migrate(ds, initial).status, MigrationStatus.Applied)
       assertEquals(executor.migrate(ds, withNick(false)), MigrationResult(2, MigrationStatus.Applied, 2))
-      assertEquals(scalar(ds, "SELECT attnotnull FROM pg_attribute WHERE attrelid = 'public.users'::regclass AND attname = 'nick'"), "t")
+      assertEquals(
+        scalar(
+          ds,
+          "SELECT attnotnull FROM pg_attribute WHERE attrelid = 'public.users'::regclass AND attname = 'nick'"
+        ),
+        "t"
+      )
     }
   }
 
@@ -240,14 +273,18 @@ class PostgreSqlExecutorSuite extends TestPostgres:
   test("primary keys are created, survive a key column rename and are verified") {
     withDatabase { ds =>
       val id = ColumnModel(SchemaId("ACCOUNT_ID"), SqlIdentifier("id"), SqlType.BigInt, false)
-      val accounts = TableModel(SchemaId("ACCOUNT"), QualifiedName(SqlIdentifier("accounts"), Some(SqlIdentifier("public"))),
-        Vector(id, login), Vector(id.id))
+      val accounts = TableModel(
+        SchemaId("ACCOUNT"),
+        QualifiedName(SqlIdentifier("accounts"), Some(SqlIdentifier("public"))),
+        Vector(id, login),
+        Vector(id.id)
+      )
       assertEquals(executor.migrate(ds, SchemaModel(Vector(accounts))).status, MigrationStatus.Applied)
       execute(ds, "INSERT INTO public.accounts VALUES (1, 'patrick')")
       val renamedKey = accounts.copy(columns = Vector(id.copy(name = SqlIdentifier("account_id")), login))
       assertEquals(executor.migrate(ds, SchemaModel(Vector(renamedKey))).status, MigrationStatus.Applied)
       assertEquals(scalar(ds, "SELECT username FROM public.accounts WHERE account_id = 1"), "patrick")
-      intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.accounts VALUES (1, 'duplicate')"))
+      intercept[SQLException](execute(ds, "INSERT INTO public.accounts VALUES (1, 'duplicate')"))
       execute(ds, "ALTER TABLE public.accounts DROP CONSTRAINT accounts_pkey")
       val error = intercept[MigrationException](executor.migrate(ds, SchemaModel(Vector(renamedKey))))
       assert(error.getMessage.contains("primary key"), error.getMessage)
@@ -271,10 +308,15 @@ class PostgreSqlExecutorSuite extends TestPostgres:
       val expanded = SchemaModel(Vector(renamed.copy(columns = renamed.columns ++ extras)))
       assertEquals(executor.migrate(ds, expanded).status, MigrationStatus.Applied)
       assertEquals(scalar(ds, "SELECT login_name FROM public.accounts"), "patrick")
-      execute(ds, "UPDATE public.accounts SET token = '8f2c4c1e-3f6b-4a8e-9d3a-2b7c1e5f0a94', " +
-        "seen_at = '2026-09-24 12:34:56.789', paid_at = '2026-09-24 12:34:56.123456+02'")
-      assertEquals(scalar(ds, "SELECT token::text || ' ' || seen_at::text FROM public.accounts"),
-        "8f2c4c1e-3f6b-4a8e-9d3a-2b7c1e5f0a94 2026-09-24 12:34:56.789")
+      execute(
+        ds,
+        "UPDATE public.accounts SET token = '8f2c4c1e-3f6b-4a8e-9d3a-2b7c1e5f0a94', " +
+          "seen_at = '2026-09-24 12:34:56.789', paid_at = '2026-09-24 12:34:56.123456+02'"
+      )
+      assertEquals(
+        scalar(ds, "SELECT token::text || ' ' || seen_at::text FROM public.accounts"),
+        "8f2c4c1e-3f6b-4a8e-9d3a-2b7c1e5f0a94 2026-09-24 12:34:56.789"
+      )
       assertEquals(executor.migrate(ds, expanded).status, MigrationStatus.AlreadyApplied)
     }
   }
@@ -282,7 +324,10 @@ class PostgreSqlExecutorSuite extends TestPostgres:
   test("a precision PostgreSQL cannot store is refused before a connection") {
     withDatabase { ds =>
       val precise = ColumnModel(SchemaId("SEEN"), SqlIdentifier("seen_at"), SqlType.Timestamp(9))
-      val error = intercept[MigrationException](executor.migrate(ds, SchemaModel(Vector(users.copy(columns = users.columns :+ precise)))))
+      val error = intercept[MigrationException](executor.migrate(
+        ds,
+        SchemaModel(Vector(users.copy(columns = users.columns :+ precise)))
+      ))
       assertEquals(error.state, FailureState.NotStarted)
       assert(error.getMessage.contains("Table 'USER': table column has TIMESTAMP precision 9"), error.getMessage)
       noHistory(ds)
@@ -304,20 +349,32 @@ class PostgreSqlExecutorSuite extends TestPostgres:
         ColumnModel(SchemaId("T_LOB"), SqlIdentifier("document"), SqlType.LargeObject),
         ColumnModel(SchemaId("T_JSON"), SqlIdentifier("settings"), SqlType.Json)
       )
-      val typed = SchemaModel(Vector(TableModel(SchemaId("T"), QualifiedName(SqlIdentifier("typed"), Some(SqlIdentifier("public"))),
-        columns, Vector(columns.head.id))))
+      val typed = SchemaModel(Vector(TableModel(
+        SchemaId("T"),
+        QualifiedName(SqlIdentifier("typed"), Some(SqlIdentifier("public"))),
+        columns,
+        Vector(columns.head.id)
+      )))
       assertEquals(executor.migrate(ds, typed).status, MigrationStatus.Applied)
-      execute(ds, "INSERT INTO public.typed VALUES (1, 'EUR', 12.345, 99999999999999999999, '08:30:15', 1.5, 0.25, " +
-        "'2026-09-24', '\\xcafe', lo_from_bytea(0, 'large'), '{\"theme\": \"dark\"}')")
+      execute(
+        ds,
+        "INSERT INTO public.typed VALUES (1, 'EUR', 12.345, 99999999999999999999, '08:30:15', 1.5, 0.25, " +
+          "'2026-09-24', '\\xcafe', lo_from_bytea(0, 'large'), '{\"theme\": \"dark\"}')"
+      )
       assertEquals(scalar(ds, "SELECT settings ->> 'theme' FROM public.typed"), "dark")
       assertEquals(scalar(ds, "SELECT convert_from(lo_get(document), 'UTF8') FROM public.typed"), "large")
-      assertEquals(scalar(ds, "SELECT concat_ws(' ', code, price, total, opens_at, weight, ratio, day, data) FROM public.typed"),
-        "EUR 12.35 99999999999999999999 08:30:15 1.5 0.25 2026-09-24 \\xcafe")
+      assertEquals(
+        scalar(ds, "SELECT concat_ws(' ', code, price, total, opens_at, weight, ratio, day, data) FROM public.typed"),
+        "EUR 12.35 99999999999999999999 08:30:15 1.5 0.25 2026-09-24 \\xcafe"
+      )
       assertEquals(executor.migrate(ds, typed).status, MigrationStatus.AlreadyApplied)
       execute(ds, "ALTER TABLE public.typed ALTER COLUMN price TYPE numeric(12,2), ALTER COLUMN settings TYPE json")
       val error = intercept[MigrationException](executor.migrate(ds, typed))
       assert(error.getMessage.contains("expected Numeric(10,2)"), error.getMessage)
-      assert(error.getMessage.contains("column \"public\".\"typed\".\"settings\" type is pg_catalog.json"), error.getMessage)
+      assert(
+        error.getMessage.contains("column \"public\".\"typed\".\"settings\" type is pg_catalog.json"),
+        error.getMessage
+      )
     }
   }
 
@@ -327,23 +384,35 @@ class PostgreSqlExecutorSuite extends TestPostgres:
         val seen = ColumnModel(SchemaId("SEEN"), SqlIdentifier("seen_at"), SqlType.Timestamp(3))
         fixture(ds, SchemaModel(Vector(users.copy(columns = users.columns :+ seen))))
         execute(ds, s"ALTER TABLE public.users ALTER COLUMN seen_at TYPE $actual")
-        val error = intercept[MigrationException](executor.migrate(ds, SchemaModel(Vector(users.copy(columns = users.columns :+ seen)))))
+        val error = intercept[MigrationException](executor.migrate(
+          ds,
+          SchemaModel(Vector(users.copy(columns = users.columns :+ seen)))
+        ))
         assert(error.getMessage.contains("expected Timestamp(3)"), error.getMessage)
       }
     }
   }
 
   private val customerId = ColumnModel(SchemaId("CUSTOMER_ID"), SqlIdentifier("id"), SqlType.BigInt, false)
-  private val customers = TableModel(SchemaId("CUSTOMER"), QualifiedName(SqlIdentifier("customer"), Some(SqlIdentifier("crm"))),
-    Vector(customerId), Vector(customerId.id))
+  private val customers = TableModel(
+    SchemaId("CUSTOMER"),
+    QualifiedName(SqlIdentifier("customer"), Some(SqlIdentifier("crm"))),
+    Vector(customerId),
+    Vector(customerId.id)
+  )
   private val invoiceId = ColumnModel(SchemaId("INVOICE_ID"), SqlIdentifier("id"), SqlType.BigInt, false)
   private val owner = ColumnModel(SchemaId("INVOICE_OWNER"), SqlIdentifier("customer_id"), SqlType.BigInt, false)
   private val correction = ColumnModel(SchemaId("INVOICE_CORRECTION"), SqlIdentifier("correction_id"), SqlType.BigInt)
-  private val invoices = TableModel(SchemaId("INVOICE"), QualifiedName(SqlIdentifier("invoice"), Some(SqlIdentifier("public"))),
-    Vector(invoiceId, owner, correction), Vector(invoiceId.id), Vector(
+  private val invoices = TableModel(
+    SchemaId("INVOICE"),
+    QualifiedName(SqlIdentifier("invoice"), Some(SqlIdentifier("public"))),
+    Vector(invoiceId, owner, correction),
+    Vector(invoiceId.id),
+    Vector(
       ForeignKeyModel(Vector(owner.id), customers.id, customers.primaryKey),
       ForeignKeyModel(Vector(correction.id), SchemaId("INVOICE"), Vector(invoiceId.id))
-    ))
+    )
+  )
   private val billing = SchemaModel(Vector(invoices, customers))
 
   private def billingFixture(ds: DataSource): Unit =
@@ -355,8 +424,8 @@ class PostgreSqlExecutorSuite extends TestPostgres:
   test("foreign keys across schemas and to the own table are created, enforced and verified on restart") {
     withDatabase { ds =>
       billingFixture(ds)
-      intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.invoice VALUES (12, 2, NULL)"))
-      intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.invoice VALUES (12, 1, 99)"))
+      intercept[SQLException](execute(ds, "INSERT INTO public.invoice VALUES (12, 2, NULL)"))
+      intercept[SQLException](execute(ds, "INSERT INTO public.invoice VALUES (12, 1, 99)"))
       assertEquals(executor.migrate(ds, billing), MigrationResult(1, MigrationStatus.AlreadyApplied, 0))
     }
   }
@@ -366,12 +435,17 @@ class PostgreSqlExecutorSuite extends TestPostgres:
       billingFixture(ds)
       val renamed = SchemaModel(Vector(
         invoices.copy(columns = Vector(invoiceId, owner.copy(name = SqlIdentifier("client_id")), correction)),
-        customers.copy(name = customers.name.copy(name = SqlIdentifier("client")),
-          columns = Vector(customerId.copy(name = SqlIdentifier("client_no"))))
+        customers.copy(
+          name = customers.name.copy(name = SqlIdentifier("client")),
+          columns = Vector(customerId.copy(name = SqlIdentifier("client_no")))
+        )
       ))
       assertEquals(executor.migrate(ds, renamed), MigrationResult(2, MigrationStatus.Applied, 3))
-      assertEquals(scalar(ds, "SELECT count(*) FROM public.invoice i JOIN crm.client c ON c.client_no = i.client_id"), "2")
-      intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.invoice VALUES (12, 2, NULL)"))
+      assertEquals(
+        scalar(ds, "SELECT count(*) FROM public.invoice i JOIN crm.client c ON c.client_no = i.client_id"),
+        "2"
+      )
+      intercept[SQLException](execute(ds, "INSERT INTO public.invoice VALUES (12, 2, NULL)"))
     }
   }
 
@@ -379,11 +453,16 @@ class PostgreSqlExecutorSuite extends TestPostgres:
     withDatabase { ds =>
       billingFixture(ds)
       val approver = ColumnModel(SchemaId("INVOICE_APPROVER"), SqlIdentifier("approver_id"), SqlType.BigInt)
-      val approved = SchemaModel(Vector(invoices.copy(columns = invoices.columns :+ approver,
-        foreignKeys = invoices.foreignKeys :+ ForeignKeyModel(Vector(approver.id), customers.id, customers.primaryKey)), customers))
+      val approved = SchemaModel(Vector(
+        invoices.copy(
+          columns = invoices.columns :+ approver,
+          foreignKeys = invoices.foreignKeys :+ ForeignKeyModel(Vector(approver.id), customers.id, customers.primaryKey)
+        ),
+        customers
+      ))
       assertEquals(executor.migrate(ds, approved), MigrationResult(2, MigrationStatus.Applied, 2))
       execute(ds, "UPDATE public.invoice SET approver_id = 1")
-      intercept[java.sql.SQLException](execute(ds, "UPDATE public.invoice SET approver_id = 2"))
+      intercept[SQLException](execute(ds, "UPDATE public.invoice SET approver_id = 2"))
     }
   }
 
@@ -391,24 +470,37 @@ class PostgreSqlExecutorSuite extends TestPostgres:
     withDatabase { ds =>
       val parentId = ColumnModel(SchemaId("parent/id"), SqlIdentifier("id"), SqlType.Uuid, nullable = false)
       val parentTenant = ColumnModel(SchemaId("parent/tenant"), SqlIdentifier("tenant"), SqlType.Text, nullable = false)
-      val parent = TableModel(SchemaId("parent"), QualifiedName(SqlIdentifier("parent"), Some(SqlIdentifier("public"))),
-        Vector(parentId, parentTenant), Vector(parentId.id),
-        uniqueKeys = Vector(UniqueKeyModel(Vector(parentId.id, parentTenant.id))))
+      val parent = TableModel(
+        SchemaId("parent"),
+        QualifiedName(SqlIdentifier("parent"), Some(SqlIdentifier("public"))),
+        Vector(parentId, parentTenant),
+        Vector(parentId.id),
+        uniqueKeys = Vector(UniqueKeyModel(Vector(parentId.id, parentTenant.id)))
+      )
       val ref = ColumnModel(SchemaId("translation/ref"), SqlIdentifier("page_id"), SqlType.Uuid, nullable = false)
       val locale = ColumnModel(SchemaId("translation/locale"), SqlIdentifier("locale"), SqlType.Text, nullable = false)
       val scope = ColumnModel(SchemaId("translation/tenant"), SqlIdentifier("tenant"), SqlType.Text, nullable = false)
-      val translation = TableModel(SchemaId("translation"),
+      val translation = TableModel(
+        SchemaId("translation"),
         QualifiedName(SqlIdentifier("translation"), Some(SqlIdentifier("public"))),
-        Vector(ref, locale, scope), Vector(ref.id, locale.id),
-        foreignKeys = Vector(ForeignKeyModel(Vector(ref.id, scope.id), parent.id,
-          Vector(parentId.id, parentTenant.id), onDeleteCascade = true)))
+        Vector(ref, locale, scope),
+        Vector(ref.id, locale.id),
+        foreignKeys = Vector(ForeignKeyModel(
+          Vector(ref.id, scope.id),
+          parent.id,
+          Vector(parentId.id, parentTenant.id),
+          onDeleteCascade = true
+        ))
+      )
       val model = SchemaModel(Vector(parent, translation))
       assertEquals(executor.migrate(ds, model).status, MigrationStatus.Applied)
       assertEquals(executor.migrate(ds, model).status, MigrationStatus.AlreadyApplied)
       val id = "'00000000-0000-0000-0000-000000000001'"
       execute(ds, s"INSERT INTO public.parent VALUES ($id, 'tenant-a')")
-      intercept[java.sql.SQLException](execute(ds,
-        s"INSERT INTO public.translation VALUES ($id, 'de', 'tenant-b')"))
+      intercept[SQLException](execute(
+        ds,
+        s"INSERT INTO public.translation VALUES ($id, 'de', 'tenant-b')"
+      ))
       execute(ds, s"INSERT INTO public.translation VALUES ($id, 'de', 'tenant-a')")
       execute(ds, s"DELETE FROM public.parent WHERE id = $id")
       assertEquals(scalar(ds, "SELECT count(*) FROM public.translation"), "0")
@@ -419,10 +511,12 @@ class PostgreSqlExecutorSuite extends TestPostgres:
   test("missing, extra and cascading foreign keys and references from unmodeled tables block the start") {
     Vector(
       "ALTER TABLE public.invoice DROP CONSTRAINT invoice_customer_id_fkey" -> "is missing from",
-      "ALTER TABLE public.invoice ADD FOREIGN KEY (customer_id) REFERENCES crm.customer (id)" -> "unexpected foreign key",
+      "ALTER TABLE public.invoice ADD FOREIGN KEY (customer_id) REFERENCES crm.customer (id)" ->
+        "unexpected foreign key",
       "ALTER TABLE public.invoice DROP CONSTRAINT invoice_customer_id_fkey, " +
         "ADD FOREIGN KEY (customer_id) REFERENCES crm.customer (id) ON DELETE CASCADE" -> "unexpected foreign key",
-      "CREATE TABLE public.audit (customer_id bigint REFERENCES crm.customer (id))" -> "unmodeled table \"public\".\"audit\""
+      "CREATE TABLE public.audit (customer_id bigint REFERENCES crm.customer (id))" ->
+        "unmodeled table \"public\".\"audit\""
     ).foreach { (change, message) =>
       withDatabase { ds =>
         billingFixture(ds)
@@ -434,13 +528,15 @@ class PostgreSqlExecutorSuite extends TestPostgres:
   }
 
   private val tenant = ColumnModel(SchemaId("USER_TENANT"), SqlIdentifier("tenant"), SqlType.Text)
-  private val uniqueUsers = SchemaModel(Vector(users.copy(columns = users.columns :+ tenant,
-    uniqueKeys = Vector(UniqueKeyModel(Vector(login.id)), UniqueKeyModel(Vector(tenant.id, login.id))))))
+  private val uniqueUsers = SchemaModel(Vector(users.copy(
+    columns = users.columns :+ tenant,
+    uniqueKeys = Vector(UniqueKeyModel(Vector(login.id)), UniqueKeyModel(Vector(tenant.id, login.id)))
+  )))
 
   test("unique keys are created with the table, enforced and verified on restart") {
     withDatabase { ds =>
       fixture(ds, uniqueUsers)
-      intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.users(username) VALUES ('patrick')"))
+      intercept[SQLException](execute(ds, "INSERT INTO public.users(username) VALUES ('patrick')"))
       assertEquals(executor.migrate(ds, uniqueUsers), MigrationResult(1, MigrationStatus.AlreadyApplied, 0))
     }
   }
@@ -450,7 +546,7 @@ class PostgreSqlExecutorSuite extends TestPostgres:
     withDatabase { ds =>
       fixture(ds)
       assertEquals(executor.migrate(ds, keyed), MigrationResult(2, MigrationStatus.Applied, 1))
-      intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.users VALUES ('patrick')"))
+      intercept[SQLException](execute(ds, "INSERT INTO public.users VALUES ('patrick')"))
     }
     withDatabase { ds =>
       fixture(ds)
@@ -464,10 +560,12 @@ class PostgreSqlExecutorSuite extends TestPostgres:
   test("renaming a table and its unique columns keeps the unique keys") {
     withDatabase { ds =>
       fixture(ds, uniqueUsers)
-      val renamedUnique = SchemaModel(Vector(uniqueUsers.tables.head.copy(name = renamed.name,
-        columns = Vector(login.copy(name = SqlIdentifier("login_name")), tenant.copy(name = SqlIdentifier("tenant_id"))))))
+      val renamedUnique = SchemaModel(Vector(uniqueUsers.tables.head.copy(
+        name = renamed.name,
+        columns = Vector(login.copy(name = SqlIdentifier("login_name")), tenant.copy(name = SqlIdentifier("tenant_id")))
+      )))
       assertEquals(executor.migrate(ds, renamedUnique), MigrationResult(2, MigrationStatus.Applied, 3))
-      intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.accounts(login_name) VALUES ('patrick')"))
+      intercept[SQLException](execute(ds, "INSERT INTO public.accounts(login_name) VALUES ('patrick')"))
       assertEquals(executor.migrate(ds, renamedUnique).status, MigrationStatus.AlreadyApplied)
     }
   }
@@ -483,7 +581,8 @@ class PostgreSqlExecutorSuite extends TestPostgres:
       "ALTER TABLE public.users DROP CONSTRAINT users_username_key, ADD UNIQUE (username) INCLUDE (tenant)" ->
         "unsupported INCLUDE columns",
       "ALTER TABLE public.users DROP CONSTRAINT users_username_key; " +
-        "CREATE UNIQUE INDEX users_login ON public.users (username)" -> "unsupported uniqueness without a unique constraint"
+        "CREATE UNIQUE INDEX users_login ON public.users (username)" ->
+        "unsupported uniqueness without a unique constraint"
     ).foreach { (change, message) =>
       withDatabase { ds =>
         fixture(ds, uniqueUsers)
@@ -498,21 +597,30 @@ class PostgreSqlExecutorSuite extends TestPostgres:
     withDatabase { ds =>
       assume(scalar(ds, "SHOW server_version_num").toInt >= 150000, "NULLS NOT DISTINCT needs PostgreSQL 15")
       fixture(ds, uniqueUsers)
-      execute(ds, "ALTER TABLE public.users DROP CONSTRAINT users_username_key, ADD UNIQUE NULLS NOT DISTINCT (username)")
+      execute(
+        ds,
+        "ALTER TABLE public.users DROP CONSTRAINT users_username_key, ADD UNIQUE NULLS NOT DISTINCT (username)"
+      )
       val error = intercept[MigrationException](executor.migrate(ds, uniqueUsers))
       assert(error.getMessage.contains("unsupported NULLS NOT DISTINCT"), error.getMessage)
     }
   }
 
-  private val indexedUsers = SchemaModel(Vector(users.copy(columns = users.columns :+ tenant, indexes = Vector(
-    IndexModel(Vector(IndexColumn(login.id))),
-    IndexModel(Vector(IndexColumn(tenant.id), IndexColumn(login.id, descending = true)))
-  ))))
+  private val indexedUsers = SchemaModel(Vector(users.copy(
+    columns = users.columns :+ tenant,
+    indexes = Vector(
+      IndexModel(Vector(IndexColumn(login.id))),
+      IndexModel(Vector(IndexColumn(tenant.id), IndexColumn(login.id, descending = true)))
+    )
+  )))
 
   test("indexes are created after their table and verified on restart") {
     withDatabase { ds =>
       assertEquals(executor.migrate(ds, indexedUsers), MigrationResult(1, MigrationStatus.Applied, 3))
-      assertEquals(scalar(ds, "SELECT count(*) FROM pg_indexes WHERE schemaname = 'public' AND tablename = 'users'"), "2")
+      assertEquals(
+        scalar(ds, "SELECT count(*) FROM pg_indexes WHERE schemaname = 'public' AND tablename = 'users'"),
+        "2"
+      )
       assertEquals(executor.migrate(ds, indexedUsers), MigrationResult(1, MigrationStatus.AlreadyApplied, 0))
     }
   }
@@ -521,8 +629,10 @@ class PostgreSqlExecutorSuite extends TestPostgres:
     withDatabase { ds =>
       fixture(ds)
       assertEquals(executor.migrate(ds, indexedUsers), MigrationResult(2, MigrationStatus.Applied, 3))
-      val renamedIndexed = SchemaModel(Vector(indexedUsers.tables.head.copy(name = renamed.name,
-        columns = Vector(login.copy(name = SqlIdentifier("login_name")), tenant.copy(name = SqlIdentifier("tenant_id"))))))
+      val renamedIndexed = SchemaModel(Vector(indexedUsers.tables.head.copy(
+        name = renamed.name,
+        columns = Vector(login.copy(name = SqlIdentifier("login_name")), tenant.copy(name = SqlIdentifier("tenant_id")))
+      )))
       assertEquals(executor.migrate(ds, renamedIndexed), MigrationResult(3, MigrationStatus.Applied, 3))
       assertEquals(scalar(ds, "SELECT login_name FROM public.accounts"), "patrick")
       assertEquals(executor.migrate(ds, renamedIndexed).status, MigrationStatus.AlreadyApplied)
@@ -537,7 +647,8 @@ class PostgreSqlExecutorSuite extends TestPostgres:
         "unexpected index (\"username\" DESC)",
       "DROP INDEX public.users_username_idx; CREATE INDEX ON public.users (username) WHERE tenant IS NULL" ->
         "unsupported partial predicate",
-      "DROP INDEX public.users_username_idx; CREATE INDEX ON public.users (lower(username))" -> "unsupported expressions",
+      "DROP INDEX public.users_username_idx; CREATE INDEX ON public.users (lower(username))" ->
+        "unsupported expressions",
       "DROP INDEX public.users_username_idx; CREATE INDEX ON public.users USING hash (username)" ->
         "unsupported access method hash",
       "DROP INDEX public.users_username_idx; CREATE INDEX ON public.users (username) INCLUDE (tenant)" ->
@@ -558,20 +669,30 @@ class PostgreSqlExecutorSuite extends TestPostgres:
     }
   }
 
-  private val status = ColumnModel(SchemaId("USER_STATUS"), SqlIdentifier("status"), SqlType.Varchar(10),
-    check = Some(ColumnCheck.AllowedValues(Vector("NEW", "ACTIVE"))))
-  private val level = ColumnModel(SchemaId("USER_LEVEL"), SqlIdentifier("level"), SqlType.SmallInt,
-    check = Some(ColumnCheck.Range(0, 2)))
+  private val status = ColumnModel(
+    SchemaId("USER_STATUS"),
+    SqlIdentifier("status"),
+    SqlType.Varchar(10),
+    check = Some(ColumnCheck.AllowedValues(Vector("NEW", "ACTIVE")))
+  )
+  private val level = ColumnModel(
+    SchemaId("USER_LEVEL"),
+    SqlIdentifier("level"),
+    SqlType.SmallInt,
+    check = Some(ColumnCheck.Range(0, 2))
+  )
   private val checkedUsers = SchemaModel(Vector(users.copy(columns = users.columns ++ Vector(status, level))))
   private def withChecks(statusCheck: Option[ColumnCheck], levelCheck: Option[ColumnCheck] = level.check) =
-    SchemaModel(Vector(users.copy(columns = users.columns ++ Vector(status.copy(check = statusCheck), level.copy(check = levelCheck)))))
+    SchemaModel(Vector(users.copy(columns =
+      users.columns ++ Vector(status.copy(check = statusCheck), level.copy(check = levelCheck))
+    )))
 
   test("column checks are created, enforced and verified on restart") {
     withDatabase { ds =>
       fixture(ds, checkedUsers)
       execute(ds, "UPDATE public.users SET status = 'ACTIVE', level = 2")
-      intercept[java.sql.SQLException](execute(ds, "UPDATE public.users SET status = 'GONE'"))
-      intercept[java.sql.SQLException](execute(ds, "UPDATE public.users SET level = 3"))
+      intercept[SQLException](execute(ds, "UPDATE public.users SET status = 'GONE'"))
+      intercept[SQLException](execute(ds, "UPDATE public.users SET level = 3"))
       assertEquals(executor.migrate(ds, checkedUsers), MigrationResult(1, MigrationStatus.AlreadyApplied, 0))
     }
   }
@@ -586,11 +707,16 @@ class PostgreSqlExecutorSuite extends TestPostgres:
       val narrowed = withChecks(Some(ColumnCheck.AllowedValues(Vector("NEW", "ACTIVE"))), Some(ColumnCheck.Range(0, 1)))
       assertEquals(intercept[MigrationException](executor.migrate(ds, narrowed)).state, FailureState.RolledBack)
       assertEquals(revisions(ds), "2")
-      val renamedChecked = SchemaModel(Vector(extended.tables.head.copy(columns = extended.tables.head.columns.map(c =>
-        if c.id == status.id then c.copy(name = SqlIdentifier("state")) else c))))
+      val renamedChecked = SchemaModel(Vector(extended.tables.head.copy(columns =
+        extended.tables.head.columns.map(c =>
+          if c.id == status.id then c.copy(name = SqlIdentifier("state")) else c
+        )
+      )))
       assertEquals(executor.migrate(ds, renamedChecked), MigrationResult(3, MigrationStatus.Applied, 1))
-      intercept[java.sql.SQLException](execute(ds, "UPDATE public.users SET state = 'GONE'"))
-      val unchecked = SchemaModel(Vector(renamedChecked.tables.head.copy(columns = renamedChecked.tables.head.columns.map(_.copy(check = None)))))
+      intercept[SQLException](execute(ds, "UPDATE public.users SET state = 'GONE'"))
+      val unchecked = SchemaModel(Vector(renamedChecked.tables.head.copy(columns =
+        renamedChecked.tables.head.columns.map(_.copy(check = None))
+      )))
       assertEquals(executor.migrate(ds, unchecked), MigrationResult(4, MigrationStatus.Applied, 2))
       execute(ds, "UPDATE public.users SET state = 'GONE', level = 7")
     }
@@ -621,51 +747,106 @@ class PostgreSqlExecutorSuite extends TestPostgres:
     }
   }
 
-  test("Hibernate entities with associations, collections, inheritance, enums, keys, indexes and generated keys migrate end to end") {
+  test(
+    "Hibernate entities with associations, collections, inheritance, enums, keys, indexes and generated keys migrate end to end"
+  ) {
     import com.anjunar.hibernateddl.hibernate.*
-    val model = TestMetadata.read(classOf[Article], classOf[Label], classOf[Invoice], classOf[LegacyCustomer],
-      classOf[Account], classOf[Shipment], classOf[Measurement], classOf[Letter], classOf[Purchase],
-      classOf[Generated], classOf[Ticket], classOf[Voucher], classOf[Animal], classOf[Cat], classOf[Dog],
-      classOf[Vehicle], classOf[Car], classOf[Payment], classOf[CardPayment], classOf[TransferPayment], classOf[Shelf],
-      classOf[Profile], classOf[Document], classOf[Settings])
+    val model = TestMetadata.read(
+      classOf[Article],
+      classOf[Label],
+      classOf[Invoice],
+      classOf[LegacyCustomer],
+      classOf[Account],
+      classOf[Shipment],
+      classOf[Measurement],
+      classOf[Letter],
+      classOf[Purchase],
+      classOf[Generated],
+      classOf[Ticket],
+      classOf[Voucher],
+      classOf[Animal],
+      classOf[Cat],
+      classOf[Dog],
+      classOf[Vehicle],
+      classOf[Car],
+      classOf[Payment],
+      classOf[CardPayment],
+      classOf[TransferPayment],
+      classOf[Shelf],
+      classOf[Profile],
+      classOf[Document],
+      classOf[Settings]
+    )
       .fold(errors => fail(errors.mkString("\n")), identity)
     withDatabase { ds =>
       val result = executor.migrate(ds, model)
       assertEquals(result.status, MigrationStatus.Applied)
       assert(result.statementCount > model.tables.size, result)
-      execute(ds, "INSERT INTO public.article VALUES (1); INSERT INTO public.label VALUES (7); " +
-        "INSERT INTO public.article_keyword VALUES (1, 'scala'); INSERT INTO public.article_label VALUES (1, 7); " +
-        "INSERT INTO public.article_statuses VALUES (1, 'Sent')")
-      intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.article_label VALUES (1, 8)"))
-      intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.article_statuses VALUES (1, 'Lost')"))
-      assertEquals(scalar(ds, "SELECT nextval('public.voucher_numbers') || ',' || nextval('public.generated_seq')"), "100,1")
+      execute(
+        ds,
+        "INSERT INTO public.article VALUES (1); INSERT INTO public.label VALUES (7); " +
+          "INSERT INTO public.article_keyword VALUES (1, 'scala'); INSERT INTO public.article_label VALUES (1, 7); " +
+          "INSERT INTO public.article_statuses VALUES (1, 'Sent')"
+      )
+      intercept[SQLException](execute(ds, "INSERT INTO public.article_label VALUES (1, 8)"))
+      intercept[SQLException](execute(ds, "INSERT INTO public.article_statuses VALUES (1, 'Lost')"))
+      assertEquals(
+        scalar(ds, "SELECT nextval('public.voucher_numbers') || ',' || nextval('public.generated_seq')"),
+        "100,1"
+      )
       execute(ds, "INSERT INTO public.ticket DEFAULT VALUES")
       assertEquals(scalar(ds, "SELECT id FROM public.ticket"), "1")
-      execute(ds, "INSERT INTO public.animal (dtype, id, name, lives) VALUES ('Cat', 1, 'Tom', 9); " +
-        "INSERT INTO public.vehicle (id, wheels) VALUES (1, 4); INSERT INTO public.car (id, seats) VALUES (1, 5); " +
-        "INSERT INTO public.cardpayment (id, amount, card) VALUES (nextval('public.payment_seq'), 10, 'visa')")
-      intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.animal (dtype, id) VALUES ('Horse', 2)"))
-      intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.car (id, seats) VALUES (2, 5)"))
-      execute(ds, "INSERT INTO public.shelf (id) VALUES (1); " +
-        "INSERT INTO public.shelf_titles (shelf_id, lang, titles) VALUES (1, 'de', 'Regal'), (1, 'en', 'Shelf'); " +
-        "INSERT INTO public.shelf_weights (shelf_id, label_id, weights) VALUES (1, 7, 3)")
-      intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.shelf_titles (shelf_id, lang, titles) VALUES (1, 'de', 'Brett')"))
-      intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.shelf_weights (shelf_id, label_id, weights) VALUES (1, 8, 1)"))
-      execute(ds, "INSERT INTO public.profile (id, name) VALUES (1, 'Ada'); " +
-        "INSERT INTO public.profile_details (id, bio) VALUES (1, 'Mathematician')")
-      intercept[java.sql.SQLException](execute(ds, "INSERT INTO public.profile_details (id, bio) VALUES (2, 'Nobody')"))
+      execute(
+        ds,
+        "INSERT INTO public.animal (dtype, id, name, lives) VALUES ('Cat', 1, 'Tom', 9); " +
+          "INSERT INTO public.vehicle (id, wheels) VALUES (1, 4); INSERT INTO public.car (id, seats) VALUES (1, 5); " +
+          "INSERT INTO public.cardpayment (id, amount, card) VALUES (nextval('public.payment_seq'), 10, 'visa')"
+      )
+      intercept[SQLException](execute(ds, "INSERT INTO public.animal (dtype, id) VALUES ('Horse', 2)"))
+      intercept[SQLException](execute(ds, "INSERT INTO public.car (id, seats) VALUES (2, 5)"))
+      execute(
+        ds,
+        "INSERT INTO public.shelf (id) VALUES (1); " +
+          "INSERT INTO public.shelf_titles (shelf_id, lang, titles) VALUES (1, 'de', 'Regal'), (1, 'en', 'Shelf'); " +
+          "INSERT INTO public.shelf_weights (shelf_id, label_id, weights) VALUES (1, 7, 3)"
+      )
+      intercept[SQLException](execute(
+        ds,
+        "INSERT INTO public.shelf_titles (shelf_id, lang, titles) VALUES (1, 'de', 'Brett')"
+      ))
+      intercept[SQLException](execute(
+        ds,
+        "INSERT INTO public.shelf_weights (shelf_id, label_id, weights) VALUES (1, 8, 1)"
+      ))
+      execute(
+        ds,
+        "INSERT INTO public.profile (id, name) VALUES (1, 'Ada'); " +
+          "INSERT INTO public.profile_details (id, bio) VALUES (1, 'Mathematician')"
+      )
+      intercept[SQLException](execute(ds, "INSERT INTO public.profile_details (id, bio) VALUES (2, 'Nobody')"))
       assertEquals(executor.migrate(ds, model), MigrationResult(1, MigrationStatus.AlreadyApplied, 0))
     }
   }
 
-  private val keySequence = SequenceModel(SchemaId("USER_SEQUENCE"), QualifiedName(SqlIdentifier("users_SEQ"), Some(SqlIdentifier("public"))), 1, 50)
+  private val keySequence = SequenceModel(
+    SchemaId("USER_SEQUENCE"),
+    QualifiedName(SqlIdentifier("users_SEQ"), Some(SqlIdentifier("public"))),
+    1,
+    50
+  )
   private val sequenced = SchemaModel(Vector(users), Vector(keySequence))
 
   test("sequences are created, renamed with their current value and verified on restart") {
     withDatabase { ds =>
       assertEquals(executor.migrate(ds, sequenced), MigrationResult(1, MigrationStatus.Applied, 2))
-      assertEquals(scalar(ds, "SELECT nextval('public.\"users_SEQ\"') || ',' || nextval('public.\"users_SEQ\"')"), "1,51")
-      val renamedSequence = SchemaModel(Vector(users), Vector(keySequence.copy(name = keySequence.name.copy(name = SqlIdentifier("accounts_SEQ")))))
+      assertEquals(
+        scalar(ds, "SELECT nextval('public.\"users_SEQ\"') || ',' || nextval('public.\"users_SEQ\"')"),
+        "1,51"
+      )
+      val renamedSequence = SchemaModel(
+        Vector(users),
+        Vector(keySequence.copy(name = keySequence.name.copy(name = SqlIdentifier("accounts_SEQ"))))
+      )
       assertEquals(executor.migrate(ds, renamedSequence), MigrationResult(2, MigrationStatus.Applied, 1))
       assertEquals(scalar(ds, "SELECT nextval('public.\"accounts_SEQ\"')"), "101")
       assertEquals(executor.migrate(ds, renamedSequence).status, MigrationStatus.AlreadyApplied)
@@ -693,33 +874,57 @@ class PostgreSqlExecutorSuite extends TestPostgres:
   test("identity columns generate keys, keep explicit values and are verified") {
     val key = ColumnModel(SchemaId("TICKET_ID"), SqlIdentifier("id"), SqlType.BigInt, nullable = false, identity = true)
     val subject = ColumnModel(SchemaId("TICKET_SUBJECT"), SqlIdentifier("subject"), SqlType.Text)
-    val tickets = SchemaModel(Vector(TableModel(SchemaId("TICKET"), QualifiedName(SqlIdentifier("ticket"), Some(SqlIdentifier("public"))),
-      Vector(key, subject), Vector(key.id))))
+    val tickets = SchemaModel(Vector(TableModel(
+      SchemaId("TICKET"),
+      QualifiedName(SqlIdentifier("ticket"), Some(SqlIdentifier("public"))),
+      Vector(key, subject),
+      Vector(key.id)
+    )))
     withDatabase { ds =>
       assertEquals(executor.migrate(ds, tickets).status, MigrationStatus.Applied)
-      execute(ds, "INSERT INTO public.ticket (subject) VALUES ('first'); INSERT INTO public.ticket VALUES (100, 'explicit')")
+      execute(
+        ds,
+        "INSERT INTO public.ticket (subject) VALUES ('first'); INSERT INTO public.ticket VALUES (100, 'explicit')"
+      )
       assertEquals(scalar(ds, "SELECT string_agg(id::text, ',' ORDER BY id) FROM public.ticket"), "1,100")
       assertEquals(executor.migrate(ds, tickets).status, MigrationStatus.AlreadyApplied)
       execute(ds, "ALTER TABLE public.ticket ALTER COLUMN id SET MAXVALUE 2 SET CYCLE")
       val cycling = intercept[MigrationException](executor.migrate(ds, tickets)).getMessage
-      assert(cycling.contains("identity column \"public\".\"ticket\".\"id\" generates with maximum 2; " +
-        s"expected ${Long.MaxValue}"), cycling)
+      assert(
+        cycling.contains("identity column \"public\".\"ticket\".\"id\" generates with maximum 2; " +
+          s"expected ${Long.MaxValue}"),
+        cycling
+      )
       assert(cycling.contains("generates with cycling true; expected false"), cycling)
-      execute(ds, "ALTER TABLE public.ticket ALTER COLUMN id SET MAXVALUE 9223372036854775807 SET NO CYCLE SET INCREMENT BY 5")
+      execute(
+        ds,
+        "ALTER TABLE public.ticket ALTER COLUMN id SET MAXVALUE 9223372036854775807 SET NO CYCLE SET INCREMENT BY 5"
+      )
       assert(intercept[MigrationException](executor.migrate(ds, tickets)).getMessage
         .contains("generates with increment 5; expected 1"))
       execute(ds, "ALTER TABLE public.ticket ALTER COLUMN id SET INCREMENT BY 1")
       assertEquals(executor.migrate(ds, tickets).status, MigrationStatus.AlreadyApplied)
       execute(ds, "ALTER TABLE public.ticket ALTER COLUMN id SET GENERATED ALWAYS")
-      assert(intercept[MigrationException](executor.migrate(ds, tickets)).getMessage.contains("GENERATED ALWAYS identity"))
+      assert(intercept[MigrationException](executor.migrate(
+        ds,
+        tickets
+      )).getMessage.contains("GENERATED ALWAYS identity"))
       execute(ds, "ALTER TABLE public.ticket ALTER COLUMN id DROP IDENTITY")
-      assert(intercept[MigrationException](executor.migrate(ds, tickets)).getMessage.contains("identity=false; expected true"))
+      assert(intercept[MigrationException](executor.migrate(
+        ds,
+        tickets
+      )).getMessage.contains("identity=false; expected true"))
     }
     // Smaller key types get identity sequences of their own type and maximum.
-    val small = SchemaModel(Vector(TableModel(SchemaId("SMALL"), QualifiedName(SqlIdentifier("small"), Some(SqlIdentifier("public"))),
-      Vector(key.copy(id = SchemaId("SMALL_ID"), dataType = SqlType.SmallInt),
-        key.copy(id = SchemaId("SMALL_NUMBER"), name = SqlIdentifier("number"), dataType = SqlType.Integer)),
-      Vector(SchemaId("SMALL_ID")))))
+    val small = SchemaModel(Vector(TableModel(
+      SchemaId("SMALL"),
+      QualifiedName(SqlIdentifier("small"), Some(SqlIdentifier("public"))),
+      Vector(
+        key.copy(id = SchemaId("SMALL_ID"), dataType = SqlType.SmallInt),
+        key.copy(id = SchemaId("SMALL_NUMBER"), name = SqlIdentifier("number"), dataType = SqlType.Integer)
+      ),
+      Vector(SchemaId("SMALL_ID"))
+    )))
     withDatabase { ds =>
       assertEquals(executor.migrate(ds, small).status, MigrationStatus.Applied)
       assertEquals(executor.migrate(ds, small).status, MigrationStatus.AlreadyApplied)
@@ -739,33 +944,56 @@ class PostgreSqlExecutorSuite extends TestPostgres:
   test("a history table created by another version is refused, not altered") {
     withDatabase { ds =>
       execute(ds, "CREATE SCHEMA __hibernate_ddl")
-      execute(ds, "CREATE TABLE __hibernate_ddl.schema_history (migration_id varchar(200) PRIMARY KEY, to_revision bigint)")
+      execute(
+        ds,
+        "CREATE TABLE __hibernate_ddl.schema_history (migration_id varchar(200) PRIMARY KEY, to_revision bigint)"
+      )
       val error = intercept[MigrationException](executor.migrate(ds, initial))
       assert(error.getMessage.contains("another version"), error.getMessage)
       assertEquals(scalar(ds, "SELECT to_regclass('public.users') IS NULL"), "t")
     }
   }
 
-  private val adopting = new JdbcMigrationExecutor(PostgreSqlMigrationBackend, ExecutionOptions(adoptExistingSchema = true))
+  private val adopting =
+    new JdbcMigrationExecutor(PostgreSqlMigrationBackend, ExecutionOptions(adoptExistingSchema = true))
 
   test("a database created by Hibernate's hbm2ddl is adopted as revision 1 only when enabled, then migrates normally") {
     import com.anjunar.hibernateddl.hibernate.*
-    val classes = Seq(classOf[Purchase], classOf[Invoice], classOf[LegacyCustomer], classOf[Account], classOf[Shipment],
-      classOf[Generated], classOf[Ticket], classOf[Voucher], classOf[Vehicle], classOf[Car],
-      classOf[Payment], classOf[CardPayment], classOf[TransferPayment], classOf[Profile], classOf[Document],
-      classOf[Settings])
+    val classes = Seq(
+      classOf[Purchase],
+      classOf[Invoice],
+      classOf[LegacyCustomer],
+      classOf[Account],
+      classOf[Shipment],
+      classOf[Generated],
+      classOf[Ticket],
+      classOf[Voucher],
+      classOf[Vehicle],
+      classOf[Car],
+      classOf[Payment],
+      classOf[CardPayment],
+      classOf[TransferPayment],
+      classOf[Profile],
+      classOf[Document],
+      classOf[Settings]
+    )
     val model = TestMetadata.read(classes*).fold(errors => fail(errors.mkString("\n")), identity)
     withDatabase { ds =>
       execute(ds, TestMetadata.createScript(classes*))
       val refused = intercept[MigrationException](executor.migrate(ds, model))
       assertEquals(refused.state, FailureState.RolledBack)
-      assert(refused.getMessage.contains("no schema history but already contains public.account, public.car"), refused.getMessage)
+      assert(
+        refused.getMessage.contains("no schema history but already contains public.account, public.car"),
+        refused.getMessage
+      )
       noHistory(ds)
       assertEquals(adopting.migrate(ds, model), MigrationResult(1, MigrationStatus.Adopted, 0))
       assertEquals(scalar(ds, "SELECT cardinality(statements) FROM __hibernate_ddl.schema_history"), "0")
       assertEquals(adopting.migrate(ds, model), MigrationResult(1, MigrationStatus.AlreadyApplied, 0))
       val note = ColumnModel(SchemaId("9d8e7f60/5f607182"), SqlIdentifier("note"), SqlType.Text)
-      val extended = model.copy(tables = model.tables.map(t => if t.id.value == "9d8e7f60" then t.copy(columns = t.columns :+ note) else t))
+      val extended = model.copy(tables =
+        model.tables.map(t => if t.id.value == "9d8e7f60" then t.copy(columns = t.columns :+ note) else t)
+      )
       assertEquals(executor.migrate(ds, extended), MigrationResult(2, MigrationStatus.Applied, 1))
     }
   }
@@ -776,8 +1004,11 @@ class PostgreSqlExecutorSuite extends TestPostgres:
       val drift = intercept[MigrationException](adopting.migrate(ds, initial))
       assert(drift.getMessage.contains("Adopted schema does not match database"), drift.getMessage)
       assert(drift.getMessage.contains("unexpected column \"extra\""), drift.getMessage)
-      val other = TableModel(SchemaId("OTHER"), QualifiedName(SqlIdentifier("others"), Some(SqlIdentifier("public"))),
-        Vector(ColumnModel(SchemaId("OTHER_NOTE"), SqlIdentifier("note"), SqlType.Text)))
+      val other = TableModel(
+        SchemaId("OTHER"),
+        QualifiedName(SqlIdentifier("others"), Some(SqlIdentifier("public"))),
+        Vector(ColumnModel(SchemaId("OTHER_NOTE"), SqlIdentifier("note"), SqlType.Text))
+      )
       val missing = intercept[MigrationException](adopting.migrate(ds, SchemaModel(Vector(users, other))))
       assert(missing.getMessage.contains("missing: public.others"), missing.getMessage)
       noHistory(ds)
@@ -796,9 +1027,12 @@ class PostgreSqlExecutorSuite extends TestPostgres:
       assert(drift.getMessage.contains("unexpected check constraint \"letter_status_check\""), drift.getMessage)
       assert(drift.getMessage.contains("on column \"status\" is missing"), drift.getMessage)
       noHistory(ds)
-      val checks = for table <- model.tables; column <- table.columns; check <- column.check yield (table, column, check)
-      assertEquals(checks.map((t, c, _) => s"${t.name.name.value}.${c.name.value}").sorted,
-        Vector("animal.dtype", "article_statuses.statuses", "letter.Stage", "letter.priority", "letter.status"))
+      val checks =
+        for table <- model.tables; column <- table.columns; check <- column.check yield (table, column, check)
+      assertEquals(
+        checks.map((t, c, _) => s"${t.name.name.value}.${c.name.value}").sorted,
+        Vector("animal.dtype", "article_statuses.statuses", "letter.Stage", "letter.priority", "letter.status")
+      )
       val renames = PostgreSqlMigrationBackend.planHibernateCheckRenames(ds, model)
         .fold(errors => fail(errors.mkString("; ")), identity)
       assertEquals(renames.size, checks.size)
@@ -826,8 +1060,12 @@ class PostgreSqlExecutorSuite extends TestPostgres:
     def column(id: String, name: String, dataType: SqlType = SqlType.BigInt, nullable: Boolean = true) =
       ColumnModel(SchemaId(id), SqlIdentifier(name), dataType, nullable)
     def table(id: String, name: String, columns: ColumnModel*) =
-      TableModel(SchemaId(id), QualifiedName(SqlIdentifier(name), Some(SqlIdentifier("public"))), columns.toVector,
-        Vector(columns.head.id))
+      TableModel(
+        SchemaId(id),
+        QualifiedName(SqlIdentifier(name), Some(SqlIdentifier("public"))),
+        columns.toVector,
+        Vector(columns.head.id)
+      )
     val parent = table("P", "parent", column("P_ID", "id", nullable = false), column("P_BUDDY", "buddy_id"))
     val buddy = table("B", "buddy", column("B_ID", "id", nullable = false), column("B_PARENT", "parent_id"))
     val parentId = column("C_PARENT", "parent_id")
@@ -835,16 +1073,30 @@ class PostgreSqlExecutorSuite extends TestPostgres:
     val child = table("C", "child", column("C_ID", "id", nullable = false), parentId, label).copy(
       foreignKeys = Vector(ForeignKeyModel(Vector(parentId.id), parent.id, parent.primaryKey)),
       uniqueKeys = Vector(UniqueKeyModel(Vector(label.id, parentId.id))),
-      indexes = Vector(IndexModel(Vector(IndexColumn(parentId.id)))))
-    val sequence = SequenceModel(SchemaId("C_SEQ"), QualifiedName(SqlIdentifier("child_seq"), Some(SqlIdentifier("public"))), 1, 50)
-    val before = SchemaModel(Vector(
-      parent.copy(foreignKeys = Vector(ForeignKeyModel(Vector(SchemaId("P_BUDDY")), buddy.id, buddy.primaryKey))),
-      buddy.copy(foreignKeys = Vector(ForeignKeyModel(Vector(SchemaId("B_PARENT")), parent.id, parent.primaryKey))),
-      child), Vector(sequence))
-    val after = SchemaModel(Vector(child.copy(columns = child.columns.filterNot(_ == parentId),
-      foreignKeys = Vector.empty, uniqueKeys = Vector.empty, indexes = Vector.empty)))
-    val approvals = Set[Approval](Approval.Drop(parentId.id), Approval.Drop(parent.id), Approval.Drop(buddy.id),
-      Approval.Drop(sequence.id))
+      indexes = Vector(IndexModel(Vector(IndexColumn(parentId.id))))
+    )
+    val sequence =
+      SequenceModel(SchemaId("C_SEQ"), QualifiedName(SqlIdentifier("child_seq"), Some(SqlIdentifier("public"))), 1, 50)
+    val before = SchemaModel(
+      Vector(
+        parent.copy(foreignKeys = Vector(ForeignKeyModel(Vector(SchemaId("P_BUDDY")), buddy.id, buddy.primaryKey))),
+        buddy.copy(foreignKeys = Vector(ForeignKeyModel(Vector(SchemaId("B_PARENT")), parent.id, parent.primaryKey))),
+        child
+      ),
+      Vector(sequence)
+    )
+    val after = SchemaModel(Vector(child.copy(
+      columns = child.columns.filterNot(_ == parentId),
+      foreignKeys = Vector.empty,
+      uniqueKeys = Vector.empty,
+      indexes = Vector.empty
+    )))
+    val approvals = Set[Approval](
+      Approval.Drop(parentId.id),
+      Approval.Drop(parent.id),
+      Approval.Drop(buddy.id),
+      Approval.Drop(sequence.id)
+    )
     val approved = new JdbcMigrationExecutor(PostgreSqlMigrationBackend, ExecutionOptions(approvals = approvals))
     withDatabase { ds =>
       assertEquals(executor.migrate(ds, before).status, MigrationStatus.Applied)
@@ -858,33 +1110,48 @@ class PostgreSqlExecutorSuite extends TestPostgres:
       execute(ds, "DROP VIEW public.child_parents")
       assertEquals(approved.migrate(ds, after), MigrationResult(2, MigrationStatus.Applied, 3))
       assertEquals(scalar(ds, "SELECT label FROM public.child"), "kept")
-      assertEquals(scalar(ds, "SELECT to_regclass('public.parent') IS NULL AND to_regclass('public.child_seq') IS NULL"), "t")
-      assertEquals(scalar(ds, "SELECT statements[2] FROM __hibernate_ddl.schema_history WHERE revision = 2"),
-        "DROP TABLE \"public\".\"buddy\", \"public\".\"parent\";")
+      assertEquals(
+        scalar(ds, "SELECT to_regclass('public.parent') IS NULL AND to_regclass('public.child_seq') IS NULL"),
+        "t"
+      )
+      assertEquals(
+        scalar(ds, "SELECT statements[2] FROM __hibernate_ddl.schema_history WHERE revision = 2"),
+        "DROP TABLE \"public\".\"buddy\", \"public\".\"parent\";"
+      )
     }
   }
 
   test("an operator migrates a refused change by hand and the executor verifies and records it") {
     val shortened = SchemaModel(Vector(users.copy(columns = Vector(login.copy(dataType = SqlType.Varchar(50))))))
-    val manual = new JdbcMigrationExecutor(PostgreSqlMigrationBackend,
-      ExecutionOptions(acceptManualMigration = Some(SchemaFingerprint.of(shortened))))
+    val manual = new JdbcMigrationExecutor(
+      PostgreSqlMigrationBackend,
+      ExecutionOptions(acceptManualMigration = Some(SchemaFingerprint.of(shortened)))
+    )
     withDatabase { ds =>
       fixture(ds)
       val refused = intercept[MigrationException](executor.migrate(ds, shortened))
       assert(refused.getMessage.contains("Changing type of column 'USER_LOGIN'"), refused.getMessage)
-      assert(intercept[MigrationException](manual.migrate(ds, shortened)).getMessage.contains("does not match database"))
+      assert(intercept[MigrationException](manual.migrate(
+        ds,
+        shortened
+      )).getMessage.contains("does not match database"))
       execute(ds, "ALTER TABLE public.users ALTER COLUMN username TYPE varchar(50)")
       assertEquals(manual.migrate(ds, shortened), MigrationResult(2, MigrationStatus.ManuallyMigrated, 0))
       assertEquals(executor.migrate(ds, shortened), MigrationResult(2, MigrationStatus.AlreadyApplied, 0))
-      assertEquals(scalar(ds, "SELECT cardinality(statements) FROM __hibernate_ddl.schema_history WHERE revision = 2"), "0")
+      assertEquals(
+        scalar(ds, "SELECT cardinality(statements) FROM __hibernate_ddl.schema_history WHERE revision = 2"),
+        "0"
+      )
       assertEquals(scalar(ds, "SELECT username FROM public.users"), "patrick")
     }
   }
 
   test("a manual migration cannot record a drop or rename that the database does not show") {
     val empty = SchemaModel(Vector.empty)
-    def manual(model: SchemaModel) = new JdbcMigrationExecutor(PostgreSqlMigrationBackend,
-      ExecutionOptions(acceptManualMigration = Some(SchemaFingerprint.of(model))))
+    def manual(model: SchemaModel) = new JdbcMigrationExecutor(
+      PostgreSqlMigrationBackend,
+      ExecutionOptions(acceptManualMigration = Some(SchemaFingerprint.of(model)))
+    )
     withDatabase { ds =>
       fixture(ds)
       val dropped = intercept[MigrationException](manual(empty).migrate(ds, empty))
@@ -901,15 +1168,29 @@ class PostgreSqlExecutorSuite extends TestPostgres:
   private val personId = ColumnModel(SchemaId("PEOPLE_ID"), SqlIdentifier("id"), SqlType.BigInt, false)
   private val firstName = ColumnModel(SchemaId("PEOPLE_FIRST"), SqlIdentifier("first_name"), SqlType.Varchar(100))
   private val lastName = ColumnModel(SchemaId("PEOPLE_LAST"), SqlIdentifier("last_name"), SqlType.Varchar(100))
-  private val display = ColumnModel(SchemaId("PEOPLE_DISPLAY"), SqlIdentifier("Display Name"), SqlType.Varchar(255), false)
-  private def people(columns: ColumnModel*) = SchemaModel(Vector(TableModel(SchemaId("PEOPLE"),
-    QualifiedName(SqlIdentifier("people"), public), personId +: columns.toVector, Vector(personId.id))))
+  private val display =
+    ColumnModel(SchemaId("PEOPLE_DISPLAY"), SqlIdentifier("Display Name"), SqlType.Varchar(255), false)
+  private def people(columns: ColumnModel*) = SchemaModel(Vector(TableModel(
+    SchemaId("PEOPLE"),
+    QualifiedName(SqlIdentifier("people"), public),
+    personId +: columns.toVector,
+    Vector(personId.id)
+  )))
   private val strange = "O'Brien; DROP TABLE people --"
-  private val displayRule = Backfill.fillNulls("people-display-v1", display.id, BackfillTrigger.BecomesRequired,
+  private val displayRule = Backfill.fillNulls(
+    "people-display-v1",
+    display.id,
+    BackfillTrigger.BecomesRequired,
     BackfillValue.coalesce(
-      BackfillValue.concat(BackfillValue.column(firstName.id), BackfillValue.literal(" "), BackfillValue.column(lastName.id)),
+      BackfillValue.concat(
+        BackfillValue.column(firstName.id),
+        BackfillValue.literal(" "),
+        BackfillValue.column(lastName.id)
+      ),
       BackfillValue.column(firstName.id),
-      BackfillValue.literal(strange)))
+      BackfillValue.literal(strange)
+    )
+  )
   private def withPeople[A](body: DataSource => A): A =
     withDatabase { ds =>
       assertEquals(executor.migrate(ds, people(firstName, lastName)).status, MigrationStatus.Applied)
@@ -923,19 +1204,44 @@ class PostgreSqlExecutorSuite extends TestPostgres:
     withPeople { ds =>
       val target = people(firstName, lastName, display)
       val result = executor.migrate(ds, target, Vector(displayRule))
-      assertEquals(result, MigrationResult(2, MigrationStatus.Applied, 3,
-        Vector(BackfillOutcome("people-display-v1", BackfillResult.Executed, Some(3L)))))
+      assertEquals(
+        result,
+        MigrationResult(
+          2,
+          MigrationStatus.Applied,
+          3,
+          Vector(BackfillOutcome("people-display-v1", BackfillResult.Executed, Some(3L)))
+        )
+      )
       assertEquals(displays(ds), s"Ada Lovelace|Grace|$strange")
-      assertEquals(scalar(ds, "SELECT attnotnull FROM pg_attribute WHERE attrelid = 'public.people'::regclass " +
-        "AND attname = 'Display Name'"), "t")
-      assertEquals(scalar(ds, "SELECT concat_ws(' ', backfill_id, result, updated_rows, revision, target_column) " +
-        "FROM __hibernate_ddl.backfill_history"), "people-display-v1 executed 3 2 PEOPLE_DISPLAY")
-      assertEquals(scalar(ds, "SELECT statements[2] FROM __hibernate_ddl.schema_history WHERE revision = 2"),
+      assertEquals(
+        scalar(
+          ds,
+          "SELECT attnotnull FROM pg_attribute WHERE attrelid = 'public.people'::regclass " +
+            "AND attname = 'Display Name'"
+        ),
+        "t"
+      )
+      assertEquals(
+        scalar(
+          ds,
+          "SELECT concat_ws(' ', backfill_id, result, updated_rows, revision, target_column) " +
+            "FROM __hibernate_ddl.backfill_history"
+        ),
+        "people-display-v1 executed 3 2 PEOPLE_DISPLAY"
+      )
+      assertEquals(
+        scalar(ds, "SELECT statements[2] FROM __hibernate_ddl.schema_history WHERE revision = 2"),
         "UPDATE \"public\".\"people\" SET \"Display Name\" = COALESCE((\"first_name\" || CAST(? AS text) || " +
-          "\"last_name\"), \"first_name\", CAST(? AS varchar(255))) WHERE \"Display Name\" IS NULL")
+          "\"last_name\"), \"first_name\", CAST(? AS varchar(255))) WHERE \"Display Name\" IS NULL"
+      )
       assertEquals(executor.migrate(ds, target, Vector(displayRule)).status, MigrationStatus.AlreadyApplied)
-      val changed = Backfill.fillNulls("people-display-v1", display.id, BackfillTrigger.BecomesRequired,
-        BackfillValue.literal("Unknown"))
+      val changed = Backfill.fillNulls(
+        "people-display-v1",
+        display.id,
+        BackfillTrigger.BecomesRequired,
+        BackfillValue.literal("Unknown")
+      )
       assert(intercept[MigrationException](executor.migrate(ds, target, Vector(changed))).getMessage
         .contains("was recorded in revision 2 with another definition"))
     }
@@ -943,9 +1249,12 @@ class PostgreSqlExecutorSuite extends TestPostgres:
 
   test("a column that becomes required keeps its values; only NULL rows are filled") {
     withPeople { ds =>
-      val rule = Backfill.fillNulls("people-first-v1", firstName.id, BackfillTrigger.BecomesRequired, BackfillValue.literal("?"))
-      assertEquals(executor.migrate(ds, people(firstName.copy(nullable = false), lastName), Vector(rule)).backfills,
-        Vector(BackfillOutcome("people-first-v1", BackfillResult.Executed, Some(1L))))
+      val rule =
+        Backfill.fillNulls("people-first-v1", firstName.id, BackfillTrigger.BecomesRequired, BackfillValue.literal("?"))
+      assertEquals(
+        executor.migrate(ds, people(firstName.copy(nullable = false), lastName), Vector(rule)).backfills,
+        Vector(BackfillOutcome("people-first-v1", BackfillResult.Executed, Some(1L)))
+      )
       assertEquals(scalar(ds, "SELECT string_agg(first_name, '|' ORDER BY id) FROM public.people"), "Ada|Grace|?")
     }
   }
@@ -953,12 +1262,20 @@ class PostgreSqlExecutorSuite extends TestPostgres:
   test("a server that skipped releases fills from columns that the same migration drops afterwards") {
     withPeople { ds =>
       val v3 = people(display)
-      val drops = new JdbcMigrationExecutor(PostgreSqlMigrationBackend,
-        ExecutionOptions(approvals = Set(Approval.Drop(firstName.id), Approval.Drop(lastName.id))))
+      val drops = new JdbcMigrationExecutor(
+        PostgreSqlMigrationBackend,
+        ExecutionOptions(approvals = Set(Approval.Drop(firstName.id), Approval.Drop(lastName.id)))
+      )
       assertEquals(drops.migrate(ds, v3, Vector(displayRule)).backfills.map(_.updatedRows), Vector(Some(3L)))
       assertEquals(displays(ds), s"Ada Lovelace|Grace|$strange")
-      assertEquals(scalar(ds, "SELECT count(*) FROM pg_attribute WHERE attrelid = 'public.people'::regclass AND attnum > 0 " +
-        "AND NOT attisdropped"), "2")
+      assertEquals(
+        scalar(
+          ds,
+          "SELECT count(*) FROM pg_attribute WHERE attrelid = 'public.people'::regclass AND attnum > 0 " +
+            "AND NOT attisdropped"
+        ),
+        "2"
+      )
     }
   }
 
@@ -971,27 +1288,49 @@ class PostgreSqlExecutorSuite extends TestPostgres:
     }
   }
 
-  test("unique, check and foreign key violations of the filled values roll back the schema, the data and both histories") {
+  test(
+    "unique, check and foreign key violations of the filled values roll back the schema, the data and both histories"
+  ) {
     val unique = people(firstName, lastName, display).tables.head
     val teamId = ColumnModel(SchemaId("TEAM_ID"), SqlIdentifier("id"), SqlType.BigInt, false)
-    val teams = TableModel(SchemaId("TEAM"), QualifiedName(SqlIdentifier("teams"), public), Vector(teamId), Vector(teamId.id))
+    val teams =
+      TableModel(SchemaId("TEAM"), QualifiedName(SqlIdentifier("teams"), public), Vector(teamId), Vector(teamId.id))
     val team = ColumnModel(SchemaId("PEOPLE_TEAM"), SqlIdentifier("team_id"), SqlType.BigInt, false)
     val member = people(firstName, lastName, team).tables.head
       .copy(foreignKeys = Vector(ForeignKeyModel(Vector(team.id), teams.id, teams.primaryKey)))
     Vector(
       SchemaModel(Vector(unique.copy(uniqueKeys = Vector(UniqueKeyModel(Vector(display.id)))))) ->
-        Backfill.fillNulls("people-display-v1", display.id, BackfillTrigger.BecomesRequired, BackfillValue.literal("same")),
+        Backfill.fillNulls(
+          "people-display-v1",
+          display.id,
+          BackfillTrigger.BecomesRequired,
+          BackfillValue.literal("same")
+        ),
       people(firstName, lastName, display.copy(check = Some(ColumnCheck.AllowedValues(Vector("A", "B"))))) ->
-        Backfill.fillNulls("people-display-v1", display.id, BackfillTrigger.BecomesRequired, BackfillValue.literal("C")),
+        Backfill.fillNulls(
+          "people-display-v1",
+          display.id,
+          BackfillTrigger.BecomesRequired,
+          BackfillValue.literal("C")
+        ),
       SchemaModel(Vector(member, teams)) ->
         Backfill.fillNulls("people-team-v1", team.id, BackfillTrigger.BecomesRequired, BackfillValue.literal(99L))
     ).foreach { (target, rule) =>
       withPeople { ds =>
-        assertEquals(intercept[MigrationException](executor.migrate(ds, target, Vector(rule))).state, FailureState.RolledBack)
+        assertEquals(
+          intercept[MigrationException](executor.migrate(ds, target, Vector(rule))).state,
+          FailureState.RolledBack
+        )
         assertEquals(revisions(ds), "1")
         assertEquals(scalar(ds, "SELECT count(*) FROM __hibernate_ddl.backfill_history"), "0")
-        assertEquals(scalar(ds, "SELECT count(*) FROM pg_attribute WHERE attrelid = 'public.people'::regclass " +
-          "AND attname IN ('Display Name', 'team_id')"), "0")
+        assertEquals(
+          scalar(
+            ds,
+            "SELECT count(*) FROM pg_attribute WHERE attrelid = 'public.people'::regclass " +
+              "AND attname IN ('Display Name', 'team_id')"
+          ),
+          "0"
+        )
       }
     }
   }
@@ -1004,19 +1343,22 @@ class PostgreSqlExecutorSuite extends TestPostgres:
         val runs = Vector.fill(2)(pool.submit(new Callable[MigrationResult]:
           def call(): MigrationResult =
             start.await()
-            executor.migrate(ds, people(firstName, lastName, display), Vector(displayRule))
-        ))
+            executor.migrate(ds, people(firstName, lastName, display), Vector(displayRule))))
         start.countDown()
-        assertEquals(runs.map(_.get(15, TimeUnit.SECONDS).status).toSet,
-          Set(MigrationStatus.Applied, MigrationStatus.AlreadyApplied))
+        assertEquals(
+          runs.map(_.get(15, TimeUnit.SECONDS).status).toSet,
+          Set(MigrationStatus.Applied, MigrationStatus.AlreadyApplied)
+        )
         assertEquals(scalar(ds, "SELECT count(*) FROM __hibernate_ddl.backfill_history"), "1")
       finally
         pool.shutdownNow()
         pool.awaitTermination(5, TimeUnit.SECONDS)
     }
     withDatabase { ds =>
-      assertEquals(executor.migrate(ds, people(firstName, lastName, display), Vector(displayRule)).backfills,
-        Vector(BackfillOutcome("people-display-v1", BackfillResult.NotRequiredOnCreation, None)))
+      assertEquals(
+        executor.migrate(ds, people(firstName, lastName, display), Vector(displayRule)).backfills,
+        Vector(BackfillOutcome("people-display-v1", BackfillResult.NotRequiredOnCreation, None))
+      )
       assertEquals(scalar(ds, "SELECT result FROM __hibernate_ddl.backfill_history"), "not required on creation")
     }
   }
@@ -1027,4 +1369,3 @@ class PostgreSqlExecutorSuite extends TestPostgres:
       assert(intercept[MigrationException](executor.migrate(ds, initial)).getMessage.contains("another version"))
     }
   }
-

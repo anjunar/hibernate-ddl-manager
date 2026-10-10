@@ -29,16 +29,18 @@ object PreviewCommand:
       |        Exit codes: 0 ready, 1 blocked, 2 invalid call or technical error, 3 incomplete.""".stripMargin
 
   private final case class Arguments(
-      target: Option[Path] = None,
-      backfills: Option[Path] = None,
-      json: Boolean = false,
-      preview: PreviewOptions = PreviewOptions(),
-      options: ExecutionOptions = ExecutionOptions()
+    target: Option[Path] = None,
+    backfills: Option[Path] = None,
+    json: Boolean = false,
+    preview: PreviewOptions = PreviewOptions(),
+    options: ExecutionOptions = ExecutionOptions()
   )
 
   def run(args: Vector[String], env: Map[String, String]): Outcome =
     try preview(args, env).fold(error => Outcome(Failure, "", s"$error\n$usage"), identity)
-    catch case NonFatal(error) => Outcome(Failure, "", s"Preview failed: ${Option(error.getMessage).getOrElse(error.toString)}")
+    catch
+      case NonFatal(error) =>
+        Outcome(Failure, "", s"Preview failed: ${Option(error.getMessage).getOrElse(error.toString)}")
 
   private def preview(args: Vector[String], env: Map[String, String]): Either[String, Outcome] =
     for
@@ -46,8 +48,11 @@ object PreviewCommand:
       path <- arguments.target.toRight("--target is required")
       target <- read(path).flatMap(SchemaModelJson.decode).left.map(error => s"Target $path: $error")
       backfills <- arguments.backfills.fold(Right(Vector.empty))(path =>
-        read(path).flatMap(BackfillJson.decode).left.map(error => s"Backfills $path: $error"))
-      url <- env.get("HIBERNATE_DDL_PREVIEW_JDBC_URL").filter(_.nonEmpty).toRight("HIBERNATE_DDL_PREVIEW_JDBC_URL is not set")
+        read(path).flatMap(BackfillJson.decode).left.map(error => s"Backfills $path: $error")
+      )
+      url <- env.get(
+        "HIBERNATE_DDL_PREVIEW_JDBC_URL"
+      ).filter(_.nonEmpty).toRight("HIBERNATE_DDL_PREVIEW_JDBC_URL is not set")
     yield
       val dataSource = new PGSimpleDataSource()
       dataSource.setURL(url)
@@ -56,30 +61,35 @@ object PreviewCommand:
       val report = JdbcMigrationPreview(PostgreSqlMigrationBackend, arguments.options)
         .preview(dataSource, target, backfills, arguments.preview)
       val code = report.outcome match
-        case PreviewOutcome.Ready => Ready
-        case PreviewOutcome.Blocked => Blocked
+        case PreviewOutcome.Ready      => Ready
+        case PreviewOutcome.Blocked    => Blocked
         case PreviewOutcome.Incomplete => Incomplete
       Outcome(code, if arguments.json then PreviewRendering.json(report) else PreviewRendering.text(report), "")
 
   private def read(path: Path): Either[String, String] =
-    try Right(Files.readString(path)) catch case NonFatal(error) => Left(s"cannot be read (${error.getMessage})")
+    try Right(Files.readString(path))
+    catch case NonFatal(error) => Left(s"cannot be read (${error.getMessage})")
 
   private def parse(args: Vector[String], parsed: Arguments): Either[String, Arguments] = args match
-    case Vector() => Right(parsed)
-    case "--target" +: path +: rest => parse(rest, parsed.copy(target = Some(Path.of(path))))
-    case "--backfills" +: path +: rest => parse(rest, parsed.copy(backfills = Some(Path.of(path))))
-    case "--format" +: "text" +: rest => parse(rest, parsed.copy(json = false))
-    case "--format" +: "json" +: rest => parse(rest, parsed.copy(json = true))
-    case "--data-checks" +: "none" +: rest => parse(rest, parsed.copy(preview = parsed.preview.copy(dataChecks = DataChecks.Skip)))
+    case Vector()                          => Right(parsed)
+    case "--target" +: path +: rest        => parse(rest, parsed.copy(target = Some(Path.of(path))))
+    case "--backfills" +: path +: rest     => parse(rest, parsed.copy(backfills = Some(Path.of(path))))
+    case "--format" +: "text" +: rest      => parse(rest, parsed.copy(json = false))
+    case "--format" +: "json" +: rest      => parse(rest, parsed.copy(json = true))
+    case "--data-checks" +: "none" +: rest =>
+      parse(rest, parsed.copy(preview = parsed.preview.copy(dataChecks = DataChecks.Skip)))
     case "--data-checks" +: "existence" +: rest =>
       parse(rest, parsed.copy(preview = parsed.preview.copy(dataChecks = DataChecks.Existence)))
     case "--counts" +: rest => parse(rest, parsed.copy(preview = parsed.preview.copy(includeExactCounts = true)))
-    case "--adopt-existing-schema" +: rest => parse(rest, parsed.copy(options = parsed.options.copy(adoptExistingSchema = true)))
+    case "--adopt-existing-schema" +: rest =>
+      parse(rest, parsed.copy(options = parsed.options.copy(adoptExistingSchema = true)))
     case "--accept-manual-migration" +: fingerprint +: rest =>
       parse(rest, parsed.copy(options = parsed.options.copy(acceptManualMigration = Some(fingerprint))))
     case "--approval" +: approval +: rest =>
       val parsedApproval = Approval.parse(approval).left.map(problem => s"Invalid approval: $problem")
-      parsedApproval.flatMap(value => parse(rest, parsed.copy(options = parsed.options.copy(approvals = parsed.options.approvals + value))))
+      parsedApproval.flatMap(value =>
+        parse(rest, parsed.copy(options = parsed.options.copy(approvals = parsed.options.approvals + value)))
+      )
     case "--lock-timeout-millis" +: value +: rest if value.toIntOption.nonEmpty =>
       parse(rest, parsed.copy(options = parsed.options.copy(lockTimeoutMillis = value.toInt)))
     case "--statement-timeout-millis" +: value +: rest if value.toIntOption.nonEmpty =>

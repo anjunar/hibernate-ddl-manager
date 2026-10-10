@@ -4,6 +4,8 @@ import com.anjunar.hibernateddl.core.SchemaModel
 import org.hibernate.boot.{Metadata, MetadataSources}
 import org.hibernate.boot.registry.{StandardServiceRegistry, StandardServiceRegistryBuilder}
 import org.hibernate.tool.schema.spi.SchemaManagementToolCoordinator
+import java.io.StringWriter
+import java.util
 
 /** Reads annotated test entities the way a PostgreSQL server would boot them. */
 object TestMetadata:
@@ -13,8 +15,8 @@ object TestMetadata:
   /** The DDL that Hibernate's own schema generation (hbm2ddl `create`) would execute. */
   def createScript(classes: Class[?]*): String =
     withMetadata(classes) { (metadata, registry) =>
-      val script = new java.io.StringWriter()
-      val settings = new java.util.HashMap[String, AnyRef]()
+      val script = new StringWriter()
+      val settings = new util.HashMap[String, AnyRef]()
       settings.put("jakarta.persistence.schema-generation.database.action", "none")
       settings.put("jakarta.persistence.schema-generation.scripts.action", "create")
       settings.put("jakarta.persistence.schema-generation.scripts.create-target", script)

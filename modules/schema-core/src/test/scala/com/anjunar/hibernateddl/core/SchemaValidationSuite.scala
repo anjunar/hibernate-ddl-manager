@@ -1,8 +1,11 @@
 package com.anjunar.hibernateddl.core
 
-class SchemaValidationSuite extends munit.FunSuite:
+import munit.FunSuite
+
+class SchemaValidationSuite extends FunSuite:
   private val table = TableModel(
-    SchemaId("table"), QualifiedName(SqlIdentifier("customers")),
+    SchemaId("table"),
+    QualifiedName(SqlIdentifier("customers")),
     Vector(ColumnModel(SchemaId("column"), SqlIdentifier("name"), SqlType.Varchar(80)))
   )
 
@@ -22,9 +25,14 @@ class SchemaValidationSuite extends munit.FunSuite:
 
   test("table physical names are unique and columns are unique within each table") {
     val second = table.copy(id = SchemaId("second"), columns = Vector.empty)
-    assert(SchemaValidation.validate(SchemaModel(Vector(table, second))).exists(_.contains("Duplicate physical table or sequence name")))
+    assert(SchemaValidation.validate(SchemaModel(Vector(
+      table,
+      second
+    ))).exists(_.contains("Duplicate physical table or sequence name")))
     val duplicateColumn = table.copy(columns = table.columns :+ table.columns.head.copy(id = SchemaId("second-column")))
-    assert(SchemaValidation.validate(SchemaModel(Vector(duplicateColumn))).exists(_.contains("Duplicate physical column name")))
+    assert(SchemaValidation.validate(
+      SchemaModel(Vector(duplicateColumn))
+    ).exists(_.contains("Duplicate physical column name")))
   }
 
   test("separate schemas may share table names and separate tables may share column names") {
@@ -59,30 +67,49 @@ class SchemaValidationSuite extends munit.FunSuite:
     val customer = TableModel(SchemaId("customer"), QualifiedName(SqlIdentifier("customer")), Vector(id), Vector(id.id))
     val owner = ColumnModel(SchemaId("invoice/owner"), SqlIdentifier("owner_id"), SqlType.BigInt)
     val key = ForeignKeyModel(Vector(owner.id), customer.id, customer.primaryKey)
-    val invoice = TableModel(SchemaId("invoice"), QualifiedName(SqlIdentifier("invoice")), Vector(owner), foreignKeys = Vector(key))
+    val invoice =
+      TableModel(SchemaId("invoice"), QualifiedName(SqlIdentifier("invoice")), Vector(owner), foreignKeys = Vector(key))
     def errors(keys: ForeignKeyModel*) =
       SchemaValidation.validate(SchemaModel(Vector(customer, invoice.copy(foreignKeys = keys.toVector))))
     assertEquals(errors(key), Vector.empty)
-    assert(errors(key.copy(referencedTable = SchemaId("missing"))).exists(_.contains("references unknown table 'missing'")))
-    assert(errors(key.copy(columns = Vector(SchemaId("missing")))).exists(_.contains("references unknown column 'missing'")))
-    assert(errors(key.copy(columns = Vector.empty, referencedColumns = Vector.empty)).exists(_.contains("has no columns")))
+    assert(errors(key.copy(referencedTable =
+      SchemaId("missing")
+    )).exists(_.contains("references unknown table 'missing'")))
+    assert(errors(key.copy(columns =
+      Vector(SchemaId("missing"))
+    )).exists(_.contains("references unknown column 'missing'")))
+    assert(errors(key.copy(
+      columns = Vector.empty,
+      referencedColumns = Vector.empty
+    )).exists(_.contains("has no columns")))
     assert(errors(key.copy(referencedColumns = Vector.empty)).exists(_.contains("must reference the primary key")))
     assert(errors(key, key).exists(_.contains("more than one foreign key on (invoice/owner)")))
-    val mistyped = SchemaValidation.validate(SchemaModel(Vector(customer,
-      invoice.copy(columns = Vector(owner.copy(dataType = SqlType.Integer))))))
+    val mistyped = SchemaValidation.validate(SchemaModel(Vector(
+      customer,
+      invoice.copy(columns = Vector(owner.copy(dataType = SqlType.Integer)))
+    )))
     assert(mistyped.exists(_.contains("has type Integer but references type BigInt")), mistyped)
   }
 
   test("a cascading foreign key may reference an ordered unique key") {
     val id = ColumnModel(SchemaId("parent/id"), SqlIdentifier("id"), SqlType.Uuid, nullable = false)
     val tenant = ColumnModel(SchemaId("parent/tenant"), SqlIdentifier("tenant"), SqlType.Text, nullable = false)
-    val parent = TableModel(SchemaId("parent"), QualifiedName(SqlIdentifier("parent")),
-      Vector(id, tenant), Vector(id.id), uniqueKeys = Vector(UniqueKeyModel(Vector(id.id, tenant.id))))
+    val parent = TableModel(
+      SchemaId("parent"),
+      QualifiedName(SqlIdentifier("parent")),
+      Vector(id, tenant),
+      Vector(id.id),
+      uniqueKeys = Vector(UniqueKeyModel(Vector(id.id, tenant.id)))
+    )
     val ref = ColumnModel(SchemaId("child/ref"), SqlIdentifier("parent_id"), SqlType.Uuid, nullable = false)
     val scope = ColumnModel(SchemaId("child/tenant"), SqlIdentifier("tenant"), SqlType.Text, nullable = false)
     val key = ForeignKeyModel(Vector(ref.id, scope.id), parent.id, Vector(id.id, tenant.id), onDeleteCascade = true)
-    val child = TableModel(SchemaId("child"), QualifiedName(SqlIdentifier("child")),
-      Vector(ref, scope), foreignKeys = Vector(key))
+    val child = TableModel(
+      SchemaId("child"),
+      QualifiedName(SqlIdentifier("child")),
+      Vector(ref, scope),
+      foreignKeys = Vector(key)
+    )
     assertEquals(SchemaValidation.validate(SchemaModel(Vector(parent, child))), Vector.empty)
     val missingUnique = SchemaValidation.validate(SchemaModel(Vector(parent.copy(uniqueKeys = Vector.empty), child)))
     assert(missingUnique.exists(_.contains("must reference the primary key or a unique key")), missingUnique)
@@ -90,17 +117,22 @@ class SchemaValidationSuite extends munit.FunSuite:
 
   test("unique keys list existing columns once and are not declared twice") {
     val column = table.columns.head
-    def errors(keys: UniqueKeyModel*) = SchemaValidation.validate(SchemaModel(Vector(table.copy(uniqueKeys = keys.toVector))))
+    def errors(keys: UniqueKeyModel*) =
+      SchemaValidation.validate(SchemaModel(Vector(table.copy(uniqueKeys = keys.toVector))))
     assertEquals(errors(UniqueKeyModel(Vector(column.id))), Vector.empty)
     assert(errors(UniqueKeyModel(Vector.empty)).exists(_.contains("has no columns")))
     assert(errors(UniqueKeyModel(Vector(column.id, column.id))).exists(_.contains("more than once")))
     assert(errors(UniqueKeyModel(Vector(SchemaId("missing")))).exists(_.contains("unknown column 'missing'")))
-    assert(errors(UniqueKeyModel(Vector(column.id)), UniqueKeyModel(Vector(column.id))).exists(_.contains("more than one unique key")))
+    assert(errors(
+      UniqueKeyModel(Vector(column.id)),
+      UniqueKeyModel(Vector(column.id))
+    ).exists(_.contains("more than one unique key")))
   }
 
   test("indexes list existing columns once and are not declared twice") {
     val column = table.columns.head
-    def errors(indexes: IndexModel*) = SchemaValidation.validate(SchemaModel(Vector(table.copy(indexes = indexes.toVector))))
+    def errors(indexes: IndexModel*) =
+      SchemaValidation.validate(SchemaModel(Vector(table.copy(indexes = indexes.toVector))))
     val ascending = IndexModel(Vector(IndexColumn(column.id)))
     assertEquals(errors(ascending, IndexModel(Vector(IndexColumn(column.id, descending = true)))), Vector.empty)
     assert(errors(IndexModel(Vector.empty)).exists(_.contains("has no columns")))
@@ -112,22 +144,35 @@ class SchemaValidationSuite extends munit.FunSuite:
 
   test("CHAR lengths, NUMERIC precision and scale and TIME precisions must be in range") {
     def errors(dataType: SqlType) =
-      SchemaValidation.validate(SchemaModel(Vector(table.copy(columns = table.columns.map(_.copy(dataType = dataType))))))
+      SchemaValidation.validate(SchemaModel(Vector(table.copy(columns =
+        table.columns.map(_.copy(dataType = dataType))
+      ))))
     assert(errors(SqlType.Char(0)).exists(_.contains("invalid CHAR length 0")))
     assert(errors(SqlType.Numeric(0, 0)).exists(_.contains("invalid NUMERIC(0, 0)")))
     assert(errors(SqlType.Numeric(5, 6)).exists(_.contains("invalid NUMERIC(5, 6)")))
     assert(errors(SqlType.Numeric(5, -1)).exists(_.contains("invalid NUMERIC(5, -1)")))
     assert(errors(SqlType.Time(-1)).exists(_.contains("invalid TIME precision -1")))
-    Vector(SqlType.Char(1), SqlType.Numeric(38, 2), SqlType.Numeric(10, 10), SqlType.Time(0), SqlType.SmallInt,
-      SqlType.Real, SqlType.DoublePrecision, SqlType.Date, SqlType.Binary, SqlType.LargeObject,
-      SqlType.Json).foreach { valid =>
+    Vector(
+      SqlType.Char(1),
+      SqlType.Numeric(38, 2),
+      SqlType.Numeric(10, 10),
+      SqlType.Time(0),
+      SqlType.SmallInt,
+      SqlType.Real,
+      SqlType.DoublePrecision,
+      SqlType.Date,
+      SqlType.Binary,
+      SqlType.LargeObject,
+      SqlType.Json
+    ).foreach { valid =>
       assertEquals(errors(valid), Vector.empty)
     }
   }
 
   test("allowed values need a string column and fit its length; ranges need an integer column and fit its type") {
     def errors(dataType: SqlType, check: ColumnCheck) = SchemaValidation.validate(SchemaModel(Vector(
-      table.copy(columns = table.columns.map(_.copy(dataType = dataType, check = Some(check)))))))
+      table.copy(columns = table.columns.map(_.copy(dataType = dataType, check = Some(check))))
+    )))
     assertEquals(errors(SqlType.Varchar(5), ColumnCheck.AllowedValues(Vector("DRAFT", "SENT"))), Vector.empty)
     assertEquals(errors(SqlType.SmallInt, ColumnCheck.Range(0, 2)), Vector.empty)
     assert(errors(SqlType.Varchar(4), ColumnCheck.AllowedValues(Vector("DRAFT"))).exists(_.contains("longer than 4")))
@@ -143,20 +188,35 @@ class SchemaValidationSuite extends munit.FunSuite:
     val key = table.columns.head.copy(dataType = SqlType.BigInt, nullable = false, identity = true)
     def errors(model: SchemaModel) = SchemaValidation.validate(model)
     assertEquals(errors(SchemaModel(Vector(table.copy(columns = Vector(key))))), Vector.empty)
-    assert(errors(SchemaModel(Vector(table.copy(columns = Vector(key.copy(nullable = true)))))).exists(_.contains("must not be nullable")))
-    assert(errors(SchemaModel(Vector(table.copy(columns = Vector(key.copy(dataType = SqlType.Text)))))).exists(_.contains("integer type")))
+    assert(errors(SchemaModel(Vector(table.copy(columns =
+      Vector(key.copy(nullable = true))
+    )))).exists(_.contains("must not be nullable")))
+    assert(errors(SchemaModel(Vector(table.copy(columns =
+      Vector(key.copy(dataType = SqlType.Text))
+    )))).exists(_.contains("integer type")))
     val sequence = SequenceModel(SchemaId("sequence"), QualifiedName(SqlIdentifier("customer_seq")), 1, 50)
     assertEquals(errors(SchemaModel(Vector(table), Vector(sequence))), Vector.empty)
-    assert(errors(SchemaModel(Vector(table), Vector(sequence.copy(increment = 0)))).exists(_.contains("ascending sequence")))
-    assert(errors(SchemaModel(Vector(table), Vector(sequence.copy(start = 0)))).exists(_.contains("ascending sequence")))
+    assert(errors(SchemaModel(
+      Vector(table),
+      Vector(sequence.copy(increment = 0))
+    )).exists(_.contains("ascending sequence")))
+    assert(errors(SchemaModel(
+      Vector(table),
+      Vector(sequence.copy(start = 0))
+    )).exists(_.contains("ascending sequence")))
     assert(errors(SchemaModel(Vector(table), Vector(sequence.copy(name = table.name))))
       .exists(_.contains("Duplicate physical table or sequence name")))
-    assert(errors(SchemaModel(Vector(table), Vector(sequence.copy(id = table.id)))).exists(_.contains("Duplicate stable ID")))
+    assert(errors(SchemaModel(
+      Vector(table),
+      Vector(sequence.copy(id = table.id))
+    )).exists(_.contains("Duplicate stable ID")))
   }
 
   test("TIMESTAMP precisions must not be negative") {
     def errors(dataType: SqlType) =
-      SchemaValidation.validate(SchemaModel(Vector(table.copy(columns = table.columns.map(_.copy(dataType = dataType))))))
+      SchemaValidation.validate(SchemaModel(Vector(table.copy(columns =
+        table.columns.map(_.copy(dataType = dataType))
+      ))))
     assert(errors(SqlType.Timestamp(-1)).exists(_.contains("invalid TIMESTAMP precision -1")))
     assert(errors(SqlType.TimestampWithTimeZone(-1)).exists(_.contains("invalid TIMESTAMP precision -1")))
     assertEquals(errors(SqlType.Timestamp(0)), Vector.empty)

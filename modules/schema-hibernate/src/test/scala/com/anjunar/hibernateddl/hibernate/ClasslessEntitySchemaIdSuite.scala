@@ -7,8 +7,9 @@ import org.hibernate.mapping.PersistentClass
 
 import java.io.ByteArrayInputStream
 import java.nio.charset.StandardCharsets
+import munit.FunSuite
 
-class ClasslessEntitySchemaIdSuite extends munit.FunSuite:
+class ClasslessEntitySchemaIdSuite extends FunSuite:
   test("service provider gives a classless Hibernate entity stable table and column IDs") {
     val registry = new StandardServiceRegistryBuilder()
       .applySetting("hibernate.dialect", "org.hibernate.dialect.PostgreSQLDialect")
@@ -16,7 +17,8 @@ class ClasslessEntitySchemaIdSuite extends munit.FunSuite:
       .applySetting("hibernate.default_schema", "public")
       .build()
     try
-      val xml = """<entity-mappings xmlns="http://www.hibernate.org/xsd/orm/mapping" version="7.0">
+      val xml =
+        """<entity-mappings xmlns="http://www.hibernate.org/xsd/orm/mapping" version="7.0">
         |  <entity name="generated.test.translation" metadata-complete="true">
         |    <table name="generated_translation"/>
         |    <attributes>
@@ -31,8 +33,13 @@ class ClasslessEntitySchemaIdSuite extends munit.FunSuite:
         .buildMetadata()
       val table = HibernateSchemaSource.read(metadata).toOption.get.tables.head
       assertEquals(table.id, SchemaId("a31b4c20/translation"))
-      assertEquals(table.primaryKey, Vector(
-        SchemaId("a31b4c20/translation/page_id"), SchemaId("a31b4c20/translation/locale")))
+      assertEquals(
+        table.primaryKey,
+        Vector(
+          SchemaId("a31b4c20/translation/page_id"),
+          SchemaId("a31b4c20/translation/locale")
+        )
+      )
       assertEquals(table.columns.find(_.name.value == "title").map(_.dataType), Some(SqlType.Text))
       assertEquals(SchemaValidation.validate(SchemaModel(Vector(table))), Vector.empty)
     finally StandardServiceRegistryBuilder.destroy(registry)

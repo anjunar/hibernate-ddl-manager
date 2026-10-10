@@ -25,9 +25,9 @@ import scala.util.control.NonFatal
   */
 final class SchemaMigrationIntegrator extends Integrator:
   override def integrate(
-      metadata: Metadata,
-      bootstrapContext: BootstrapContext,
-      sessionFactory: SessionFactoryImplementor
+    metadata: Metadata,
+    bootstrapContext: BootstrapContext,
+    sessionFactory: SessionFactoryImplementor
   ): Unit =
     // Every SessionFactory on the classpath runs this; only an enabled one reads more.
     val settings = sessionFactory.getProperties.asScala
@@ -38,12 +38,17 @@ final class SchemaMigrationIntegrator extends Integrator:
           "without JTA enlistment before building the SessionFactory")
       val provider = Option(registry.getService(classOf[ConnectionProvider])).getOrElse(
         refuse("Hibernate has no single ConnectionProvider (multi-tenancy?); call HibernateSchemaMigration.migrate " +
-          "with a DataSource before building the SessionFactory"))
+          "with a DataSource before building the SessionFactory")
+      )
       val dataSource = ProviderDataSource(provider)
       val result = HibernateSchemaMigration.migrate(metadata, dataSource)
       dataSource.resetFailure.foreach { error =>
-        throw new MigrationException(s"Migration ended at revision ${result.revision}, but the connection could not " +
-          s"be given back to Hibernate as it was lent and was aborted: ${error.getMessage}", FailureState.Committed, error)
+        throw new MigrationException(
+          s"Migration ended at revision ${result.revision}, but the connection could not " +
+            s"be given back to Hibernate as it was lent and was aborted: ${error.getMessage}",
+          FailureState.Committed,
+          error
+        )
       }
 
   private def refuse(message: String): Nothing =

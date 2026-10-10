@@ -1,8 +1,9 @@
 package com.anjunar.hibernateddl.executor
 
 import com.anjunar.hibernateddl.core.*
+import munit.FunSuite
 
-class SchemaModelJsonSuite extends munit.FunSuite:
+class SchemaModelJsonSuite extends FunSuite:
   private val id = ColumnModel(SchemaId("7f3a9c21/0a1b2c3d"), SqlIdentifier("id"), SqlType.Uuid, nullable = false)
   private val customer = TableModel(
     SchemaId("7f3a9c21"),
@@ -26,14 +27,28 @@ class SchemaModelJsonSuite extends munit.FunSuite:
 
   test("encoding is compact, readable and round-trips every type") {
     val json = SchemaModelJson.encode(model)
-    assert(json.startsWith("""{"format":8,"tables":[{"id":"7f3a9c21","catalog":null,"schema":"public","name":"customer","""), json)
+    assert(
+      json.startsWith("""{"format":8,"tables":[{"id":"7f3a9c21","catalog":null,"schema":"public","name":"customer","""),
+      json
+    )
     assert(json.contains(""""type":"varchar(80)","nullable":true,"check":null,"identity":false"""), json)
     assert(json.contains(""""type":"timestamp(6)","nullable":false,"check":null,"identity":false"""), json)
-    assert(json.contains(""""type":"timestamp(3) with time zone","nullable":true,"check":null,"identity":false"""), json)
+    assert(
+      json.contains(""""type":"timestamp(3) with time zone","nullable":true,"check":null,"identity":false"""),
+      json
+    )
     assert(json.contains(""""type":"uuid""""), json)
-    assert(json.endsWith(""""primaryKey":["7f3a9c21/0a1b2c3d"],"foreignKeys":[],"uniqueKeys":[],"indexes":[],"checks":[]}],"sequences":[]}"""), json)
+    assert(
+      json.endsWith(
+        """"primaryKey":["7f3a9c21/0a1b2c3d"],"foreignKeys":[],"uniqueKeys":[],"indexes":[],"checks":[]}],"sequences":[]}"""
+      ),
+      json
+    )
     assertEquals(SchemaModelJson.decode(json), Right(model))
-    assertEquals(SchemaModelJson.decode(SchemaModelJson.encode(SchemaModel(Vector.empty))), Right(SchemaModel(Vector.empty)))
+    assertEquals(
+      SchemaModelJson.decode(SchemaModelJson.encode(SchemaModel(Vector.empty))),
+      Right(SchemaModel(Vector.empty))
+    )
   }
 
   test("quotes, backslashes, control and non-ASCII characters are escaped and survive a round trip") {
@@ -53,72 +68,127 @@ class SchemaModelJsonSuite extends munit.FunSuite:
         |  "columns": [{"id": "7f3a9c21/0a1b2c3d", "name": "id", "type": "uuid", "nullable": false},
         |  {"id": "7f3a9c21/f34e45b6", "name": "nick_name", "type": "varchar(80)", "nullable": true}],
         |  "primaryKey": ["7f3a9c21/0a1b2c3d"]}]}""".stripMargin
-    assertEquals(SchemaModelJson.decode(jsonb), Right(SchemaModel(Vector(customer.copy(columns = customer.columns.take(2))))))
+    assertEquals(
+      SchemaModelJson.decode(jsonb),
+      Right(SchemaModel(Vector(customer.copy(columns = customer.columns.take(2)))))
+    )
   }
 
   test("foreign keys round-trip, including a self-reference") {
     val parent = ColumnModel(SchemaId("7f3a9c21/7c8d9e0f"), SqlIdentifier("parent_id"), SqlType.Uuid)
-    val linked = customer.copy(columns = customer.columns :+ parent,
-      foreignKeys = Vector(ForeignKeyModel(Vector(parent.id), customer.id, customer.primaryKey)))
+    val linked = customer.copy(
+      columns = customer.columns :+ parent,
+      foreignKeys = Vector(ForeignKeyModel(Vector(parent.id), customer.id, customer.primaryKey))
+    )
     val json = SchemaModelJson.encode(SchemaModel(Vector(linked)))
-    assert(json.contains(""""foreignKeys":[{"columns":["7f3a9c21/7c8d9e0f"],"referencedTable":"7f3a9c21",""" +
-      """"referencedColumns":["7f3a9c21/0a1b2c3d"],"onDeleteCascade":false}]"""), json)
+    assert(
+      json.contains(""""foreignKeys":[{"columns":["7f3a9c21/7c8d9e0f"],"referencedTable":"7f3a9c21",""" +
+        """"referencedColumns":["7f3a9c21/0a1b2c3d"],"onDeleteCascade":false}]"""),
+      json
+    )
     assertEquals(SchemaModelJson.decode(json), Right(SchemaModel(Vector(linked))))
   }
 
   test("format 7 foreign keys default to no cascade; format 8 records cascade") {
     val parent = ColumnModel(SchemaId("7f3a9c21/7c8d9e0f"), SqlIdentifier("parent_id"), SqlType.Uuid)
     val oldKey = ForeignKeyModel(Vector(parent.id), customer.id, customer.primaryKey)
-    val plain = SchemaModel(Vector(customer.copy(columns = customer.columns :+ parent,
-      foreignKeys = Vector(oldKey))))
+    val plain = SchemaModel(Vector(customer.copy(
+      columns = customer.columns :+ parent,
+      foreignKeys = Vector(oldKey)
+    )))
     val written = SchemaModelJson.encode(plain)
     val legacy = written.replace("\"format\":8", "\"format\":7")
       .replace(",\"onDeleteCascade\":false", "")
     assertEquals(SchemaModelJson.decode(legacy), Right(plain))
-    val cascading = plain.copy(tables = plain.tables.map(_.copy(
-      foreignKeys = Vector(oldKey.copy(onDeleteCascade = true)))))
+    val cascading = plain.copy(tables =
+      plain.tables.map(_.copy(
+        foreignKeys = Vector(oldKey.copy(onDeleteCascade = true))
+      ))
+    )
     assertEquals(SchemaModelJson.decode(SchemaModelJson.encode(cascading)), Right(cascading))
-    assert(failure(SchemaModelJson.encode(cascading).replace("\"onDeleteCascade\":true",
-      "\"onDeleteCascade\":null")).contains("onDeleteCascade must be true or false"))
+    assert(failure(SchemaModelJson.encode(cascading).replace(
+      "\"onDeleteCascade\":true",
+      "\"onDeleteCascade\":null"
+    )).contains("onDeleteCascade must be true or false"))
   }
 
   test("every column type has a JSON name and round-trips") {
-    val types = Vector(SqlType.Varchar(80), SqlType.Char(1), SqlType.Numeric(38, 2), SqlType.Timestamp(6),
-      SqlType.TimestampWithTimeZone(3), SqlType.Time(0), SqlType.Integer, SqlType.BigInt, SqlType.Boolean, SqlType.Text,
-      SqlType.Uuid, SqlType.SmallInt, SqlType.Real, SqlType.DoublePrecision, SqlType.Date, SqlType.Binary, SqlType.LargeObject,
-      SqlType.Json)
+    val types = Vector(
+      SqlType.Varchar(80),
+      SqlType.Char(1),
+      SqlType.Numeric(38, 2),
+      SqlType.Timestamp(6),
+      SqlType.TimestampWithTimeZone(3),
+      SqlType.Time(0),
+      SqlType.Integer,
+      SqlType.BigInt,
+      SqlType.Boolean,
+      SqlType.Text,
+      SqlType.Uuid,
+      SqlType.SmallInt,
+      SqlType.Real,
+      SqlType.DoublePrecision,
+      SqlType.Date,
+      SqlType.Binary,
+      SqlType.LargeObject,
+      SqlType.Json
+    )
     val typed = customer.copy(columns = id +: types.zipWithIndex.map { (dataType, index) =>
       ColumnModel(SchemaId(s"7f3a9c21/c$index"), SqlIdentifier(s"c$index"), dataType)
     })
     val json = SchemaModelJson.encode(SchemaModel(Vector(typed)))
-    Vector("char(1)", "numeric(38,2)", "time(0)", "smallint", "real", "double precision", "date", "binary", "large object", "json")
+    Vector(
+      "char(1)",
+      "numeric(38,2)",
+      "time(0)",
+      "smallint",
+      "real",
+      "double precision",
+      "date",
+      "binary",
+      "large object",
+      "json"
+    )
       .foreach { name =>
-      assert(json.contains(s"\"type\":\"$name\""), s"$name in $json")
-    }
+        assert(json.contains(s"\"type\":\"$name\""), s"$name in $json")
+      }
     assertEquals(SchemaModelJson.decode(json), Right(SchemaModel(Vector(typed))))
     assert(failure(json.replace("numeric(38,2)", "numeric(38)")).contains("unknown type 'numeric(38)'"))
   }
 
   test("unique keys round-trip in key order") {
-    val keyed = customer.copy(uniqueKeys = Vector(
-      UniqueKeyModel(Vector(SchemaId("7f3a9c21/f34e45b6"))),
-      UniqueKeyModel(Vector(SchemaId("7f3a9c21/1c2d3e4f"), SchemaId("7f3a9c21/f34e45b6")))
-    ))
+    val keyed = customer.copy(uniqueKeys =
+      Vector(
+        UniqueKeyModel(Vector(SchemaId("7f3a9c21/f34e45b6"))),
+        UniqueKeyModel(Vector(SchemaId("7f3a9c21/1c2d3e4f"), SchemaId("7f3a9c21/f34e45b6")))
+      )
+    )
     val json = SchemaModelJson.encode(SchemaModel(Vector(keyed)))
-    assert(json.contains(""""uniqueKeys":[{"columns":["7f3a9c21/f34e45b6"]},""" +
-      """{"columns":["7f3a9c21/1c2d3e4f","7f3a9c21/f34e45b6"]}]"""), json)
+    assert(
+      json.contains(""""uniqueKeys":[{"columns":["7f3a9c21/f34e45b6"]},""" +
+        """{"columns":["7f3a9c21/1c2d3e4f","7f3a9c21/f34e45b6"]}]"""),
+      json
+    )
     assertEquals(SchemaModelJson.decode(json), Right(SchemaModel(Vector(keyed))))
     assert(failure(json.replace("{\"columns\":[\"7f3a9c21/f34e45b6\"]}", "{\"cols\":[]}")).contains("expected columns"))
   }
 
   test("indexes round-trip with their column directions") {
-    val indexed = customer.copy(indexes = Vector(
-      IndexModel(Vector(IndexColumn(SchemaId("7f3a9c21/f34e45b6")))),
-      IndexModel(Vector(IndexColumn(SchemaId("7f3a9c21/5a6b7c8d"), descending = true), IndexColumn(SchemaId("7f3a9c21/f34e45b6"))))
-    ))
+    val indexed = customer.copy(indexes =
+      Vector(
+        IndexModel(Vector(IndexColumn(SchemaId("7f3a9c21/f34e45b6")))),
+        IndexModel(Vector(
+          IndexColumn(SchemaId("7f3a9c21/5a6b7c8d"), descending = true),
+          IndexColumn(SchemaId("7f3a9c21/f34e45b6"))
+        ))
+      )
+    )
     val json = SchemaModelJson.encode(SchemaModel(Vector(indexed)))
-    assert(json.contains(""""indexes":[{"columns":[{"id":"7f3a9c21/f34e45b6","descending":false}]},""" +
-      """{"columns":[{"id":"7f3a9c21/5a6b7c8d","descending":true},{"id":"7f3a9c21/f34e45b6","descending":false}]}]"""), json)
+    assert(
+      json.contains(""""indexes":[{"columns":[{"id":"7f3a9c21/f34e45b6","descending":false}]},""" +
+        """{"columns":[{"id":"7f3a9c21/5a6b7c8d","descending":true},{"id":"7f3a9c21/f34e45b6","descending":false}]}]"""),
+      json
+    )
     assertEquals(SchemaModelJson.decode(json), Right(SchemaModel(Vector(indexed))))
     assert(failure(json.replace("\"descending\":true", "\"descending\":1")).contains("true or false"))
   }
@@ -126,8 +196,8 @@ class SchemaModelJsonSuite extends munit.FunSuite:
   test("column checks round-trip as allowed values or an integer range") {
     val checked = customer.copy(columns = customer.columns.map {
       case c if c.name.value == "nick_name" => c.copy(check = Some(ColumnCheck.AllowedValues(Vector("it's", "\"x\""))))
-      case c if c.name.value == "points" => c.copy(check = Some(ColumnCheck.Range(Long.MinValue, -1)))
-      case c => c
+      case c if c.name.value == "points"    => c.copy(check = Some(ColumnCheck.Range(Long.MinValue, -1)))
+      case c                                => c
     })
     val json = SchemaModelJson.encode(SchemaModel(Vector(checked)))
     assert(json.contains(""""check":{"values":["it's","\"x\""]}"""), json)
@@ -139,19 +209,34 @@ class SchemaModelJsonSuite extends munit.FunSuite:
 
   test("identity columns and sequences round-trip") {
     val model = SchemaModel(
-      Vector(customer.copy(columns = customer.columns.map(c => if c.id == id.id then c.copy(dataType = SqlType.BigInt, identity = true) else c))),
-      Vector(SequenceModel(SchemaId("7f3a9c21/0a1b2c3d/sequence"), QualifiedName(SqlIdentifier("customer_SEQ"), Some(SqlIdentifier("public"))), 1, 50))
+      Vector(customer.copy(columns =
+        customer.columns.map(c => if c.id == id.id then c.copy(dataType = SqlType.BigInt, identity = true) else c)
+      )),
+      Vector(SequenceModel(
+        SchemaId("7f3a9c21/0a1b2c3d/sequence"),
+        QualifiedName(SqlIdentifier("customer_SEQ"), Some(SqlIdentifier("public"))),
+        1,
+        50
+      ))
     )
     val json = SchemaModelJson.encode(model)
     assert(json.contains(""""type":"bigint","nullable":false,"check":null,"identity":true"""), json)
-    assert(json.endsWith(""""sequences":[{"id":"7f3a9c21/0a1b2c3d/sequence","catalog":null,"schema":"public",""" +
-      """"name":"customer_SEQ","start":1,"increment":50}]}"""), json)
+    assert(
+      json.endsWith(""""sequences":[{"id":"7f3a9c21/0a1b2c3d/sequence","catalog":null,"schema":"public",""" +
+        """"name":"customer_SEQ","start":1,"increment":50}]}"""),
+      json
+    )
     assertEquals(SchemaModelJson.decode(json), Right(model))
     assert(failure(json.replace("\"increment\":50", "\"increment\":1.5")).contains("Invalid JSON"))
-    assert(failure(json.replace("\"identity\":true", "\"identity\":\"yes\"")).contains("identity must be true or false"))
+    assert(failure(json.replace(
+      "\"identity\":true",
+      "\"identity\":\"yes\""
+    )).contains("identity must be true or false"))
   }
 
-  test("format 5, written before identity columns and sequences existed, still decodes to the same model and fingerprint") {
+  test(
+    "format 5, written before identity columns and sequences existed, still decodes to the same model and fingerprint"
+  ) {
     val written = """{"format":5,"tables":[{"id":"t","catalog":null,"schema":"public","name":"t","columns":""" +
       """[{"id":"t/id","name":"id","type":"uuid","nullable":false,"check":null},{"id":"t/status","name":"status",""" +
       """"type":"varchar(10)","nullable":true,"check":{"values":["NEW","OLD"]}}],"primaryKey":["t/id"],""" +
@@ -219,7 +304,10 @@ class SchemaModelJsonSuite extends munit.FunSuite:
     assert(failure(json.replace("\"format\":8", "\"format\":0")).contains("format 0 is unsupported"))
     assert(failure(json.replace(",\"sequences\":[]", "")).contains("expected format, sequences, tables"))
     assert(failure(json.replace(",\"foreignKeys\":[]", "")).contains("expected catalog, checks, columns, foreignKeys"))
-    assert(failure(json.replace("\"foreignKeys\":[]", "\"foreignKeys\":[{\"columns\":[]}]")).contains("referencedTable"))
+    assert(failure(json.replace(
+      "\"foreignKeys\":[]",
+      "\"foreignKeys\":[{\"columns\":[]}]"
+    )).contains("referencedTable"))
     assert(failure("""{"tables":[]}""").contains("format is missing"))
     assert(failure(json.replace("\"catalog\":null,", "")).contains("expected catalog"))
     assert(failure(json.replace("\"catalog\":null,", "\"catalog\":null,\"comment\":\"x\",")).contains("comment"))
@@ -236,9 +324,17 @@ class SchemaModelJsonSuite extends munit.FunSuite:
   test("malformed JSON is rejected with its offset") {
     val json = SchemaModelJson.encode(model)
     Vector(
-      "", json + " x", json.dropRight(1), """{"format":1,"format":1,"tables":[]}""", """{"format":1.0,"tables":[]}""",
-      """{"format":01,"tables":[]}""", """{"format":1,"tables":[],}""", """{"format":1,"tables":["\q"]}""",
-      """{"format":1,"tables":["\u12"]}""", "{\"format\":1,\"tables\":[\"a\nb\"]}", """{"format":1,"tables":[tru]}"""
+      "",
+      json + " x",
+      json.dropRight(1),
+      """{"format":1,"format":1,"tables":[]}""",
+      """{"format":1.0,"tables":[]}""",
+      """{"format":01,"tables":[]}""",
+      """{"format":1,"tables":[],}""",
+      """{"format":1,"tables":["\q"]}""",
+      """{"format":1,"tables":["\u12"]}""",
+      "{\"format\":1,\"tables\":[\"a\nb\"]}",
+      """{"format":1,"tables":[tru]}"""
     ).foreach { malformed =>
       assert(failure(malformed).startsWith("Invalid JSON at offset"), malformed)
     }

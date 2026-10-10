@@ -4,6 +4,7 @@ import com.anjunar.hibernateddl.core.*
 import java.sql.Connection
 import javax.sql.DataSource
 import scala.util.control.NonFatal
+import java.sql.{Statement as SqlStatement}
 
 /** Migrates the database to the target model during server startup, using one owned transaction.
   * The previous model is the one the latest history entry stored; without history it is the
@@ -27,10 +28,14 @@ import scala.util.control.NonFatal
   * caller transaction is committed or rolled back.
   */
 final class JdbcMigrationExecutor(
-    backend: TransactionalMigrationBackend,
-    options: ExecutionOptions = ExecutionOptions()
+  backend: TransactionalMigrationBackend,
+  options: ExecutionOptions = ExecutionOptions()
 ):
-  def migrate(dataSource: DataSource, target: SchemaModel, backfills: Vector[Backfill] = Vector.empty): MigrationResult =
+  def migrate(
+    dataSource: DataSource,
+    target: SchemaModel,
+    backfills: Vector[Backfill] = Vector.empty
+  ): MigrationResult =
     val targetFingerprint = prepare(target, backfills)
     var connection: Connection = null
     var isolation = Connection.TRANSACTION_NONE
@@ -55,8 +60,12 @@ final class JdbcMigrationExecutor(
       committed = true
       restore(connection, isolation).foreach { error =>
         abort(connection, error)
-        throw new MigrationException(s"Migration committed revision ${result.revision}, but the connection could not " +
-          s"be restored and was aborted: ${error.getMessage}", FailureState.Committed, error)
+        throw new MigrationException(
+          s"Migration committed revision ${result.revision}, but the connection could not " +
+            s"be restored and was aborted: ${error.getMessage}",
+          FailureState.Committed,
+          error
+        )
       }
       result
     catch
@@ -96,12 +105,15 @@ final class JdbcMigrationExecutor(
     * checks the database, executes and records.
     */
   private def migrateLocked(
-      connection: Connection,
-      target: SchemaModel,
-      targetFingerprint: String,
-      backfills: Vector[Backfill]
+    connection: Connection,
+    target: SchemaModel,
+    targetFingerprint: String,
+    backfills: Vector[Backfill]
   ): MigrationResult =
-    val history = MigrationPlanner.verifyHistory(backend.readHistory(connection)).fold(problem => refuse(Vector(problem.message)), identity)
+    val history = MigrationPlanner.verifyHistory(backend.readHistory(connection)).fold(
+      problem => refuse(Vector(problem.message)),
+      identity
+    )
     val records = backend.readBackfills(connection)
     val existing = if history.isEmpty then backend.existingRelations(connection, target) else Vector.empty
     val plan = MigrationPlanner.plan(backend, options, history, records, target, targetFingerprint, backfills, existing)
@@ -109,8 +121,16 @@ final class JdbcMigrationExecutor(
     val revision = plan.revision
     val next = revision + 1
     def record(statements: Vector[String]): Unit =
-      backend.recordHistory(connection, HistoryEntry(next, plan.previousFingerprint, targetFingerprint,
-        SchemaModelJson.encode(target), statements))
+      backend.recordHistory(
+        connection,
+        HistoryEntry(
+          next,
+          plan.previousFingerprint,
+          targetFingerprint,
+          SchemaModelJson.encode(target),
+          statements
+        )
+      )
     plan.mode match
       case PlanMode.NoChange =>
         validateDatabase(connection, target, "Applied schema", TableLock.Shared)
@@ -118,19 +138,51 @@ final class JdbcMigrationExecutor(
       case PlanMode.Adoption =>
         validateDatabase(connection, target, "Adopted schema")
         record(Vector.empty)
-        MigrationResult(next, MigrationStatus.Adopted, 0, recordBackfills(connection, plan, plan.adopted.map((_,
-          BackfillResult.Adopted, None))), plan.pending)
+        MigrationResult(
+          next,
+          MigrationStatus.Adopted,
+          0,
+          recordBackfills(
+            connection,
+            plan,
+            plan.adopted.map((
+              _,
+              BackfillResult.Adopted,
+              None
+            ))
+          ),
+          plan.pending
+        )
       case PlanMode.ManualMigration =>
-        val remaining = backend.existingRelations(connection, SchemaModel(
-          plan.previous.tables.filter(table => plan.absent.contains(table.name)),
-          plan.previous.sequences.filter(sequence => plan.absent.contains(sequence.name))))
+        val remaining = backend.existingRelations(
+          connection,
+          SchemaModel(
+            plan.previous.tables.filter(table => plan.absent.contains(table.name)),
+            plan.previous.sequences.filter(sequence => plan.absent.contains(sequence.name))
+          )
+        )
         if remaining.nonEmpty then
-          refuse(Vector(s"Manually migrated schema does not match database: ${remaining.map(_.display).sorted.mkString(", ")} " +
-            "of the previous schema still exist, but the target no longer has them; drop or rename them first"))
+          refuse(Vector(
+            s"Manually migrated schema does not match database: ${remaining.map(_.display).sorted.mkString(", ")} " +
+              "of the previous schema still exist, but the target no longer has them; drop or rename them first"
+          ))
         validateDatabase(connection, target, "Manually migrated schema")
         record(Vector.empty)
-        MigrationResult(next, MigrationStatus.ManuallyMigrated, 0, recordBackfills(connection, plan, plan.adopted.map((_,
-          BackfillResult.Adopted, None))), plan.pending)
+        MigrationResult(
+          next,
+          MigrationStatus.ManuallyMigrated,
+          0,
+          recordBackfills(
+            connection,
+            plan,
+            plan.adopted.map((
+              _,
+              BackfillResult.Adopted,
+              None
+            ))
+          ),
+          plan.pending
+        )
       case PlanMode.Migration =>
         validateDatabase(connection, plan.previous, "Previous schema")
         // Known dependents are named before any DDL; the database may still refuse others.
@@ -144,12 +196,18 @@ final class JdbcMigrationExecutor(
         validateDatabase(connection, target, "Target schema")
         val statements = steps.collect {
           case step: PlanStep.Statement => step.sql
-          case step: PlanStep.Fill => step.statement.sql
+          case step: PlanStep.Fill      => step.statement.sql
         }
         record(statements)
         val outcomes = filled.map((backfill, rows) => (backfill, BackfillResult.Executed, Some(rows))) ++
           plan.created.map(backfill => (backfill, BackfillResult.NotRequiredOnCreation, None))
-        MigrationResult(next, MigrationStatus.Applied, statements.size, recordBackfills(connection, plan, outcomes), plan.pending)
+        MigrationResult(
+          next,
+          MigrationStatus.Applied,
+          statements.size,
+          recordBackfills(connection, plan, outcomes),
+          plan.pending
+        )
 
   /** The plan's steps with every bound-at-execution template replaced by the SQL for the object
     * the catalog shows now, under the locks and before any DDL; replacements created later can
@@ -157,24 +215,40 @@ final class JdbcMigrationExecutor(
     */
   private def bind(connection: Connection, plan: MigrationPlan): Vector[PlanStep] =
     val bindings = MigrationPlanner.bindings(plan)
-    val results = bindings.map((index, operation, table, columns) => index -> backend.bindDrop(connection, operation, table, columns))
+    val results = bindings.map((index, operation, table, columns) =>
+      index -> backend.bindDrop(connection, operation, table, columns)
+    )
     val problems = results.flatMap(_._2.left.toOption).flatten
     if problems.nonEmpty then refuse(problems)
     val bound = results.collect { case (index, Right(sql)) => index -> sql }.toMap
     plan.steps.zipWithIndex.map {
       case (step: PlanStep.Statement, index) if SchemaOperation.boundAtExecution(step.operation) =>
-        step.copy(sql = bound.getOrElse(index, refuse(Vector(s"Step ${index + 1} names no object it could be bound to"))))
+        step.copy(sql =
+          bound.getOrElse(index, refuse(Vector(s"Step ${index + 1} names no object it could be bound to")))
+        )
       case (step, _) => step
     }
 
   private def recordBackfills(
-      connection: Connection,
-      plan: MigrationPlan,
-      outcomes: Vector[(Backfill, BackfillResult, Option[Long])]
+    connection: Connection,
+    plan: MigrationPlan,
+    outcomes: Vector[(Backfill, BackfillResult, Option[Long])]
   ): Vector[BackfillOutcome] =
     outcomes.sortBy(_._1.id).map { (backfill, result, rows) =>
-      backend.recordBackfill(connection, BackfillRecord(backfill.id, BackfillChecksum.Format, BackfillChecksum.of(backfill),
-        backfill.target, plan.revision + 1, plan.previousFingerprint, plan.targetFingerprint, result, rows))
+      backend.recordBackfill(
+        connection,
+        BackfillRecord(
+          backfill.id,
+          BackfillChecksum.Format,
+          BackfillChecksum.of(backfill),
+          backfill.target,
+          plan.revision + 1,
+          plan.previousFingerprint,
+          plan.targetFingerprint,
+          result,
+          rows
+        )
+      )
       BackfillOutcome(backfill.id, result, rows)
     }
 
@@ -195,21 +269,24 @@ final class JdbcMigrationExecutor(
 
   /** Checks everything that does not depend on the database and returns the target fingerprint. */
   private def prepare(target: SchemaModel, backfills: Vector[Backfill]): String =
-    try MigrationPlanner.prepare(backend, options, target, backfills).fold(
-      messages => throw new MigrationException(messages.mkString("; "), FailureState.NotStarted), identity)
+    try
+      MigrationPlanner.prepare(backend, options, target, backfills).fold(
+        messages => throw new MigrationException(messages.mkString("; "), FailureState.NotStarted),
+        identity
+      )
     catch
       case error: MigrationException => throw error
-      case NonFatal(error) =>
+      case NonFatal(error)           =>
         throw new MigrationException(s"Migration planning failed: ${error.getMessage}", FailureState.NotStarted, error)
 
   private def refuse(messages: Vector[String]): Nothing =
     throw new IllegalStateException(messages.mkString("; "))
 
   private def validateDatabase(
-      connection: Connection,
-      model: SchemaModel,
-      label: String,
-      lock: TableLock = TableLock.Exclusive
+    connection: Connection,
+    model: SchemaModel,
+    label: String,
+    lock: TableLock = TableLock.Exclusive
   ): Unit =
     val errors = backend.lockAndValidate(connection, model, lock)
     if errors.nonEmpty then throw new IllegalStateException(s"$label does not match database: ${errors.mkString("; ")}")
@@ -239,7 +316,7 @@ final class JdbcMigrationExecutor(
       None
 
   /** Runs one statement with the statement timeout and closes it without masking a failure. */
-  private def withStatement[S <: java.sql.Statement, A](open: => S)(body: S => A): A =
+  private def withStatement[S <: SqlStatement, A](open: => S)(body: S => A): A =
     val statement = open
     var primaryFailure: Throwable = null
     try

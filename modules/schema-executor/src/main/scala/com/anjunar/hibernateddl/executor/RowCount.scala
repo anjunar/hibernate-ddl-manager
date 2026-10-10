@@ -7,4 +7,3 @@ enum RowCount:
   case Exact(rows: Long)
   case Estimate(rows: Long)
   case Unknown
-

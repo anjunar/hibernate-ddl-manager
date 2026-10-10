@@ -5,17 +5,22 @@ import com.anjunar.hibernateddl.hibernate.annotation.SchemaId
 import jakarta.persistence.{CheckConstraint, Column, Entity, Id, Table}
 import munit.FunSuite
 
-import java.util.UUID
+import java.util
 
 @Entity
 @SchemaId("682d9ace")
-@Table(name = "checked_post", schema = "public",
-  check = Array(new CheckConstraint(name = "ck_publication",
-    constraint = "(status = 'DRAFT' AND published_at IS NULL) OR (status = 'PUBLISHED' AND published_at IS NOT NULL)")))
+@Table(
+  name = "checked_post",
+  schema = "public",
+  check = Array(new CheckConstraint(
+    name = "ck_publication",
+    constraint = "(status = 'DRAFT' AND published_at IS NULL) OR (status = 'PUBLISHED' AND published_at IS NOT NULL)"
+  ))
+)
 class CheckedPost:
   @Id
   @SchemaId("a2473e8b")
-  var id: UUID = null
+  var id: util.UUID = null
 
   @SchemaId("cf271a06")
   @Column(nullable = false, length = 24)

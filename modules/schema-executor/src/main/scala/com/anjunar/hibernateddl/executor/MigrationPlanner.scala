@@ -12,10 +12,10 @@ object MigrationPlanner:
 
   /** Checks everything that does not depend on the database and returns the target fingerprint. */
   def prepare(
-      backend: PlanningBackend,
-      options: ExecutionOptions,
-      target: SchemaModel,
-      backfills: Vector[Backfill]
+    backend: PlanningBackend,
+    options: ExecutionOptions,
+    target: SchemaModel,
+    backfills: Vector[Backfill]
   ): Either[Vector[String], String] =
     val errors = Vector.newBuilder[String]
     val maximumTimeoutMillis = 24 * 60 * 60 * 1000
@@ -32,16 +32,19 @@ object MigrationPlanner:
   def verifyHistory(entries: Vector[HistoryEntry]): Either[PlanProblem, Vector[AppliedRevision]] =
     entries.foldLeft[Either[PlanProblem, Vector[AppliedRevision]]](Right(Vector.empty)) { (result, entry) =>
       result.flatMap { chain =>
-        def corrupt(reason: String) = Left(PlanProblem(PlanProblem.HistoryInconsistent,
-          s"Schema history is inconsistent at revision ${entry.revision}: $reason; refusing to migrate"))
+        def corrupt(reason: String) = Left(PlanProblem(
+          PlanProblem.HistoryInconsistent,
+          s"Schema history is inconsistent at revision ${entry.revision}: $reason; refusing to migrate"
+        ))
         if entry.revision != chain.size + 1 then corrupt(s"expected revision ${chain.size + 1}")
         else if entry.previousFingerprint != chain.lastOption.fold(EmptyFingerprint)(_.entry.targetFingerprint) then
           corrupt("previous fingerprint does not match the preceding revision")
-        else SchemaModelJson.decode(entry.model) match
-          case Left(error) => corrupt(s"stored model is unreadable ($error)")
-          case Right(model) if SchemaFingerprint.of(model) != entry.targetFingerprint =>
-            corrupt("stored model does not match its fingerprint")
-          case Right(model) => Right(chain :+ AppliedRevision(entry, model))
+        else
+          SchemaModelJson.decode(entry.model) match
+            case Left(error) => corrupt(s"stored model is unreadable ($error)")
+            case Right(model) if SchemaFingerprint.of(model) != entry.targetFingerprint =>
+              corrupt("stored model does not match its fingerprint")
+            case Right(model) => Right(chain :+ AppliedRevision(entry, model))
       }
     }
 
@@ -49,16 +52,17 @@ object MigrationPlanner:
     * matters without history, where it decides between creation and adoption.
     */
   def plan(
-      backend: PlanningBackend,
-      options: ExecutionOptions,
-      history: Vector[AppliedRevision],
-      records: Vector[BackfillRecord],
-      target: SchemaModel,
-      targetFingerprint: String,
-      backfills: Vector[Backfill],
-      existing: Vector[QualifiedName]
+    backend: PlanningBackend,
+    options: ExecutionOptions,
+    history: Vector[AppliedRevision],
+    records: Vector[BackfillRecord],
+    target: SchemaModel,
+    targetFingerprint: String,
+    backfills: Vector[Backfill],
+    existing: Vector[QualifiedName]
   ): MigrationPlan =
-    val base = MigrationPlan(PlanMode.Migration, history, records, target, targetFingerprint, Vector.empty, false, Vector.empty)
+    val base =
+      MigrationPlan(PlanMode.Migration, history, records, target, targetFingerprint, Vector.empty, false, Vector.empty)
     val recordProblems = verifyRecords(history, records)
     if recordProblems.nonEmpty then base.copy(problems = recordProblems)
     else
@@ -70,9 +74,12 @@ object MigrationPlanner:
         val returning = history.find(_.entry.targetFingerprint == targetFingerprint).filterNot { older =>
           options.approvals.contains(Approval.Revert(older.entry.revision))
         }.map { older =>
-          PlanProblem(PlanProblem.RevertNotApproved, s"Target schema equals revision ${older.entry.revision}, but the " +
-            s"database is at revision ${base.revision}; a server with an older schema must not start after a newer " +
-            s"migration. If returning to it is intended, approve it with Approval.Revert(${older.entry.revision})")
+          PlanProblem(
+            PlanProblem.RevertNotApproved,
+            s"Target schema equals revision ${older.entry.revision}, but the " +
+              s"database is at revision ${base.revision}; a server with an older schema must not start after a newer " +
+              s"migration. If returning to it is intended, approve it with Approval.Revert(${older.entry.revision})"
+          )
         }
         val problems = changed ++ returning ++ retired(history, target)
         if history.isEmpty && existing.nonEmpty then adoption(base, options, existing, pending, problems)
@@ -80,42 +87,59 @@ object MigrationPlanner:
         else migration(backend, options, base, pending, problems)
 
   private def adoption(
-      base: MigrationPlan,
-      options: ExecutionOptions,
-      existing: Vector[QualifiedName],
-      pending: Vector[Backfill],
-      problems: Vector[PlanProblem]
+    base: MigrationPlan,
+    options: ExecutionOptions,
+    existing: Vector[QualifiedName],
+    pending: Vector[Backfill],
+    problems: Vector[PlanProblem]
   ): MigrationPlan =
     def show(names: Vector[QualifiedName]) = names.map(_.display).distinct.sorted.mkString(", ")
     val target = base.target
     val missing = (target.tables.map(_.name) ++ target.sequences.map(_.name)).filterNot(existing.contains)
     val adoptionProblems =
-      if !options.adoptExistingSchema then Vector(PlanProblem(PlanProblem.AdoptionNotEnabled,
-        s"The database has no schema history but already contains ${show(existing)} of the target schema; " +
-          "enable adoptExistingSchema to adopt a database that matches the target exactly"))
-      else if missing.nonEmpty then Vector(PlanProblem(PlanProblem.AdoptionIncomplete,
-        s"Adopting the existing schema requires every table and sequence of the target; missing: ${show(missing)}"))
+      if !options.adoptExistingSchema then
+        Vector(PlanProblem(
+          PlanProblem.AdoptionNotEnabled,
+          s"The database has no schema history but already contains ${show(existing)} of the target schema; " +
+            "enable adoptExistingSchema to adopt a database that matches the target exactly"
+        ))
+      else if missing.nonEmpty then
+        Vector(PlanProblem(
+          PlanProblem.AdoptionIncomplete,
+          s"Adopting the existing schema requires every table and sequence of the target; missing: ${show(missing)}"
+        ))
       else Vector.empty
     val required = newlyRequired(EmptyModel, target)
     val (found, left) = pending.partition(backfill => required.contains(backfill.target))
-    base.copy(mode = PlanMode.Adoption, complete = true, problems = problems ++ adoptionProblems, adopted = found,
-      pending = left.map(_.id))
+    base.copy(
+      mode = PlanMode.Adoption,
+      complete = true,
+      problems = problems ++ adoptionProblems,
+      adopted = found,
+      pending = left.map(_.id)
+    )
 
   private def manual(
-      base: MigrationPlan,
-      options: ExecutionOptions,
-      pending: Vector[Backfill],
-      problems: Vector[PlanProblem]
+    base: MigrationPlan,
+    options: ExecutionOptions,
+    pending: Vector[Backfill],
+    problems: Vector[PlanProblem]
   ): MigrationPlan =
     val accepted = options.acceptManualMigration.get
     val target = base.target
     val manualProblems =
-      if accepted != base.targetFingerprint then Vector(PlanProblem(PlanProblem.ManualTargetMismatch,
-        s"acceptManualMigration names the target $accepted, but this target is ${base.targetFingerprint}; " +
-          "remove the option or name this target"))
-      else if base.history.isEmpty then Vector(PlanProblem(PlanProblem.ManualWithoutHistory,
-        "A database without schema history has no previous revision to migrate by hand; " +
-          "adopt an existing database with adoptExistingSchema instead"))
+      if accepted != base.targetFingerprint then
+        Vector(PlanProblem(
+          PlanProblem.ManualTargetMismatch,
+          s"acceptManualMigration names the target $accepted, but this target is ${base.targetFingerprint}; " +
+            "remove the option or name this target"
+        ))
+      else if base.history.isEmpty then
+        Vector(PlanProblem(
+          PlanProblem.ManualWithoutHistory,
+          "A database without schema history has no previous revision to migrate by hand; " +
+            "adopt an existing database with adoptExistingSchema instead"
+        ))
       else Vector.empty
     val previous = base.previous
     val targetNames = (target.tables.map(_.name) ++ target.sequences.map(_.name)).toSet
@@ -123,54 +147,74 @@ object MigrationPlanner:
       previous.sequences.map(_.name).filterNot(targetNames.contains)
     val required = newlyRequired(previous, target)
     val (found, left) = pending.partition(backfill => required.contains(backfill.target))
-    base.copy(mode = PlanMode.ManualMigration, complete = true, problems = problems ++ manualProblems, absent = absent,
-      adopted = found, pending = left.map(_.id))
+    base.copy(
+      mode = PlanMode.ManualMigration,
+      complete = true,
+      problems = problems ++ manualProblems,
+      absent = absent,
+      adopted = found,
+      pending = left.map(_.id)
+    )
 
   private def migration(
-      backend: PlanningBackend,
-      options: ExecutionOptions,
-      base: MigrationPlan,
-      pending: Vector[Backfill],
-      problems: Vector[PlanProblem]
+    backend: PlanningBackend,
+    options: ExecutionOptions,
+    base: MigrationPlan,
+    pending: Vector[Backfill],
+    problems: Vector[PlanProblem]
   ): MigrationPlan =
     val history = base.history
     val previous = base.previous
     val target = base.target
     DiffEngine.diff(previous, target) match
       case Left(errors) =>
-        base.copy(problems = problems ++ errors.map(PlanProblem(PlanProblem.UnsupportedChange, _)), notes = Vector(
-          "To migrate by hand instead, change the database to exactly the target schema and start once with " +
-            s"acceptManualMigration = \"${base.targetFingerprint}\""))
+        base.copy(
+          problems = problems ++ errors.map(PlanProblem(PlanProblem.UnsupportedChange, _)),
+          notes = Vector(
+            "To migrate by hand instead, change the database to exactly the target schema and start once with " +
+              s"acceptManualMigration = \"${base.targetFingerprint}\""
+          )
+        )
       case Right(operations) =>
         def earlier(matches: TableModel => Boolean): Option[Long] =
           history.find(_.model.tables.exists(matches)).map(_.entry.revision)
         def renameBack(kind: String, id: SchemaId, revision: Option[Long]) = revision.map { revision =>
-          Approval.RenameBack(id) -> (s"Renaming $kind '${id.value}' back to its name from revision $revision is what an " +
-            s"older server would do; if intended, approve it with Approval.RenameBack(\"${id.value}\")")
+          Approval.RenameBack(id) ->
+            (s"Renaming $kind '${id.value}' back to its name from revision $revision is what an " +
+              s"older server would do; if intended, approve it with Approval.RenameBack(\"${id.value}\")")
         }
         def drop(kind: String, id: SchemaId, name: String) =
-          Approval.Drop(id) -> (s"Dropping $kind '${id.value}' ($name) deletes its data; if intended, approve it with " +
-            s"Approval.Drop(\"${id.value}\")")
+          Approval.Drop(id) ->
+            (s"Dropping $kind '${id.value}' ($name) deletes its data; if intended, approve it with " +
+              s"Approval.Drop(\"${id.value}\")")
         // Every approval an operation needs, with the message that asks for it.
         def needed(operation: SchemaOperation): Vector[(Approval, String)] = operation match
           case SchemaOperation.RenameTable(id, _, to) =>
             renameBack("table", id, earlier(table => table.id == id && table.name == to)).toVector
           case SchemaOperation.RenameColumn(tableId, _, columnId, _, to) =>
-            renameBack("column", columnId,
-              earlier(table => table.id == tableId && table.columns.exists(c => c.id == columnId && c.name == to))).toVector
+            renameBack(
+              "column",
+              columnId,
+              earlier(table => table.id == tableId && table.columns.exists(c => c.id == columnId && c.name == to))
+            ).toVector
           case SchemaOperation.RenameSequence(id, _, to) =>
-            renameBack("sequence", id,
-              history.find(_.model.sequences.exists(s => s.id == id && s.name == to)).map(_.entry.revision)).toVector
+            renameBack(
+              "sequence",
+              id,
+              history.find(_.model.sequences.exists(s => s.id == id && s.name == to)).map(_.entry.revision)
+            ).toVector
           case SchemaOperation.DropColumn(_, table, columnId, column) =>
             Vector(drop("column", columnId, s"${table.display}.${column.value}"))
-          case SchemaOperation.DropTables(tables) => tables.map(table => drop("table", table.tableId, table.table.display))
-          case SchemaOperation.DropSequence(id, sequence) => Vector(drop("sequence", id, sequence.display))
+          case SchemaOperation.DropTables(tables) =>
+            tables.map(table => drop("table", table.tableId, table.table.display))
+          case SchemaOperation.DropSequence(id, sequence)         => Vector(drop("sequence", id, sequence.display))
           case SchemaOperation.DropUniqueKey(ref, table, columns) =>
             val approval = Approval.dropUniqueKey(ref)
-            Vector(approval -> (s"Dropping unique key ${ref.display} of table '${ref.table.value}' " +
-              s"(${table.display} ${columns.map(_.value).mkString("(", ", ", ")")}) lets its columns hold duplicates; if " +
-              s"intended, approve it with Approval.DropUniqueKey(\"${ref.signature}\") or the setting entry " +
-              Approval.entry(approval)))
+            Vector(approval ->
+              (s"Dropping unique key ${ref.display} of table '${ref.table.value}' " +
+                s"(${table.display} ${columns.map(_.value).mkString("(", ", ", ")")}) lets its columns hold duplicates; if " +
+                s"intended, approve it with Approval.DropUniqueKey(\"${ref.signature}\") or the setting entry " +
+                Approval.entry(approval)))
           case _ => Vector.empty
         val approvals = operations.map(needed)
         val approvalProblems = approvals.flatten.collect {
@@ -178,15 +222,22 @@ object MigrationPlanner:
             PlanProblem(PlanProblem.ApprovalMissing, message, Some(subject(approval)))
         }
         val rejectedRisks = operations.map(_.risk).filterNot(options.allowedRisks.contains).distinct
-        val riskProblems = Option.when(rejectedRisks.nonEmpty)(PlanProblem(PlanProblem.RiskNotAllowed,
-          s"Migration risks are not allowed: ${rejectedRisks.mkString(", ")}")).toVector
+        val riskProblems = Option.when(rejectedRisks.nonEmpty)(PlanProblem(
+          PlanProblem.RiskNotAllowed,
+          s"Migration risks are not allowed: ${rejectedRisks.mkString(", ")}"
+        )).toVector
         val planned = problems ++ approvalProblems ++ riskProblems
         backend.render(operations) match
           case Left(errors) => base.copy(problems = planned ++ errors.map(PlanProblem(PlanProblem.RenderFailed, _)))
-          case Right(statements) if statements.exists(sql => sql == null || sql.trim.isEmpty) ||
-              statements.size != operations.size =>
-            base.copy(problems = planned :+ PlanProblem(PlanProblem.RenderFailed,
-              "Backend must render exactly one non-empty SQL statement per operation"))
+          case Right(statements)
+              if statements.exists(sql => sql == null || sql.trim.isEmpty) ||
+                statements.size != operations.size =>
+            base.copy(problems =
+              planned :+ PlanProblem(
+                PlanProblem.RenderFailed,
+                "Backend must render exactly one non-empty SQL statement per operation"
+              )
+            )
           case Right(statements) =>
             val (fills, fillProblems) = planFills(backend, previous, target, operations, pending)
             val created = operations.collect {
@@ -194,27 +245,42 @@ object MigrationPlanner:
             }.flatten.toSet
             val steps = operations.zip(statements).zip(approvals).flatMap { case ((operation, sql), required) =>
               val approval = required.headOption.map(_._1)
-              val statement = PlanStep.Statement(operation, sql, approval, required.forall(r => options.approvals.contains(r._1)))
+              val statement =
+                PlanStep.Statement(operation, sql, approval, required.forall(r => options.approvals.contains(r._1)))
               operation match
                 case SchemaOperation.SetNotNull(_, table, columnId, column) =>
                   val fill = fills.get(columnId)
                   val hint = fill.map(step => s"backfill '${step.backfill.id}' left them NULL")
-                    .orElse(base.records.find(_.target == columnId).map(record => s"backfill '${record.id}' was recorded " +
-                      s"in revision ${record.revision} and does not run again; a new rule for it needs a new ID"))
+                    .orElse(base.records.find(_.target == columnId).map(record =>
+                      s"backfill '${record.id}' was recorded " +
+                        s"in revision ${record.revision} and does not run again; a new rule for it needs a new ID"
+                    ))
                     .getOrElse("register a backfill for it or fill the rows before the migration")
-                  fill.toVector ++ Vector(PlanStep.NoNulls(columnId, s"${table.display}.${column.value}",
-                    backend.nullCount(table, column), hint), statement)
+                  fill.toVector ++ Vector(
+                    PlanStep.NoNulls(
+                      columnId,
+                      s"${table.display}.${column.value}",
+                      backend.nullCount(table, column),
+                      hint
+                    ),
+                    statement
+                  )
                 case _ => Vector(statement)
             }
             val createdBackfills = pending.filter(backfill => created.contains(backfill.target))
             val recorded = (fills.values.map(_.backfill) ++ createdBackfills).map(_.id).toSet
-            base.copy(steps = steps, complete = fillProblems.isEmpty, problems = planned ++ fillProblems,
-              created = createdBackfills, pending = pending.map(_.id).filterNot(recorded.contains))
+            base.copy(
+              steps = steps,
+              complete = fillProblems.isEmpty,
+              problems = planned ++ fillProblems,
+              created = createdBackfills,
+              pending = pending.map(_.id).filterNot(recorded.contains)
+            )
 
   private def subject(approval: Approval): String = approval match
-    case Approval.Drop(id) => id.value
-    case Approval.RenameBack(id) => id.value
-    case Approval.Revert(revision) => revision.toString
+    case Approval.Drop(id)                 => id.value
+    case Approval.RenameBack(id)           => id.value
+    case Approval.Revert(revision)         => revision.toString
     case Approval.DropUniqueKey(signature) => signature
 
   /** Resolves the one pending backfill for each column that becomes required in an existing
@@ -222,18 +288,24 @@ object MigrationPlanner:
     * dropped only after the fill.
     */
   private def planFills(
-      backend: PlanningBackend,
-      previous: SchemaModel,
-      target: SchemaModel,
-      operations: Vector[SchemaOperation],
-      pending: Vector[Backfill]
+    backend: PlanningBackend,
+    previous: SchemaModel,
+    target: SchemaModel,
+    operations: Vector[SchemaOperation],
+    pending: Vector[Backfill]
   ): (Map[SchemaId, PlanStep.Fill], Vector[PlanProblem]) =
-    val required = operations.collect { case operation: SchemaOperation.SetNotNull => operation.columnId -> operation }.toMap
+    val required = operations.collect { case operation: SchemaOperation.SetNotNull =>
+      operation.columnId -> operation
+    }.toMap
     val applicable = pending.filter(backfill => required.contains(backfill.target))
     val conflicts = applicable.groupBy(_.target).toVector.sortBy(_._1.value).collect {
       case (column, rules) if rules.size > 1 =>
-        PlanProblem(PlanProblem.BackfillConflict, s"Backfills ${rules.map(rule => s"'${rule.id}'").sorted.mkString(", ")} " +
-          s"all fill column '${column.value}'; only one may apply", Some(column.value))
+        PlanProblem(
+          PlanProblem.BackfillConflict,
+          s"Backfills ${rules.map(rule => s"'${rule.id}'").sorted.mkString(", ")} " +
+            s"all fill column '${column.value}'; only one may apply",
+          Some(column.value)
+        )
     }
     if conflicts.nonEmpty then (Map.empty, conflicts)
     else
@@ -254,12 +326,20 @@ object MigrationPlanner:
   /** Every recorded backfill must belong to a revision of the schema history. */
   private def verifyRecords(history: Vector[AppliedRevision], records: Vector[BackfillRecord]): Vector[PlanProblem] =
     records.flatMap { record =>
-      def corrupt(reason: String) = Some(PlanProblem(PlanProblem.BackfillHistoryInconsistent,
-        s"Backfill history is inconsistent at backfill '${record.id}': $reason; refusing to migrate", Some(record.id)))
-      val applied = if record.revision < 1 || record.revision > history.size then None else Some(history(record.revision.toInt - 1))
-      if record.format != BackfillChecksum.Format then corrupt(s"its definition format ${record.format} is unknown to this version")
-      else if !applied.exists(a => a.entry.previousFingerprint == record.previousFingerprint &&
-          a.entry.targetFingerprint == record.targetFingerprint) then
+      def corrupt(reason: String) = Some(PlanProblem(
+        PlanProblem.BackfillHistoryInconsistent,
+        s"Backfill history is inconsistent at backfill '${record.id}': $reason; refusing to migrate",
+        Some(record.id)
+      ))
+      val applied =
+        if record.revision < 1 || record.revision > history.size then None else Some(history(record.revision.toInt - 1))
+      if record.format != BackfillChecksum.Format then
+        corrupt(s"its definition format ${record.format} is unknown to this version")
+      else if !applied.exists(a =>
+          a.entry.previousFingerprint == record.previousFingerprint &&
+            a.entry.targetFingerprint == record.targetFingerprint
+        )
+      then
         corrupt(s"revision ${record.revision} with its fingerprints is not in the schema history")
       else if record.updatedRows.nonEmpty != (record.result == BackfillResult.Executed) then
         corrupt("only an executed backfill has a count of updated rows")
@@ -270,8 +350,12 @@ object MigrationPlanner:
   private def changedBackfills(records: Vector[BackfillRecord], backfills: Vector[Backfill]): Vector[PlanProblem] =
     backfills.flatMap { backfill =>
       records.find(_.id == backfill.id).filter(_.checksum != BackfillChecksum.of(backfill)).map { record =>
-        PlanProblem(PlanProblem.BackfillChanged, s"Backfill '${backfill.id}' was recorded in revision ${record.revision} " +
-          "with another definition; a changed rule needs a new ID", Some(backfill.id))
+        PlanProblem(
+          PlanProblem.BackfillChanged,
+          s"Backfill '${backfill.id}' was recorded in revision ${record.revision} " +
+            "with another definition; a changed rule needs a new ID",
+          Some(backfill.id)
+        )
       }
     }
 
@@ -285,8 +369,12 @@ object MigrationPlanner:
     val latest = history.lastOption.fold(Set.empty[SchemaId])(applied => ids(applied.model))
     (ids(target) -- latest).toVector.sortBy(_.value).flatMap { id =>
       history.findLast(applied => ids(applied.model).contains(id)).map { applied =>
-        PlanProblem(PlanProblem.RetiredId, s"Stable ID '${id.value}' was dropped after revision ${applied.entry.revision} " +
-          "and is retired; a retired ID must never be reused, generate a new one", Some(id.value))
+        PlanProblem(
+          PlanProblem.RetiredId,
+          s"Stable ID '${id.value}' was dropped after revision ${applied.entry.revision} " +
+            "and is retired; a retired ID must never be reused, generate a new one",
+          Some(id.value)
+        )
       }
     }
 
@@ -308,12 +396,14 @@ object MigrationPlanner:
       plan.previous.tables.find(_.id == tableId).map { table =>
         (table.name, columns.flatMap(id => table.columns.find(_.id == id).map(_.name)))
       }
-    plan.steps.zipWithIndex.collect { case (PlanStep.Statement(operation, _, _, _), index)
-        if SchemaOperation.boundAtExecution(operation) => (index, operation) }.flatMap { (index, operation) =>
+    plan.steps.zipWithIndex.collect {
+      case (PlanStep.Statement(operation, _, _, _), index)
+          if SchemaOperation.boundAtExecution(operation) => (index, operation)
+    }.flatMap { (index, operation) =>
       val names = operation match
-        case SchemaOperation.DropIndex(ref, _, _) => current(ref.table, ref.columns.map(_.column))
+        case SchemaOperation.DropIndex(ref, _, _)     => current(ref.table, ref.columns.map(_.column))
         case SchemaOperation.DropUniqueKey(ref, _, _) => current(ref.table, ref.columns)
-        case _ => None
+        case _                                        => None
       names.map((table, columns) => (index, operation, table, columns))
     }
 
@@ -326,4 +416,6 @@ object MigrationPlanner:
   /** Required columns of the target that were missing or nullable before. */
   def newlyRequired(previous: SchemaModel, target: SchemaModel): Set[SchemaId] =
     val before = previous.tables.flatMap(_.columns).map(column => column.id -> column.nullable).toMap
-    target.tables.flatMap(_.columns).filter(column => !column.nullable && before.getOrElse(column.id, true)).map(_.id).toSet
+    target.tables.flatMap(
+      _.columns
+    ).filter(column => !column.nullable && before.getOrElse(column.id, true)).map(_.id).toSet

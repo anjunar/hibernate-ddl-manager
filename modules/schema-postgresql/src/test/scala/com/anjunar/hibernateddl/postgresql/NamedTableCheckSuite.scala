@@ -8,10 +8,13 @@ import java.sql.SQLException
 import javax.sql.DataSource
 
 class NamedTableCheckSuite extends TestPostgres:
-  private val publication = TableCheck(SqlIdentifier("ck_blog_post_publication"),
-    "(status = 'DRAFT' AND published_at IS NULL) OR (status = 'PUBLISHED' AND published_at IS NOT NULL)")
+  private val publication = TableCheck(
+    SqlIdentifier("ck_blog_post_publication"),
+    "(status = 'DRAFT' AND published_at IS NULL) OR (status = 'PUBLISHED' AND published_at IS NOT NULL)"
+  )
   private val status = TableCheck(SqlIdentifier("ck_blog_post_status"), "status IN ('DRAFT', 'PUBLISHED')")
-  private val table = TableModel(SchemaId("post"),
+  private val table = TableModel(
+    SchemaId("post"),
     QualifiedName(SqlIdentifier("blog_post"), Some(SqlIdentifier("public"))),
     Vector(
       ColumnModel(SchemaId("id"), SqlIdentifier("id"), SqlType.Uuid, false),
@@ -21,9 +24,11 @@ class NamedTableCheckSuite extends TestPostgres:
       ColumnModel(SchemaId("content"), SqlIdentifier("content"), SqlType.Text, false),
       ColumnModel(SchemaId("status"), SqlIdentifier("status"), SqlType.Varchar(24), false),
       ColumnModel(SchemaId("published"), SqlIdentifier("published_at"), SqlType.TimestampWithTimeZone(6))
-    ), primaryKey = Vector(SchemaId("id")),
+    ),
+    primaryKey = Vector(SchemaId("id")),
     uniqueKeys = Vector(UniqueKeyModel(Vector(SchemaId("slug")))),
-    checks = Vector(status, publication))
+    checks = Vector(status, publication)
+  )
   private val model = SchemaModel(Vector(table))
   private val executor = JdbcMigrationExecutor(PostgreSqlMigrationBackend)
   private val adopt = JdbcMigrationExecutor(PostgreSqlMigrationBackend, ExecutionOptions(adoptExistingSchema = true))
@@ -62,13 +67,20 @@ class NamedTableCheckSuite extends TestPostgres:
       val result = adopt.migrate(ds, model)
       assertEquals(result, MigrationResult(1, MigrationStatus.Adopted, 0))
       val expanded = table.copy(
-        columns = table.columns.map(c => if c.id == SchemaId("title") then c.copy(dataType = SqlType.Varchar(240)) else c) :+
-          ColumnModel(SchemaId("summary"), SqlIdentifier("summary"), SqlType.Varchar(300)))
+        columns =
+          table.columns.map(c => if c.id == SchemaId("title") then c.copy(dataType = SqlType.Varchar(240)) else c) :+
+            ColumnModel(SchemaId("summary"), SqlIdentifier("summary"), SqlType.Varchar(300))
+      )
       assertEquals(executor.migrate(ds, SchemaModel(Vector(expanded))).status, MigrationStatus.Applied)
-      assertEquals(scalar(ds, "SELECT title || ':' || content FROM public.blog_post WHERE summary IS NULL"),
-        "Keep this title:Keep this body")
+      assertEquals(
+        scalar(ds, "SELECT title || ':' || content FROM public.blog_post WHERE summary IS NULL"),
+        "Keep this title:Keep this body"
+      )
       assertEquals(scalar(ds, definitions), before)
-      assertEquals(intercept[SQLException](execute(ds, "UPDATE public.blog_post SET status = 'PUBLISHED'")).getSQLState, "23514")
+      assertEquals(
+        intercept[SQLException](execute(ds, "UPDATE public.blog_post SET status = 'PUBLISHED'")).getSQLState,
+        "23514"
+      )
     }
   }
 
@@ -89,7 +101,11 @@ class NamedTableCheckSuite extends TestPostgres:
       execute(ds, legacy)
       execute(ds, "ALTER TABLE public.blog_post DROP CONSTRAINT ck_blog_post_publication")
       assert(intercept[MigrationException](adopt.migrate(ds, model)).getMessage.contains("missing"))
-      execute(ds, "ALTER TABLE public.blog_post ADD CONSTRAINT ck_blog_post_publication CHECK (" + publication.expression + ") NOT VALID")
+      execute(
+        ds,
+        "ALTER TABLE public.blog_post ADD CONSTRAINT ck_blog_post_publication CHECK (" + publication.expression +
+          ") NOT VALID"
+      )
       assert(intercept[MigrationException](adopt.migrate(ds, model)).getMessage.contains("NOT VALID"))
     }
   }
@@ -113,7 +129,10 @@ class NamedTableCheckSuite extends TestPostgres:
       execute(ds, draft)
       val changed = model.copy(tables = Vector(table.copy(checks = Vector(status))))
       assert(intercept[MigrationException](executor.migrate(ds, changed)).getMessage.contains("manual migration"))
-      assertEquals(intercept[SQLException](execute(ds, "UPDATE public.blog_post SET status = 'PUBLISHED'")).getSQLState, "23514")
+      assertEquals(
+        intercept[SQLException](execute(ds, "UPDATE public.blog_post SET status = 'PUBLISHED'")).getSQLState,
+        "23514"
+      )
       assertEquals(scalar(ds, "SELECT count(*) FROM __hibernate_ddl.schema_history"), "1")
     }
   }
@@ -129,12 +148,19 @@ class NamedTableCheckSuite extends TestPostgres:
       execute(ds, s"""ALTER TABLE public.blog_post RENAME CONSTRAINT ck_blog_post_status TO "$enumName" """)
       val before = scalar(ds, definitions)
       assertEquals(adopt.migrate(ds, discovered), MigrationResult(1, MigrationStatus.Adopted, 0))
-      val next = post.copy(columns = post.columns :+
-        ColumnModel(SchemaId("d4f39c20/0ca6e520"), SqlIdentifier("summary"), SqlType.Varchar(300)))
+      val next = post.copy(columns =
+        post.columns :+
+          ColumnModel(SchemaId("d4f39c20/0ca6e520"), SqlIdentifier("summary"), SqlType.Varchar(300))
+      )
       assertEquals(executor.migrate(ds, SchemaModel(Vector(next))).status, MigrationStatus.Applied)
-      assertEquals(scalar(ds, "SELECT title || ':' || content FROM public.blog_post WHERE summary IS NULL"),
-        "Keep this title:Keep this body")
+      assertEquals(
+        scalar(ds, "SELECT title || ':' || content FROM public.blog_post WHERE summary IS NULL"),
+        "Keep this title:Keep this body"
+      )
       assertEquals(scalar(ds, definitions), before)
-      assertEquals(intercept[SQLException](execute(ds, "UPDATE public.blog_post SET status = 'PUBLISHED'")).getSQLState, "23514")
+      assertEquals(
+        intercept[SQLException](execute(ds, "UPDATE public.blog_post SET status = 'PUBLISHED'")).getSQLState,
+        "23514"
+      )
     }
   }

@@ -2,8 +2,9 @@ package com.anjunar.hibernateddl.postgresql
 
 import com.anjunar.hibernateddl.core.*
 import com.anjunar.hibernateddl.core.SchemaOperation.*
+import munit.FunSuite
 
-class PostgreSqlDialectSuite extends munit.FunSuite:
+class PostgreSqlDialectSuite extends FunSuite:
   private val tableId = SchemaId("table:orders")
   private val columnId = SchemaId("column:status")
 
@@ -39,28 +40,36 @@ class PostgreSqlDialectSuite extends munit.FunSuite:
 
   test("nullability changes render per column; NULLs are counted") {
     val orders = name("order", Some("sales"))
-    assertEquals(PostgreSqlDialect.render(Vector(
-      SetNotNull(tableId, orders, columnId, SqlIdentifier("state\"code")),
-      DropNotNull(tableId, orders, columnId, SqlIdentifier("note"))
-    )), Right(Vector(
-      "ALTER TABLE \"sales\".\"order\" ALTER COLUMN \"state\"\"code\" SET NOT NULL;",
-      "ALTER TABLE \"sales\".\"order\" ALTER COLUMN \"note\" DROP NOT NULL;"
-    )))
-    assertEquals(PostgreSqlDialect.nullCount(orders, SqlIdentifier("note")),
-      "SELECT count(*) FROM \"sales\".\"order\" WHERE \"note\" IS NULL")
+    assertEquals(
+      PostgreSqlDialect.render(Vector(
+        SetNotNull(tableId, orders, columnId, SqlIdentifier("state\"code")),
+        DropNotNull(tableId, orders, columnId, SqlIdentifier("note"))
+      )),
+      Right(Vector(
+        "ALTER TABLE \"sales\".\"order\" ALTER COLUMN \"state\"\"code\" SET NOT NULL;",
+        "ALTER TABLE \"sales\".\"order\" ALTER COLUMN \"note\" DROP NOT NULL;"
+      ))
+    )
+    assertEquals(
+      PostgreSqlDialect.nullCount(orders, SqlIdentifier("note")),
+      "SELECT count(*) FROM \"sales\".\"order\" WHERE \"note\" IS NULL"
+    )
   }
 
   test("drops render without CASCADE; all tables go in one statement") {
     val orders = name("order", Some("sales"))
-    assertEquals(PostgreSqlDialect.render(Vector(
-      DropColumn(tableId, orders, columnId, SqlIdentifier("status")),
-      DropTables(Vector(DroppedTable(tableId, orders), DroppedTable(SchemaId("t2"), name("line", Some("sales"))))),
-      DropSequence(SchemaId("s"), name("order_seq", Some("sales")))
-    )), Right(Vector(
-      "ALTER TABLE \"sales\".\"order\" DROP COLUMN \"status\";",
-      "DROP TABLE \"sales\".\"order\", \"sales\".\"line\";",
-      "DROP SEQUENCE \"sales\".\"order_seq\";"
-    )))
+    assertEquals(
+      PostgreSqlDialect.render(Vector(
+        DropColumn(tableId, orders, columnId, SqlIdentifier("status")),
+        DropTables(Vector(DroppedTable(tableId, orders), DroppedTable(SchemaId("t2"), name("line", Some("sales"))))),
+        DropSequence(SchemaId("s"), name("order_seq", Some("sales")))
+      )),
+      Right(Vector(
+        "ALTER TABLE \"sales\".\"order\" DROP COLUMN \"status\";",
+        "DROP TABLE \"sales\".\"order\", \"sales\".\"line\";",
+        "DROP SEQUENCE \"sales\".\"order_seq\";"
+      ))
+    )
     assert(PostgreSqlDialect.render(Vector(DropTables(Vector.empty))).isLeft)
   }
 
@@ -154,27 +163,49 @@ class PostgreSqlDialectSuite extends munit.FunSuite:
   }
 
   test("foreign keys render as separate ALTER TABLE statements and new tables must not carry them") {
-    val key = AddForeignKey(tableId, name("invoice", Some("sales")), Vector(SqlIdentifier("customer_id")),
-      name("customer", Some("crm")), Vector(SqlIdentifier("id")))
+    val key = AddForeignKey(
+      tableId,
+      name("invoice", Some("sales")),
+      Vector(SqlIdentifier("customer_id")),
+      name("customer", Some("crm")),
+      Vector(SqlIdentifier("id"))
+    )
     assertEquals(
       PostgreSqlDialect.render(Vector(key)),
-      Right(Vector("ALTER TABLE \"sales\".\"invoice\" ADD FOREIGN KEY (\"customer_id\") REFERENCES \"crm\".\"customer\" (\"id\");"))
+      Right(Vector(
+        "ALTER TABLE \"sales\".\"invoice\" ADD FOREIGN KEY (\"customer_id\") REFERENCES \"crm\".\"customer\" (\"id\");"
+      ))
     )
     assert(PostgreSqlDialect.render(Vector(key.copy(referencedColumns = Vector.empty))).swap.toOption.get
       .exists(_.contains("as many referenced columns")))
     val id = ColumnModel(SchemaId("id"), SqlIdentifier("id"), SqlType.BigInt, nullable = false)
-    val table = TableModel(tableId, name("invoice"), Vector(id), Vector(id.id),
-      Vector(ForeignKeyModel(Vector(id.id), tableId, Vector(id.id))))
-    assert(PostgreSqlDialect.render(Vector(CreateTable(table))).swap.toOption.get.exists(_.contains("separate operations")))
+    val table = TableModel(
+      tableId,
+      name("invoice"),
+      Vector(id),
+      Vector(id.id),
+      Vector(ForeignKeyModel(Vector(id.id), tableId, Vector(id.id)))
+    )
+    assert(
+      PostgreSqlDialect.render(Vector(CreateTable(table))).swap.toOption.get.exists(_.contains("separate operations"))
+    )
   }
 
   test("unique keys render inside CREATE TABLE and as ADD UNIQUE") {
     val id = ColumnModel(SchemaId("id"), SqlIdentifier("id"), SqlType.BigInt, nullable = false)
     val code = ColumnModel(SchemaId("code"), SqlIdentifier("code"), SqlType.Text)
-    val table = TableModel(tableId, name("orders", Some("public")), Vector(id, code), Vector(id.id),
-      uniqueKeys = Vector(UniqueKeyModel(Vector(code.id)), UniqueKeyModel(Vector(code.id, id.id))))
+    val table = TableModel(
+      tableId,
+      name("orders", Some("public")),
+      Vector(id, code),
+      Vector(id.id),
+      uniqueKeys = Vector(UniqueKeyModel(Vector(code.id)), UniqueKeyModel(Vector(code.id, id.id)))
+    )
     assertEquals(
-      PostgreSqlDialect.render(Vector(CreateTable(table), AddUniqueKey(tableId, name("orders", Some("public")), Vector(SqlIdentifier("id"))))),
+      PostgreSqlDialect.render(Vector(
+        CreateTable(table),
+        AddUniqueKey(tableId, name("orders", Some("public")), Vector(SqlIdentifier("id")))
+      )),
       Right(Vector(
         "CREATE TABLE \"public\".\"orders\" (\"id\" bigint NOT NULL, \"code\" text, PRIMARY KEY (\"id\"), " +
           "UNIQUE (\"code\"), UNIQUE (\"code\", \"id\"));",
@@ -182,33 +213,65 @@ class PostgreSqlDialectSuite extends munit.FunSuite:
       ))
     )
     assert(PostgreSqlDialect.render(Vector(AddUniqueKey(tableId, name("orders"), Vector.empty))).isLeft)
-    assert(PostgreSqlDialect.render(Vector(CreateTable(table.copy(uniqueKeys = Vector(UniqueKeyModel(Vector(SchemaId("x")))))))).isLeft)
+    assert(PostgreSqlDialect.render(Vector(CreateTable(table.copy(uniqueKeys =
+      Vector(UniqueKeyModel(Vector(SchemaId("x"))))
+    )))).isLeft)
   }
 
   test("indexes render as unnamed CREATE INDEX with directions and new tables must not carry them") {
-    val index = CreateIndex(tableId, name("orders", Some("public")), Vector(
-      IndexedColumn(SqlIdentifier("placed_at"), descending = true), IndexedColumn(SqlIdentifier("id"), descending = false)))
+    val index = CreateIndex(
+      tableId,
+      name("orders", Some("public")),
+      Vector(
+        IndexedColumn(SqlIdentifier("placed_at"), descending = true),
+        IndexedColumn(SqlIdentifier("id"), descending = false)
+      )
+    )
     assertEquals(
       PostgreSqlDialect.render(Vector(index)),
       Right(Vector("CREATE INDEX ON \"public\".\"orders\" (\"placed_at\" DESC, \"id\");"))
     )
     assert(PostgreSqlDialect.render(Vector(index.copy(columns = Vector.empty))).isLeft)
     val id = ColumnModel(SchemaId("id"), SqlIdentifier("id"), SqlType.BigInt, nullable = false)
-    val table = TableModel(tableId, name("orders"), Vector(id), Vector(id.id), indexes = Vector(IndexModel(Vector(IndexColumn(id.id)))))
-    assert(PostgreSqlDialect.render(Vector(CreateTable(table))).swap.toOption.get.exists(_.contains("indexes must be separate")))
+    val table = TableModel(
+      tableId,
+      name("orders"),
+      Vector(id),
+      Vector(id.id),
+      indexes = Vector(IndexModel(Vector(IndexColumn(id.id))))
+    )
+    assert(PostgreSqlDialect.render(
+      Vector(CreateTable(table))
+    ).swap.toOption.get.exists(_.contains("indexes must be separate")))
   }
 
   test("further types render as PostgreSQL types and out-of-range sizes are rejected") {
-    val types = Vector(SqlType.Char(1) -> "char(1)", SqlType.Numeric(10, 2) -> "numeric(10,2)", SqlType.Time(0) -> "time(0)",
-      SqlType.SmallInt -> "smallint", SqlType.Real -> "real", SqlType.DoublePrecision -> "double precision",
-      SqlType.Date -> "date", SqlType.Binary -> "bytea", SqlType.LargeObject -> "oid",
-      SqlType.Json -> "jsonb")
+    val types = Vector(
+      SqlType.Char(1) -> "char(1)",
+      SqlType.Numeric(10, 2) -> "numeric(10,2)",
+      SqlType.Time(0) -> "time(0)",
+      SqlType.SmallInt -> "smallint",
+      SqlType.Real -> "real",
+      SqlType.DoublePrecision -> "double precision",
+      SqlType.Date -> "date",
+      SqlType.Binary -> "bytea",
+      SqlType.LargeObject -> "oid",
+      SqlType.Json -> "jsonb"
+    )
     types.foreach { (dataType, sql) =>
       val column = ColumnModel(SchemaId("x"), SqlIdentifier("x"), dataType)
-      assertEquals(PostgreSqlDialect.render(Vector(AddColumn(tableId, name("t"), column))),
-        Right(Vector(s"ALTER TABLE \"t\" ADD COLUMN \"x\" $sql;")))
+      assertEquals(
+        PostgreSqlDialect.render(Vector(AddColumn(tableId, name("t"), column))),
+        Right(Vector(s"ALTER TABLE \"t\" ADD COLUMN \"x\" $sql;"))
+      )
     }
-    Vector(SqlType.Numeric(1001, 0), SqlType.Numeric(5, 6), SqlType.Time(7), SqlType.Char(10485761), SqlType.Varchar(10485761))
+    Vector(
+      SqlType.Numeric(1001, 0),
+      SqlType.Numeric(5, 6),
+      SqlType.Time(7),
+      SqlType.Char(10485761),
+      SqlType.Varchar(10485761)
+    )
       .foreach { invalid =>
         val column = ColumnModel(SchemaId("x"), SqlIdentifier("x"), invalid)
         assert(PostgreSqlDialect.render(Vector(AddColumn(tableId, name("t"), column))).isLeft, invalid)
@@ -220,31 +283,48 @@ class PostgreSqlDialectSuite extends munit.FunSuite:
     val status = ColumnModel(SchemaId("status"), SqlIdentifier("status"), SqlType.Varchar(10), check = Some(values))
     val valuesName = PostgreSqlDialect.checkName(status.id, values).value
     assert(valuesName.matches("ck_[0-9a-f]{24}"), valuesName)
-    assertEquals(PostgreSqlDialect.render(Vector(AddColumn(tableId, name("t"), status))), Right(Vector(
-      s"ALTER TABLE \"t\" ADD COLUMN \"status\" varchar(10) CONSTRAINT \"$valuesName\" CHECK (\"status\" IN ('NEW', 'it''s'));")))
+    assertEquals(
+      PostgreSqlDialect.render(Vector(AddColumn(tableId, name("t"), status))),
+      Right(Vector(
+        s"ALTER TABLE \"t\" ADD COLUMN \"status\" varchar(10) CONSTRAINT \"$valuesName\" CHECK (\"status\" IN ('NEW', 'it''s'));"
+      ))
+    )
     val range = ColumnCheck.Range(0, 2)
     val change = ChangeCheck(tableId, name("t"), status.id, SqlIdentifier("state"), Some(values), Some(range))
     val rangeName = PostgreSqlDialect.checkName(status.id, range).value
-    assertEquals(PostgreSqlDialect.render(Vector(change)), Right(Vector(
-      s"ALTER TABLE \"t\" DROP CONSTRAINT \"$valuesName\", ADD CONSTRAINT \"$rangeName\" CHECK (\"state\" BETWEEN 0 AND 2);")))
+    assertEquals(
+      PostgreSqlDialect.render(Vector(change)),
+      Right(Vector(
+        s"ALTER TABLE \"t\" DROP CONSTRAINT \"$valuesName\", ADD CONSTRAINT \"$rangeName\" CHECK (\"state\" BETWEEN 0 AND 2);"
+      ))
+    )
     assertNotEquals(rangeName, valuesName)
     assertNotEquals(PostgreSqlDialect.checkName(SchemaId("other"), values).value, valuesName)
-    assert(PostgreSqlDialect.render(Vector(change.copy(to = Some(ColumnCheck.AllowedValues(Vector("a\u0000b")))))).isLeft)
+    assert(PostgreSqlDialect.render(Vector(change.copy(to =
+      Some(ColumnCheck.AllowedValues(Vector("a\u0000b")))
+    ))).isLeft)
   }
 
   test("sequences and identity columns render as PostgreSQL DDL") {
     val sequence = SequenceModel(SchemaId("s"), name("customer_SEQ", Some("public")), 1, 50)
     val key = ColumnModel(SchemaId("id"), SqlIdentifier("id"), SqlType.BigInt, nullable = false, identity = true)
-    assertEquals(PostgreSqlDialect.render(Vector(
-      CreateSequence(sequence),
-      RenameSequence(sequence.id, sequence.name, name("client_SEQ", Some("public"))),
-      CreateTable(TableModel(tableId, name("client", Some("public")), Vector(key), Vector(key.id)))
-    )), Right(Vector(
-      "CREATE SEQUENCE \"public\".\"customer_SEQ\" AS bigint START WITH 1 INCREMENT BY 50;",
-      "ALTER SEQUENCE \"public\".\"customer_SEQ\" RENAME TO \"client_SEQ\";",
-      "CREATE TABLE \"public\".\"client\" (\"id\" bigint NOT NULL GENERATED BY DEFAULT AS IDENTITY, PRIMARY KEY (\"id\"));"
-    )))
-    assert(PostgreSqlDialect.render(Vector(RenameSequence(sequence.id, sequence.name, name("x", Some("other"))))).isLeft)
+    assertEquals(
+      PostgreSqlDialect.render(Vector(
+        CreateSequence(sequence),
+        RenameSequence(sequence.id, sequence.name, name("client_SEQ", Some("public"))),
+        CreateTable(TableModel(tableId, name("client", Some("public")), Vector(key), Vector(key.id)))
+      )),
+      Right(Vector(
+        "CREATE SEQUENCE \"public\".\"customer_SEQ\" AS bigint START WITH 1 INCREMENT BY 50;",
+        "ALTER SEQUENCE \"public\".\"customer_SEQ\" RENAME TO \"client_SEQ\";",
+        "CREATE TABLE \"public\".\"client\" (\"id\" bigint NOT NULL GENERATED BY DEFAULT AS IDENTITY, PRIMARY KEY (\"id\"));"
+      ))
+    )
+    assert(PostgreSqlDialect.render(Vector(RenameSequence(
+      sequence.id,
+      sequence.name,
+      name("x", Some("other"))
+    ))).isLeft)
   }
 
   test("an empty plan renders to an empty statement vector") {
@@ -255,15 +335,18 @@ class PostgreSqlDialectSuite extends munit.FunSuite:
     ChangeColumnType(tableId, name("users", Some("public")), columnId, SqlIdentifier(column), from, to)
 
   test("the three widenings render as a quoted ALTER COLUMN TYPE from the model's type, without USING") {
-    assertEquals(PostgreSqlDialect.render(Vector(
-      retype(SqlType.Varchar(100), SqlType.Varchar(255)),
-      retype(SqlType.Integer, SqlType.BigInt, "visit\"count"),
-      retype(SqlType.Numeric(10, 2), SqlType.Numeric(14, 2), "Balance")
-    )), Right(Vector(
-      "ALTER TABLE \"public\".\"users\" ALTER COLUMN \"display_name\" TYPE varchar(255);",
-      "ALTER TABLE \"public\".\"users\" ALTER COLUMN \"visit\"\"count\" TYPE bigint;",
-      "ALTER TABLE \"public\".\"users\" ALTER COLUMN \"Balance\" TYPE numeric(14,2);"
-    )))
+    assertEquals(
+      PostgreSqlDialect.render(Vector(
+        retype(SqlType.Varchar(100), SqlType.Varchar(255)),
+        retype(SqlType.Integer, SqlType.BigInt, "visit\"count"),
+        retype(SqlType.Numeric(10, 2), SqlType.Numeric(14, 2), "Balance")
+      )),
+      Right(Vector(
+        "ALTER TABLE \"public\".\"users\" ALTER COLUMN \"display_name\" TYPE varchar(255);",
+        "ALTER TABLE \"public\".\"users\" ALTER COLUMN \"visit\"\"count\" TYPE bigint;",
+        "ALTER TABLE \"public\".\"users\" ALTER COLUMN \"Balance\" TYPE numeric(14,2);"
+      ))
+    )
   }
 
   test("a type change built by hand cannot make the renderer emit anything but a supported widening") {
@@ -286,22 +369,34 @@ class PostgreSqlDialectSuite extends munit.FunSuite:
 
   test("dropped indexes and unique keys render as templates that name no object and cannot run") {
     val table = name("my \"users\"", Some("app"))
-    val dropIndex = DropIndex(IndexRef(tableId, Vector(IndexColumn(columnId), IndexColumn(SchemaId("c2"), descending = true))),
-      table, Vector(IndexedColumn(SqlIdentifier("last"), false), IndexedColumn(SqlIdentifier("fi\"rst"), true)))
+    val dropIndex = DropIndex(
+      IndexRef(tableId, Vector(IndexColumn(columnId), IndexColumn(SchemaId("c2"), descending = true))),
+      table,
+      Vector(IndexedColumn(SqlIdentifier("last"), false), IndexedColumn(SqlIdentifier("fi\"rst"), true))
+    )
     val dropUnique = DropUniqueKey(UniqueKeyRef(tableId, Vector(columnId)), table, Vector(SqlIdentifier("email")))
-    assertEquals(PostgreSqlDialect.render(Vector(dropIndex, dropUnique)), Right(Vector(
-      "DROP INDEX \"app\".<the index (\"last\", \"fi\"\"rst\" DESC) of \"app\".\"my \"\"users\"\"\", found under the migration lock>;",
-      "ALTER TABLE \"app\".\"my \"\"users\"\"\" DROP CONSTRAINT <the unique key (\"email\"), found under the migration lock>;"
-    )))
+    assertEquals(
+      PostgreSqlDialect.render(Vector(dropIndex, dropUnique)),
+      Right(Vector(
+        "DROP INDEX \"app\".<the index (\"last\", \"fi\"\"rst\" DESC) of \"app\".\"my \"\"users\"\"\", found under the migration lock>;",
+        "ALTER TABLE \"app\".\"my \"\"users\"\"\" DROP CONSTRAINT <the unique key (\"email\"), found under the migration lock>;"
+      ))
+    )
     assert(SchemaOperation.boundAtExecution(dropIndex) && SchemaOperation.boundAtExecution(dropUnique))
     assert(!SchemaOperation.boundAtExecution(rename("a", "b")))
     assert(PostgreSqlDialect.render(Vector(dropUnique.copy(columns = Vector.empty))).isLeft)
-    assert(PostgreSqlDialect.render(Vector(dropIndex.copy(columns = dropIndex.columns.map(_.copy(descending = false))))).isLeft)
+    assert(PostgreSqlDialect.render(Vector(dropIndex.copy(columns =
+      dropIndex.columns.map(_.copy(descending = false))
+    ))).isLeft)
   }
 
   test("bound drops use the catalog's names, quoted, and no IF EXISTS") {
-    assertEquals(PostgreSqlDialect.renderDropIndex(SqlIdentifier("app"), SqlIdentifier("my \"users\"_last_idx")),
-      "DROP INDEX \"app\".\"my \"\"users\"\"_last_idx\";")
-    assertEquals(PostgreSqlDialect.renderDropConstraint(name("people", Some("app")), SqlIdentifier("users_email_key")),
-      "ALTER TABLE \"app\".\"people\" DROP CONSTRAINT \"users_email_key\";")
+    assertEquals(
+      PostgreSqlDialect.renderDropIndex(SqlIdentifier("app"), SqlIdentifier("my \"users\"_last_idx")),
+      "DROP INDEX \"app\".\"my \"\"users\"\"_last_idx\";"
+    )
+    assertEquals(
+      PostgreSqlDialect.renderDropConstraint(name("people", Some("app")), SqlIdentifier("users_email_key")),
+      "ALTER TABLE \"app\".\"people\" DROP CONSTRAINT \"users_email_key\";"
+    )
   }

@@ -5,11 +5,13 @@ import com.anjunar.hibernateddl.hibernate.annotation.SchemaId as Id
 import jakarta.persistence.*
 
 import scala.compiletime.uninitialized
+import jakarta.persistence.{Id as PersistenceId}
+import java.lang.{Long as JavaLong}
 
 /** The same member once the nickname is required. */
 @Entity
 @Table(name = "member")
 @Id("c1d2e3f4")
 class RequiredMember:
-  @jakarta.persistence.Id @Id("0a1b2c3d") var id: java.lang.Long = uninitialized
+  @PersistenceId @Id("0a1b2c3d") var id: JavaLong = uninitialized
   @Id("1b2c3d4e") @Column(nullable = false) var nick: String = uninitialized

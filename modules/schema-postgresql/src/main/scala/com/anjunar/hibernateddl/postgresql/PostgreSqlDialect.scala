@@ -6,6 +6,9 @@ import com.anjunar.hibernateddl.executor.{DataQuery, Projection}
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
+import java.lang.{Boolean as JavaBoolean}
+import java.lang.{Double as JavaDouble}
+import java.lang.{Long as JavaLong}
 
 /** Pure PostgreSQL DDL rendering.
   *
@@ -20,7 +23,7 @@ object PostgreSqlDialect extends SchemaDialect:
   private val MaxCharacterLength = 10485760
 
   override def render(
-      operations: Vector[SchemaOperation]
+    operations: Vector[SchemaOperation]
   ): Either[Vector[String], Vector[String]] =
     val diagnostics = operations.zipWithIndex.flatMap { (operation, index) =>
       validate(operation).map(message => s"Operation ${index + 1}: $message")
@@ -30,7 +33,7 @@ object PostgreSqlDialect extends SchemaDialect:
 
   private def validate(operation: SchemaOperation): Vector[String] =
     operation match
-      case SchemaOperation.CreateSequence(sequence) => validateName(sequence.name, "new sequence")
+      case SchemaOperation.CreateSequence(sequence)    => validateName(sequence.name, "new sequence")
       case SchemaOperation.RenameSequence(_, from, to) =>
         validateName(from, "source sequence") ++
           validateName(to, "target sequence") ++
@@ -58,11 +61,14 @@ object PostgreSqlDialect extends SchemaDialect:
         validateName(table, "table") ++
           columns.flatMap(column => validateIdentifier(column.name, "index column")) ++
           Option.when(columns.isEmpty || columns.map(_.descending) != ref.columns.map(_.descending))(
-            "A dropped index needs its columns with their directions.").toVector
+            "A dropped index needs its columns with their directions."
+          ).toVector
       case SchemaOperation.DropUniqueKey(ref, table, columns) =>
         validateName(table, "table") ++
           columns.flatMap(validateIdentifier(_, "unique key column")) ++
-          Option.when(columns.isEmpty || columns.size != ref.columns.size)("A dropped unique key needs its columns.").toVector
+          Option.when(
+            columns.isEmpty || columns.size != ref.columns.size
+          )("A dropped unique key needs its columns.").toVector
       case SchemaOperation.AddForeignKey(_, table, columns, referencedTable, referencedColumns, _) =>
         validateName(table, "table") ++
           validateName(referencedTable, "referenced table") ++
@@ -74,7 +80,9 @@ object PostgreSqlDialect extends SchemaDialect:
       case SchemaOperation.AddColumn(_, table, column) =>
         validateName(table, "table") ++
           validateColumn(column, "new column") ++
-          Option.when(!column.nullable)("Adding a non-null column to an existing table requires a data migration.").toVector
+          Option.when(
+            !column.nullable
+          )("Adding a non-null column to an existing table requires a data migration.").toVector
       case SchemaOperation.RenameTable(_, from, to) =>
         validateName(from, "source table") ++
           validateName(to, "target table") ++
@@ -92,11 +100,12 @@ object PostgreSqlDialect extends SchemaDialect:
           validateType(from, "The previous type") ++
           validateType(to, "The new type") ++
           (TypeChangeRules.classify(from, to) match
-            case TypeChange.Widening(_, _) => Vector.empty
-            case TypeChange.Unchanged => Vector(s"Column '${columnId.value}' already has type $to.")
+            case TypeChange.Widening(_, _)         => Vector.empty
+            case TypeChange.Unchanged              => Vector(s"Column '${columnId.value}' already has type $to.")
             case TypeChange.Unsupported(_, reason) =>
-              Vector(s"Changing column '${columnId.value}' from $from to $to is not a supported widening: the change $reason.")
-          )
+              Vector(
+                s"Changing column '${columnId.value}' from $from to $to is not a supported widening: the change $reason."
+              ))
       case SchemaOperation.SetNotNull(_, table, _, column) =>
         validateName(table, "table") ++ validateIdentifier(column, "required column")
       case SchemaOperation.DropNotNull(_, table, _, column) =>
@@ -124,9 +133,13 @@ object PostgreSqlDialect extends SchemaDialect:
       } ++
       Option.when(table.indexes.exists(_.columns.isEmpty))(s"A $label index has no columns.").toVector ++
       table.checks.flatMap(check => validateIdentifier(check.name, s"$label check")) ++
-      table.checks.filter(check => table.columns.exists(column =>
-        column.check.exists(value => checkName(column.id, value) == check.name))).map(check =>
-        s"The $label check '${check.name.value}' collides with a generated column check.") ++
+      table.checks.filter(check =>
+        table.columns.exists(column =>
+          column.check.exists(value => checkName(column.id, value) == check.name)
+        )
+      ).map(check =>
+        s"The $label check '${check.name.value}' collides with a generated column check."
+      ) ++
       SchemaValidation.validate(SchemaModel(Vector(table.copy(foreignKeys = Vector.empty))))
 
   private def validateColumn(column: ColumnModel, label: String): Vector[String] =
@@ -134,19 +147,22 @@ object PostgreSqlDialect extends SchemaDialect:
       validateType(column.dataType, label)
 
   private def validateType(dataType: SqlType, label: String): Vector[String] = dataType match
-      case SqlType.Varchar(length) if length <= 0 || length > MaxCharacterLength =>
-        Vector(s"$label has VARCHAR length $length; PostgreSQL supports 1 to $MaxCharacterLength.")
-      case SqlType.Char(length) if length <= 0 || length > MaxCharacterLength =>
-        Vector(s"$label has CHAR length $length; PostgreSQL supports 1 to $MaxCharacterLength.")
-      case SqlType.Numeric(precision, scale) if precision <= 0 || precision > MaxNumericPrecision || scale < 0 || scale > precision =>
-        Vector(s"$label has NUMERIC($precision, $scale); PostgreSQL supports precision 1 to $MaxNumericPrecision and scale 0 to precision here.")
-      case SqlType.Time(precision) if precision < 0 || precision > MaxTimestampPrecision =>
-        Vector(s"$label has TIME precision $precision; PostgreSQL supports 0 to $MaxTimestampPrecision.")
-      case SqlType.Timestamp(precision) if precision < 0 || precision > MaxTimestampPrecision =>
-        Vector(s"$label has TIMESTAMP precision $precision; PostgreSQL supports 0 to $MaxTimestampPrecision.")
-      case SqlType.TimestampWithTimeZone(precision) if precision < 0 || precision > MaxTimestampPrecision =>
-        Vector(s"$label has TIMESTAMP precision $precision; PostgreSQL supports 0 to $MaxTimestampPrecision.")
-      case _ => Vector.empty
+    case SqlType.Varchar(length) if length <= 0 || length > MaxCharacterLength =>
+      Vector(s"$label has VARCHAR length $length; PostgreSQL supports 1 to $MaxCharacterLength.")
+    case SqlType.Char(length) if length <= 0 || length > MaxCharacterLength =>
+      Vector(s"$label has CHAR length $length; PostgreSQL supports 1 to $MaxCharacterLength.")
+    case SqlType.Numeric(precision, scale)
+        if precision <= 0 || precision > MaxNumericPrecision || scale < 0 || scale > precision =>
+      Vector(
+        s"$label has NUMERIC($precision, $scale); PostgreSQL supports precision 1 to $MaxNumericPrecision and scale 0 to precision here."
+      )
+    case SqlType.Time(precision) if precision < 0 || precision > MaxTimestampPrecision =>
+      Vector(s"$label has TIME precision $precision; PostgreSQL supports 0 to $MaxTimestampPrecision.")
+    case SqlType.Timestamp(precision) if precision < 0 || precision > MaxTimestampPrecision =>
+      Vector(s"$label has TIMESTAMP precision $precision; PostgreSQL supports 0 to $MaxTimestampPrecision.")
+    case SqlType.TimestampWithTimeZone(precision) if precision < 0 || precision > MaxTimestampPrecision =>
+      Vector(s"$label has TIMESTAMP precision $precision; PostgreSQL supports 0 to $MaxTimestampPrecision.")
+    case _ => Vector.empty
 
   private def validateCheck(check: ColumnCheck, label: String): Vector[String] = check match
     case ColumnCheck.AllowedValues(values) =>
@@ -162,8 +178,8 @@ object PostgreSqlDialect extends SchemaDialect:
       }
 
   private def validateIdentifier(
-      identifier: SqlIdentifier,
-      label: String
+    identifier: SqlIdentifier,
+    label: String
   ): Vector[String] =
     val value = identifier.value
     Vector(
@@ -191,7 +207,8 @@ object PostgreSqlDialect extends SchemaDialect:
           val names = key.columns.map(id => quoted(table.columns.find(_.id == id).get.name))
           s"UNIQUE (${names.mkString(", ")})"
         }
-        val definitions = table.columns.map(renderColumn) ++ primaryKey ++ uniqueKeys ++ table.checks.map(renderTableCheck)
+        val definitions = table.columns.map(renderColumn) ++ primaryKey ++ uniqueKeys ++
+          table.checks.map(renderTableCheck)
         s"CREATE TABLE ${qualified(table.name)} (${definitions.mkString(", ")});"
       case SchemaOperation.AddColumn(_, table, column) =>
         s"ALTER TABLE ${qualified(table)} ADD COLUMN ${renderColumn(column)};"
@@ -262,10 +279,11 @@ object PostgreSqlDialect extends SchemaDialect:
       case FillValue.Literal(BackfillLiteral.Text(text), _) =>
         Option.when(text.contains('\u0000'))("A text constant must not contain NUL.").toVector
       case FillValue.Literal(_, _) | FillValue.Null(_) => Vector.empty
-      case FillValue.Column(name) => validateIdentifier(name, "source column")
-      case FillValue.Coalesce(values) => values.flatMap(names)
-      case FillValue.Concat(values) => values.flatMap(names)
-    val errors = validateName(fill.table, "filled table") ++ validateIdentifier(fill.column, "filled column") ++ names(fill.value)
+      case FillValue.Column(name)                      => validateIdentifier(name, "source column")
+      case FillValue.Coalesce(values)                  => values.flatMap(names)
+      case FillValue.Concat(values)                    => values.flatMap(names)
+    val errors = validateName(fill.table, "filled table") ++ validateIdentifier(fill.column, "filled column") ++
+      names(fill.value)
     if errors.nonEmpty then Left(errors.map(message => s"Backfill '${fill.backfillId}': $message"))
     else
       val parameters = Vector.newBuilder[AnyRef]
@@ -277,10 +295,10 @@ object PostgreSqlDialect extends SchemaDialect:
     case FillValue.Literal(literal, as) =>
       parameters += parameter(literal)
       s"CAST(? AS ${renderType(as)})"
-    case FillValue.Column(name) => quoted(name)
-    case FillValue.Null(as) => s"CAST(NULL AS ${renderType(as)})"
+    case FillValue.Column(name)     => quoted(name)
+    case FillValue.Null(as)         => s"CAST(NULL AS ${renderType(as)})"
     case FillValue.Coalesce(values) => values.map(expression(_, parameters)).mkString("COALESCE(", ", ", ")")
-    case FillValue.Concat(values) => values.map(expression(_, parameters)).mkString("(", " || ", ")")
+    case FillValue.Concat(values)   => values.map(expression(_, parameters)).mkString("(", " || ", ")")
 
   /** A read-only query for a preview's data question. It returns one row with one number: 1 or 0
     * for whether a matching row exists, or the number of matching rows. Projections evaluate
@@ -289,8 +307,8 @@ object PostgreSqlDialect extends SchemaDialect:
   private[postgresql] def renderDataCheck(query: DataQuery, count: Boolean): (String, Vector[AnyRef]) =
     val parameters = Vector.newBuilder[AnyRef]
     def projection(value: Projection): String = value match
-      case Projection.Current(column) => quoted(column)
-      case Projection.Absent(dataType) => s"CAST(NULL AS ${renderType(dataType)})"
+      case Projection.Current(column)               => quoted(column)
+      case Projection.Absent(dataType)              => s"CAST(NULL AS ${renderType(dataType)})"
       case Projection.Filled(Some(column), fill, _) =>
         s"CASE WHEN ${quoted(column)} IS NULL THEN ${expression(fill, parameters)} ELSE ${quoted(column)} END"
       case Projection.Filled(None, fill, _) => expression(fill, parameters)
@@ -302,7 +320,7 @@ object PostgreSqlDialect extends SchemaDialect:
       if count then s"SELECT count(*) FROM $from WHERE $condition"
       else s"SELECT CASE WHEN EXISTS (SELECT 1 FROM $from WHERE $condition) THEN 1 ELSE 0 END"
     val sql = query match
-      case DataQuery.Nulls(table, value) => rows(qualified(table), s"(${projection(value)}) IS NULL")
+      case DataQuery.Nulls(table, value)    => rows(qualified(table), s"(${projection(value)}) IS NULL")
       case DataQuery.Duplicates(table, key) =>
         val (from, columns) = projected(table, key)
         val groups = s"SELECT count(*) AS n FROM $from WHERE ${columns.map(_ + " IS NOT NULL").mkString(" AND ")} " +
@@ -314,7 +332,9 @@ object PostgreSqlDialect extends SchemaDialect:
         // MATCH SIMPLE: a key with a NULL part references nothing and is never checked.
         val missing = referenced.fold("") { (target, targetColumns) =>
           s" AND NOT EXISTS (SELECT 1 FROM ${qualified(target)} AS referenced WHERE " +
-            targetColumns.zip(columns).map((column, key) => s"referenced.${quoted(column)} = projected.$key").mkString(" AND ") + ")"
+            targetColumns.zip(
+              columns
+            ).map((column, key) => s"referenced.${quoted(column)} = projected.$key").mkString(" AND ") + ")"
         }
         rows(from, columns.map(_ + " IS NOT NULL").mkString(" AND ") + missing)
       case DataQuery.Violations(table, value, dataType, check) =>
@@ -326,22 +346,22 @@ object PostgreSqlDialect extends SchemaDialect:
             values.foreach(parameters += _)
             s"NOT (${columns.head} IN (${values.map(_ => cast).mkString(", ")}))"
           case ColumnCheck.Range(min, max) =>
-            parameters += java.lang.Long.valueOf(min)
-            parameters += java.lang.Long.valueOf(max)
+            parameters += JavaLong.valueOf(min)
+            parameters += JavaLong.valueOf(max)
             s"NOT (${columns.head} BETWEEN $cast AND $cast)"
         rows(from, condition)
     sql -> parameters.result()
 
   private def parameter(literal: BackfillLiteral): AnyRef = literal match
-    case BackfillLiteral.Text(value) => value
-    case BackfillLiteral.WholeNumber(value) => java.lang.Long.valueOf(value)
-    case BackfillLiteral.Decimal(value) => value
-    case BackfillLiteral.FloatingPoint(value) => java.lang.Double.valueOf(value)
-    case BackfillLiteral.Bool(value) => java.lang.Boolean.valueOf(value)
-    case BackfillLiteral.Uuid(value) => value
-    case BackfillLiteral.Date(value) => value
-    case BackfillLiteral.Time(value) => value
-    case BackfillLiteral.Timestamp(value) => value
+    case BackfillLiteral.Text(value)                  => value
+    case BackfillLiteral.WholeNumber(value)           => JavaLong.valueOf(value)
+    case BackfillLiteral.Decimal(value)               => value
+    case BackfillLiteral.FloatingPoint(value)         => JavaDouble.valueOf(value)
+    case BackfillLiteral.Bool(value)                  => JavaBoolean.valueOf(value)
+    case BackfillLiteral.Uuid(value)                  => value
+    case BackfillLiteral.Date(value)                  => value
+    case BackfillLiteral.Time(value)                  => value
+    case BackfillLiteral.Timestamp(value)             => value
     case BackfillLiteral.TimestampWithTimeZone(value) => value
 
   /** Counts the rows in which a column is NULL. */
@@ -363,7 +383,7 @@ object PostgreSqlDialect extends SchemaDialect:
   private[postgresql] def checkName(columnId: SchemaId, check: ColumnCheck): SqlIdentifier =
     val canonical = check match
       case ColumnCheck.AllowedValues(values) => "values" +: values
-      case ColumnCheck.Range(min, max) => Vector("range", min.toString, max.toString)
+      case ColumnCheck.Range(min, max)       => Vector("range", min.toString, max.toString)
     val digest = MessageDigest.getInstance("SHA-256")
     (columnId.value +: canonical).foreach { part =>
       val bytes = part.getBytes(StandardCharsets.UTF_8)
@@ -380,27 +400,26 @@ object PostgreSqlDialect extends SchemaDialect:
     s"CONSTRAINT ${quoted(checkName(columnId, check))} CHECK ($condition)"
 
   private def renderType(dataType: SqlType): String = dataType match
-    case SqlType.Varchar(length) => s"varchar($length)"
-    case SqlType.Timestamp(precision) => s"timestamp($precision)"
+    case SqlType.Varchar(length)                  => s"varchar($length)"
+    case SqlType.Timestamp(precision)             => s"timestamp($precision)"
     case SqlType.TimestampWithTimeZone(precision) => s"timestamp($precision) with time zone"
-    case SqlType.Integer => "integer"
-    case SqlType.BigInt => "bigint"
-    case SqlType.Boolean => "boolean"
-    case SqlType.Text => "text"
-    case SqlType.Uuid => "uuid"
-    case SqlType.Char(length) => s"char($length)"
-    case SqlType.Numeric(precision, scale) => s"numeric($precision,$scale)"
-    case SqlType.Time(precision) => s"time($precision)"
-    case SqlType.SmallInt => "smallint"
-    case SqlType.Real => "real"
-    case SqlType.DoublePrecision => "double precision"
-    case SqlType.Date => "date"
-    case SqlType.Binary => "bytea"
-    case SqlType.LargeObject => "oid"
-    case SqlType.Json => "jsonb"
+    case SqlType.Integer                          => "integer"
+    case SqlType.BigInt                           => "bigint"
+    case SqlType.Boolean                          => "boolean"
+    case SqlType.Text                             => "text"
+    case SqlType.Uuid                             => "uuid"
+    case SqlType.Char(length)                     => s"char($length)"
+    case SqlType.Numeric(precision, scale)        => s"numeric($precision,$scale)"
+    case SqlType.Time(precision)                  => s"time($precision)"
+    case SqlType.SmallInt                         => "smallint"
+    case SqlType.Real                             => "real"
+    case SqlType.DoublePrecision                  => "double precision"
+    case SqlType.Date                             => "date"
+    case SqlType.Binary                           => "bytea"
+    case SqlType.LargeObject                      => "oid"
+    case SqlType.Json                             => "jsonb"
 
-  private def qualified(name: QualifiedName): String =
-    (name.schema.toVector :+ name.name).map(quoted).mkString(".")
+  private def qualified(name: QualifiedName): String = (name.schema.toVector :+ name.name).map(quoted).mkString(".")
 
   private def quoted(identifier: SqlIdentifier): String =
     "\"" + identifier.value.replace("\"", "\"\"") + "\""

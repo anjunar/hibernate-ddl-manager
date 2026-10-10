@@ -7,12 +7,11 @@ import com.anjunar.hibernateddl.core.*
   * `affected` lists the unique keys, indexes and check the database rebuilds with the column.
   */
 final case class PreviewTypeChange(
-    column: String,
-    from: String,
-    to: String,
-    rule: String,
-    valuesPreserved: Boolean,
-    rewrite: String,
-    affected: Vector[String]
+  column: String,
+  from: String,
+  to: String,
+  rule: String,
+  valuesPreserved: Boolean,
+  rewrite: String,
+  affected: Vector[String]
 )
-

@@ -6,6 +6,8 @@ import org.postgresql.ds.PGSimpleDataSource
 import java.sql.Connection
 import javax.sql.DataSource
 import scala.util.Using
+import java.lang.reflect.Proxy
+import java.util
 
 class PostgreSqlPreviewSuite extends TestPostgres:
   private val executor = new JdbcMigrationExecutor(PostgreSqlMigrationBackend)
@@ -23,7 +25,9 @@ class PostgreSqlPreviewSuite extends TestPostgres:
     Backfill.fillNulls(name, target, BackfillTrigger.BecomesRequired, value)
   private val displayRule = fill(BackfillValue.coalesce(
     BackfillValue.concat(BackfillValue.column(first.id), BackfillValue.literal(" "), BackfillValue.column(last.id)),
-    BackfillValue.column(first.id), BackfillValue.literal("Unknown")))
+    BackfillValue.column(first.id),
+    BackfillValue.literal("Unknown")
+  ))
 
   private def withPeople[A](body: DataSource => A): A =
     withDatabase { ds =>
@@ -36,18 +40,27 @@ class PostgreSqlPreviewSuite extends TestPostgres:
     report.checks.find(_.code == code).getOrElse(fail(s"No check $code in ${report.checks}"))
 
   private def snapshot(ds: DataSource): String =
-    scalar(ds, "SELECT concat_ws('|', (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace " +
-      "WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')), " +
-      "(SELECT count(*) FROM pg_namespace), " +
-      "(SELECT string_agg(concat_ws(',', id, first_name, last_name), ';' ORDER BY id) FROM public.people), " +
-      "(SELECT coalesce(string_agg(revision::text, ','), '') FROM __hibernate_ddl.schema_history))")
+    scalar(
+      ds,
+      "SELECT concat_ws('|', (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace " +
+        "WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')), " +
+        "(SELECT count(*) FROM pg_namespace), " +
+        "(SELECT string_agg(concat_ws(',', id, first_name, last_name), ';' ORDER BY id) FROM public.people), " +
+        "(SELECT coalesce(string_agg(revision::text, ','), '') FROM __hibernate_ddl.schema_history))"
+    )
 
   test("a preview of an empty database plans creation and leaves the database without any history") {
     withDatabase { ds =>
       val report = preview.preview(ds, initial)
-      assertEquals((report.outcome, report.mode, report.complete), (PreviewOutcome.Ready, Some(PlanMode.Migration), true))
+      assertEquals(
+        (report.outcome, report.mode, report.complete),
+        (PreviewOutcome.Ready, Some(PlanMode.Migration), true)
+      )
       assertEquals(report.steps.map(_.kind), Vector("ddl"))
-      assertEquals(scalar(ds, "SELECT to_regnamespace('__hibernate_ddl') IS NULL AND to_regclass('public.people') IS NULL"), "t")
+      assertEquals(
+        scalar(ds, "SELECT to_regnamespace('__hibernate_ddl') IS NULL AND to_regclass('public.people') IS NULL"),
+        "t"
+      )
       assertEquals(executor.migrate(ds, initial).statementCount, 1)
       assertEquals(scalar(ds, "SELECT statements[1] FROM __hibernate_ddl.schema_history"), report.steps.head.sql)
     }
@@ -64,8 +77,10 @@ class PostgreSqlPreviewSuite extends TestPostgres:
       assertEquals(report.steps(2).parameterTypes, Vector("text", "text"))
       assert(!PreviewRendering.json(report).contains("Unknown"), "a backfill constant must not appear in the report")
       executor.migrate(ds, target, Vector(displayRule))
-      assertEquals(scalar(ds, "SELECT array_to_string(statements, E'\\n') FROM __hibernate_ddl.schema_history WHERE revision = 2"),
-        report.steps.filterNot(_.kind == "null check").map(_.sql).mkString("\n"))
+      assertEquals(
+        scalar(ds, "SELECT array_to_string(statements, E'\\n') FROM __hibernate_ddl.schema_history WHERE revision = 2"),
+        report.steps.filterNot(_.kind == "null check").map(_.sql).mkString("\n")
+      )
     }
   }
 
@@ -87,31 +102,46 @@ class PostgreSqlPreviewSuite extends TestPostgres:
       assertEquals(preview.preview(ds, initial).outcome, PreviewOutcome.Ready)
       execute(ds, "ALTER TABLE public.people ADD COLUMN extra text")
       val drift = preview.preview(ds, initial)
-      assertEquals((drift.mode, check(drift, PreviewCheck.SchemaMatches).status), (Some(PlanMode.NoChange), CheckStatus.Failed))
+      assertEquals(
+        (drift.mode, check(drift, PreviewCheck.SchemaMatches).status),
+        (Some(PlanMode.NoChange), CheckStatus.Failed)
+      )
       execute(ds, "ALTER TABLE public.people DROP COLUMN extra")
       val required = SchemaModel(Vector(people(first, last, display)))
       executor.migrate(ds, required, Vector(displayRule))
       val changed = preview.preview(ds, required, Vector(fill(BackfillValue.literal("x"))))
       assertEquals(changed.findings.map(_.code), Vector(PlanProblem.BackfillChanged))
-      execute(ds, "UPDATE __hibernate_ddl.schema_history SET model = jsonb_set(model, '{tables,0,name}', '\"persons\"')")
+      execute(
+        ds,
+        "UPDATE __hibernate_ddl.schema_history SET model = jsonb_set(model, '{tables,0,name}', '\"persons\"')"
+      )
       val broken = preview.preview(ds, required)
-      assertEquals((broken.outcome, check(broken, PreviewCheck.HistoryConsistent).status), (PreviewOutcome.Blocked, CheckStatus.Failed))
+      assertEquals(
+        (broken.outcome, check(broken, PreviewCheck.HistoryConsistent).status),
+        (PreviewOutcome.Blocked, CheckStatus.Failed)
+      )
     }
   }
 
   test("checks compare structurally: correct ones pass, changed ones fail, unknown forms stay undecided") {
-    val level = ColumnModel(SchemaId("P_LEVEL"), SqlIdentifier("level"), SqlType.SmallInt, check = Some(ColumnCheck.Range(0, 2)))
+    val level =
+      ColumnModel(SchemaId("P_LEVEL"), SqlIdentifier("level"), SqlType.SmallInt, check = Some(ColumnCheck.Range(0, 2)))
     val model = SchemaModel(Vector(people(first, last, level)))
     val name = PostgreSqlDialect.checkName(level.id, level.check.get).value
     withDatabase { ds =>
       executor.migrate(ds, model)
       assertEquals(check(preview.preview(ds, model), PreviewCheck.SchemaMatches).status, CheckStatus.Passed)
-      execute(ds, s"ALTER TABLE public.people DROP CONSTRAINT $name, ADD CONSTRAINT $name CHECK (level BETWEEN 0 AND 5)")
+      execute(
+        ds,
+        s"ALTER TABLE public.people DROP CONSTRAINT $name, ADD CONSTRAINT $name CHECK (level BETWEEN 0 AND 5)"
+      )
       assertEquals(check(preview.preview(ds, model), PreviewCheck.SchemaMatches).status, CheckStatus.Failed)
       execute(ds, s"ALTER TABLE public.people DROP CONSTRAINT $name, ADD CONSTRAINT $name CHECK (level IN (0, 1, 2))")
       val undecided = preview.preview(ds, model)
-      assertEquals((undecided.outcome, check(undecided, PreviewCheck.SchemaMatches).status),
-        (PreviewOutcome.Incomplete, CheckStatus.Inconclusive))
+      assertEquals(
+        (undecided.outcome, check(undecided, PreviewCheck.SchemaMatches).status),
+        (PreviewOutcome.Incomplete, CheckStatus.Inconclusive)
+      )
     }
   }
 
@@ -119,33 +149,59 @@ class PostgreSqlPreviewSuite extends TestPostgres:
     withDatabase { ds =>
       execute(ds, "CREATE TABLE public.people (id bigint PRIMARY KEY, first_name varchar(100), last_name varchar(100))")
       val refused = preview.preview(ds, initial)
-      assertEquals((refused.mode, refused.findings.map(_.code)), (Some(PlanMode.Adoption), Vector(PlanProblem.AdoptionNotEnabled)))
+      assertEquals(
+        (refused.mode, refused.findings.map(_.code)),
+        (Some(PlanMode.Adoption), Vector(PlanProblem.AdoptionNotEnabled))
+      )
       val adopting = new JdbcMigrationPreview(PostgreSqlMigrationBackend, ExecutionOptions(adoptExistingSchema = true))
       assertEquals(adopting.preview(ds, initial).outcome, PreviewOutcome.Ready)
     }
     withPeople { ds =>
-      val renamed = SchemaModel(Vector(people(first, last).copy(name = QualifiedName(SqlIdentifier("persons"), public))))
-      val manual = new JdbcMigrationPreview(PostgreSqlMigrationBackend,
-        ExecutionOptions(acceptManualMigration = Some(SchemaFingerprint.of(renamed))))
+      val renamed =
+        SchemaModel(Vector(people(first, last).copy(name = QualifiedName(SqlIdentifier("persons"), public))))
+      val manual = new JdbcMigrationPreview(
+        PostgreSqlMigrationBackend,
+        ExecutionOptions(acceptManualMigration = Some(SchemaFingerprint.of(renamed)))
+      )
       val report = manual.preview(ds, renamed)
-      assertEquals((report.mode, check(report, PreviewCheck.RelationsAbsent).status), (Some(PlanMode.ManualMigration), CheckStatus.Failed))
+      assertEquals(
+        (report.mode, check(report, PreviewCheck.RelationsAbsent).status),
+        (Some(PlanMode.ManualMigration), CheckStatus.Failed)
+      )
       execute(ds, "ALTER TABLE public.people RENAME TO persons")
       assertEquals(manual.preview(ds, renamed).outcome, PreviewOutcome.Ready)
     }
   }
 
-  test("a column that becomes required needs a backfill for its NULLs; the projection keeps values and sees NULL sources") {
+  test(
+    "a column that becomes required needs a backfill for its NULLs; the projection keeps values and sees NULL sources"
+  ) {
     withPeople { ds =>
       val target = SchemaModel(Vector(people(first, last, display)))
       val without = preview.preview(ds, target)
-      assertEquals((without.outcome, check(without, PreviewCheck.NoNulls).status), (PreviewOutcome.Blocked, CheckStatus.Failed))
-      val partial = preview.preview(ds, target, Vector(fill(BackfillValue.concat(BackfillValue.column(first.id),
-        BackfillValue.column(last.id)))))
+      assertEquals(
+        (without.outcome, check(without, PreviewCheck.NoNulls).status),
+        (PreviewOutcome.Blocked, CheckStatus.Failed)
+      )
+      val partial = preview.preview(
+        ds,
+        target,
+        Vector(fill(BackfillValue.concat(
+          BackfillValue.column(first.id),
+          BackfillValue.column(last.id)
+        )))
+      )
       assertEquals(check(partial, PreviewCheck.NoNulls).status, CheckStatus.Failed)
       val counted = preview.preview(ds, target, Vector(displayRule), PreviewOptions(includeExactCounts = true))
-      assertEquals((counted.outcome, check(counted, PreviewCheck.NoNulls).rows), (PreviewOutcome.Ready, RowCount.Exact(0)))
-      val tightened = preview.preview(ds, SchemaModel(Vector(people(first.copy(nullable = false), last))),
-        previewOptions = PreviewOptions(includeExactCounts = true))
+      assertEquals(
+        (counted.outcome, check(counted, PreviewCheck.NoNulls).rows),
+        (PreviewOutcome.Ready, RowCount.Exact(0))
+      )
+      val tightened = preview.preview(
+        ds,
+        SchemaModel(Vector(people(first.copy(nullable = false), last))),
+        previewOptions = PreviewOptions(includeExactCounts = true)
+      )
       assertEquals(check(tightened, PreviewCheck.NoNulls).rows, RowCount.Exact(1))
       assertEquals(check(preview.preview(ds, target, Vector(displayRule)), PreviewCheck.NoNulls).rows, RowCount.Unknown)
     }
@@ -160,21 +216,39 @@ class PostgreSqlPreviewSuite extends TestPostgres:
       val unique = people(first, last, display).copy(uniqueKeys = Vector(UniqueKeyModel(Vector(display.id))))
       val same = preview.preview(ds, SchemaModel(Vector(unique)), Vector(fill(BackfillValue.literal("same"))))
       assertEquals(check(same, PreviewCheck.NoDuplicates).status, CheckStatus.Failed)
-      assertEquals(check(preview.preview(ds, SchemaModel(Vector(unique)), Vector(displayRule)), PreviewCheck.NoDuplicates).status,
-        CheckStatus.Passed)
+      assertEquals(
+        check(preview.preview(ds, SchemaModel(Vector(unique)), Vector(displayRule)), PreviewCheck.NoDuplicates).status,
+        CheckStatus.Passed
+      )
       val pair = people(first, last).copy(uniqueKeys = Vector(UniqueKeyModel(Vector(first.id, last.id))))
       execute(ds, "INSERT INTO public.people VALUES (4, 'Grace', NULL)")
-      assertEquals(check(preview.preview(ds, SchemaModel(Vector(pair))), PreviewCheck.NoDuplicates).status, CheckStatus.Passed)
+      assertEquals(
+        check(preview.preview(ds, SchemaModel(Vector(pair))), PreviewCheck.NoDuplicates).status,
+        CheckStatus.Passed
+      )
       execute(ds, "INSERT INTO public.people VALUES (5, 'Ada', 'Lovelace')")
-      assertEquals(check(preview.preview(ds, SchemaModel(Vector(pair)), previewOptions = PreviewOptions(includeExactCounts = true)),
-        PreviewCheck.NoDuplicates).rows, RowCount.Exact(2))
+      assertEquals(
+        check(
+          preview.preview(ds, SchemaModel(Vector(pair)), previewOptions = PreviewOptions(includeExactCounts = true)),
+          PreviewCheck.NoDuplicates
+        ).rows,
+        RowCount.Exact(2)
+      )
       val teamId = ColumnModel(SchemaId("T_ID"), SqlIdentifier("id"), SqlType.BigInt, false)
-      val teams = TableModel(SchemaId("T"), QualifiedName(SqlIdentifier("teams"), public), Vector(teamId), Vector(teamId.id))
+      val teams =
+        TableModel(SchemaId("T"), QualifiedName(SqlIdentifier("teams"), public), Vector(teamId), Vector(teamId.id))
       val team = ColumnModel(SchemaId("P_TEAM"), SqlIdentifier("team_id"), SqlType.BigInt, false)
-      val member = people(first, last, team).copy(foreignKeys = Vector(ForeignKeyModel(Vector(team.id), teams.id, teams.primaryKey)))
-      val dangling = preview.preview(ds, SchemaModel(Vector(member, teams)), Vector(fill(BackfillValue.literal(7L), team.id, "team-v1")))
+      val member = people(first, last, team).copy(foreignKeys =
+        Vector(ForeignKeyModel(Vector(team.id), teams.id, teams.primaryKey))
+      )
+      val dangling = preview.preview(
+        ds,
+        SchemaModel(Vector(member, teams)),
+        Vector(fill(BackfillValue.literal(7L), team.id, "team-v1"))
+      )
       assertEquals(check(dangling, PreviewCheck.ReferencesResolve).status, CheckStatus.Failed)
-      val checked = people(first, last, display.copy(check = Some(ColumnCheck.AllowedValues(Vector("Ada Lovelace", "Grace")))))
+      val checked =
+        people(first, last, display.copy(check = Some(ColumnCheck.AllowedValues(Vector("Ada Lovelace", "Grace")))))
       val violated = preview.preview(ds, SchemaModel(Vector(checked)), Vector(displayRule))
       assertEquals(check(violated, PreviewCheck.CheckHolds).status, CheckStatus.Failed)
     }
@@ -183,7 +257,10 @@ class PostgreSqlPreviewSuite extends TestPostgres:
   test("a table a backfill fills gets an optional row estimate once PostgreSQL has one") {
     withPeople { ds =>
       val target = SchemaModel(Vector(people(first, last, display)))
-      assertEquals(check(preview.preview(ds, target, Vector(displayRule)), PreviewCheck.RowEstimate).rows, RowCount.Unknown)
+      assertEquals(
+        check(preview.preview(ds, target, Vector(displayRule)), PreviewCheck.RowEstimate).rows,
+        RowCount.Unknown
+      )
       execute(ds, "ANALYZE public.people")
       val estimated = check(preview.preview(ds, target, Vector(displayRule)), PreviewCheck.RowEstimate)
       assertEquals((estimated.rows, estimated.required), (RowCount.Estimate(3), false))
@@ -193,46 +270,64 @@ class PostgreSqlPreviewSuite extends TestPostgres:
   test("sources dropped after the fill and renamed ones are read under their current names") {
     withPeople { ds =>
       val v3 = SchemaModel(Vector(people(display)))
-      val approved = new JdbcMigrationPreview(PostgreSqlMigrationBackend,
-        ExecutionOptions(approvals = Set(Approval.Drop(first.id), Approval.Drop(last.id))))
+      val approved = new JdbcMigrationPreview(
+        PostgreSqlMigrationBackend,
+        ExecutionOptions(approvals = Set(Approval.Drop(first.id), Approval.Drop(last.id)))
+      )
       assertEquals(approved.preview(ds, v3, Vector(displayRule)).outcome, PreviewOutcome.Ready)
       val renamed = SchemaModel(Vector(people(first.copy(name = SqlIdentifier("given_name")), last, display)))
       assertEquals(preview.preview(ds, renamed, Vector(displayRule)).outcome, PreviewOutcome.Ready)
-      assertEquals(scalar(ds, "SELECT count(*) FROM pg_attribute WHERE attrelid = 'public.people'::regclass AND attnum > 0"), "3")
+      assertEquals(
+        scalar(ds, "SELECT count(*) FROM pg_attribute WHERE attrelid = 'public.people'::regclass AND attnum > 0"),
+        "3"
+      )
     }
   }
 
   test("a read-only role suffices; missing privileges and lock timeouts leave the preview incomplete") {
-    val role = "previewer_" + java.util.UUID.randomUUID().toString.replace("-", "").take(12)
+    val role = "previewer_" + util.UUID.randomUUID().toString.replace("-", "").take(12)
     try
       withPeople { ds =>
-        execute(ds, s"CREATE ROLE $role LOGIN PASSWORD 'preview'; GRANT USAGE ON SCHEMA __hibernate_ddl TO $role; " +
-          s"GRANT SELECT ON __hibernate_ddl.schema_history, __hibernate_ddl.backfill_history TO $role")
+        execute(
+          ds,
+          s"CREATE ROLE $role LOGIN PASSWORD 'preview'; GRANT USAGE ON SCHEMA __hibernate_ddl TO $role; " +
+            s"GRANT SELECT ON __hibernate_ddl.schema_history, __hibernate_ddl.backfill_history TO $role"
+        )
         val reader = new PGSimpleDataSource()
         reader.setUrl(ds.asInstanceOf[PGSimpleDataSource].getUrl)
         reader.setUser(role)
         reader.setPassword("preview")
         val target = SchemaModel(Vector(people(first, last, display)))
         val denied = preview.preview(reader, target, Vector(displayRule))
-        assertEquals((denied.outcome, check(denied, PreviewCheck.NoNulls).status), (PreviewOutcome.Incomplete, CheckStatus.Inconclusive))
+        assertEquals(
+          (denied.outcome, check(denied, PreviewCheck.NoNulls).status),
+          (PreviewOutcome.Incomplete, CheckStatus.Inconclusive)
+        )
         execute(ds, s"GRANT SELECT ON public.people TO $role")
         assertEquals(preview.preview(reader, target, Vector(displayRule)).outcome, PreviewOutcome.Ready)
         Using.resource(ds.getConnection) { holder =>
           holder.setAutoCommit(false)
           Using.resource(holder.createStatement())(_.execute("LOCK TABLE public.people IN ACCESS EXCLUSIVE MODE"))
-          val impatient = new JdbcMigrationPreview(PostgreSqlMigrationBackend, ExecutionOptions(lockTimeoutMillis = 200))
-          val twoChecks = SchemaModel(Vector(people(first, last, display).copy(uniqueKeys = Vector(UniqueKeyModel(Vector(display.id))))))
+          val impatient =
+            new JdbcMigrationPreview(PostgreSqlMigrationBackend, ExecutionOptions(lockTimeoutMillis = 200))
+          val twoChecks = SchemaModel(Vector(people(first, last, display).copy(uniqueKeys =
+            Vector(UniqueKeyModel(Vector(display.id)))
+          )))
           val blocked = impatient.preview(ds, twoChecks, Vector(displayRule))
           holder.rollback()
           assertEquals(blocked.outcome, PreviewOutcome.Incomplete)
-          assertEquals(blocked.checks.map(_.status).filterNot(_ == CheckStatus.Passed).distinct,
-            Vector(CheckStatus.Inconclusive, CheckStatus.NotRun))
+          assertEquals(
+            blocked.checks.map(_.status).filterNot(_ == CheckStatus.Passed).distinct,
+            Vector(CheckStatus.Inconclusive, CheckStatus.NotRun)
+          )
         }
       }
     finally execute(maintenance, s"DROP ROLE IF EXISTS $role")
   }
 
-  test("the connection comes back as it arrived, and a database changed after a ready preview still stops the migration") {
+  test(
+    "the connection comes back as it arrived, and a database changed after a ready preview still stops the migration"
+  ) {
     withPeople { ds =>
       val target = SchemaModel(Vector(people(first.copy(nullable = false), last)))
       execute(ds, "UPDATE public.people SET first_name = 'Anon' WHERE first_name IS NULL")
@@ -241,16 +336,27 @@ class PostgreSqlPreviewSuite extends TestPostgres:
         override def getConnection(): Connection =
           used = ds.getConnection()
           used.setTransactionIsolation(Connection.TRANSACTION_SERIALIZABLE)
-          val proxy = java.lang.reflect.Proxy.newProxyInstance(classOf[Connection].getClassLoader, Array(classOf[Connection]),
+          val proxy = Proxy.newProxyInstance(
+            classOf[Connection].getClassLoader,
+            Array(classOf[Connection]),
             (_, method, args) =>
               if method.getName == "close" then null
-              else method.invoke(used, Option(args).getOrElse(Array.empty[AnyRef])*))
+              else method.invoke(used, Option(args).getOrElse(Array.empty[AnyRef])*)
+          )
           proxy.asInstanceOf[Connection]
       assertEquals(preview.preview(tracking, target).outcome, PreviewOutcome.Ready)
-      assertEquals((used.getAutoCommit, used.getTransactionIsolation, used.isReadOnly),
-        (true, Connection.TRANSACTION_SERIALIZABLE, false))
-      assertEquals(Using.resource(used.createStatement())(s => Using.resource(s.executeQuery("SHOW transaction_read_only")) { r =>
-        r.next(); r.getString(1) }), "off")
+      assertEquals(
+        (used.getAutoCommit, used.getTransactionIsolation, used.isReadOnly),
+        (true, Connection.TRANSACTION_SERIALIZABLE, false)
+      )
+      assertEquals(
+        Using.resource(used.createStatement())(s =>
+          Using.resource(s.executeQuery("SHOW transaction_read_only")) { r =>
+            r.next(); r.getString(1)
+          }
+        ),
+        "off"
+      )
       used.close()
       execute(ds, "INSERT INTO public.people VALUES (9, NULL, NULL)")
       assert(intercept[MigrationException](executor.migrate(ds, target)).getMessage.contains("becomes required"))
@@ -271,101 +377,177 @@ class PostgreSqlPreviewSuite extends TestPostgres:
     }
   }
 
-  test("a type change shows its rule, kept values, rewrite and rebuilt keys; dependents and data block it as the migration would") {
+  test(
+    "a type change shows its rule, kept values, rewrite and rebuilt keys; dependents and data block it as the migration would"
+  ) {
     val sid = id.copy(id = SchemaId("S_ID"))
     val code = ColumnModel(SchemaId("S_CODE"), SqlIdentifier("code"), SqlType.Varchar(10))
-    val level = ColumnModel(SchemaId("S_LEVEL"), SqlIdentifier("level"), SqlType.Integer, check = Some(ColumnCheck.Range(0, 3)))
-    def stock(columns: ColumnModel*) = SchemaModel(Vector(TableModel(SchemaId("S"), QualifiedName(SqlIdentifier("stock"), public),
-      sid +: columns.toVector, Vector(sid.id), uniqueKeys = Vector(UniqueKeyModel(Vector(code.id))),
-      indexes = Vector(IndexModel(Vector(IndexColumn(level.id, descending = true)))))))
-    def target(range: ColumnCheck) = stock(code.copy(dataType = SqlType.Varchar(20)),
-      level.copy(dataType = SqlType.BigInt, check = Some(range)))
+    val level =
+      ColumnModel(SchemaId("S_LEVEL"), SqlIdentifier("level"), SqlType.Integer, check = Some(ColumnCheck.Range(0, 3)))
+    def stock(columns: ColumnModel*) = SchemaModel(Vector(TableModel(
+      SchemaId("S"),
+      QualifiedName(SqlIdentifier("stock"), public),
+      sid +: columns.toVector,
+      Vector(sid.id),
+      uniqueKeys = Vector(UniqueKeyModel(Vector(code.id))),
+      indexes = Vector(IndexModel(Vector(IndexColumn(level.id, descending = true))))
+    )))
+    def target(range: ColumnCheck) = stock(
+      code.copy(dataType = SqlType.Varchar(20)),
+      level.copy(dataType = SqlType.BigInt, check = Some(range))
+    )
     withDatabase { ds =>
       executor.migrate(ds, stock(code, level))
       execute(ds, "INSERT INTO public.stock VALUES (1, 'a', 1), (2, 'b', 3)")
       execute(ds, "CREATE VIEW public.codes AS SELECT code FROM public.stock")
-      val blocked = preview.preview(ds, target(ColumnCheck.Range(0, 2)), previewOptions = PreviewOptions(includeExactCounts = true))
+      val blocked =
+        preview.preview(ds, target(ColumnCheck.Range(0, 2)), previewOptions = PreviewOptions(includeExactCounts = true))
       assertEquals(blocked.outcome, PreviewOutcome.Blocked)
-      assertEquals(blocked.steps.map(_.description), Vector(
-        "Change the type of column public.stock.code from Varchar(10) to Varchar(20)",
-        "Remove the check of column public.stock.level",
-        "Change the type of column public.stock.level from Integer to BigInt",
-        "Set the check of column public.stock.level"))
-      assertEquals(blocked.steps(0).typeChange, Some(PreviewTypeChange("S_CODE", "Varchar(10)", "Varchar(20)",
-        "VARCHAR grows from 10 to 20 characters", valuesPreserved = true, "possible", Vector("unique key (code)"))))
-      assertEquals(blocked.steps(2).typeChange, Some(PreviewTypeChange("S_LEVEL", "Integer", "BigInt", "INTEGER grows to BIGINT",
-        valuesPreserved = true, "expected", Vector("index (level DESC)", "check Range(0,2)"))))
+      assertEquals(
+        blocked.steps.map(_.description),
+        Vector(
+          "Change the type of column public.stock.code from Varchar(10) to Varchar(20)",
+          "Remove the check of column public.stock.level",
+          "Change the type of column public.stock.level from Integer to BigInt",
+          "Set the check of column public.stock.level"
+        )
+      )
+      assertEquals(
+        blocked.steps(0).typeChange,
+        Some(PreviewTypeChange(
+          "S_CODE",
+          "Varchar(10)",
+          "Varchar(20)",
+          "VARCHAR grows from 10 to 20 characters",
+          valuesPreserved = true,
+          "possible",
+          Vector("unique key (code)")
+        ))
+      )
+      assertEquals(
+        blocked.steps(2).typeChange,
+        Some(PreviewTypeChange(
+          "S_LEVEL",
+          "Integer",
+          "BigInt",
+          "INTEGER grows to BIGINT",
+          valuesPreserved = true,
+          "expected",
+          Vector("index (level DESC)", "check Range(0,2)")
+        ))
+      )
       val dependents = blocked.checks.filter(_.code == PreviewCheck.NoDependents)
-      assertEquals(dependents.map(c => (c.subject, c.step, c.status)), Vector(
-        (Some("S_CODE"), Some(1), CheckStatus.Failed), (Some("S_LEVEL"), Some(3), CheckStatus.Passed)))
+      assertEquals(
+        dependents.map(c => (c.subject, c.step, c.status)),
+        Vector(
+          (Some("S_CODE"), Some(1), CheckStatus.Failed),
+          (Some("S_LEVEL"), Some(3), CheckStatus.Passed)
+        )
+      )
       val refused = intercept[MigrationException](executor.migrate(ds, target(ColumnCheck.Range(0, 3))))
       assertEquals(dependents.head.details, Vector(refused.getMessage.stripPrefix("Migration failed: ")))
       // The target check runs over the values as they are; it is set in the last step.
       val holds = check(blocked, PreviewCheck.CheckHolds)
       assertEquals((holds.status, holds.step, holds.rows), (CheckStatus.Failed, Some(4), RowCount.Exact(1)))
-      val size = blocked.checks.find(c => c.code == PreviewCheck.RowEstimate && c.description.contains("public.stock")).get
+      val size =
+        blocked.checks.find(c => c.code == PreviewCheck.RowEstimate && c.description.contains("public.stock")).get
       assert(!size.required && size.details.exists(_.contains("KiB")), size)
-      assert(PreviewRendering.json(blocked).contains("\"typeChange\":{\"column\":\"S_CODE\""), PreviewRendering.json(blocked))
-      assert(PreviewRendering.text(blocked).contains("INTEGER grows to BIGINT; every value is kept; rewrite of the table " +
-        "and its indexes expected"), PreviewRendering.text(blocked))
+      assert(
+        PreviewRendering.json(blocked).contains("\"typeChange\":{\"column\":\"S_CODE\""),
+        PreviewRendering.json(blocked)
+      )
+      assert(
+        PreviewRendering.text(blocked).contains("INTEGER grows to BIGINT; every value is kept; rewrite of the table " +
+          "and its indexes expected"),
+        PreviewRendering.text(blocked)
+      )
 
       execute(ds, "DROP VIEW public.codes")
       val ready = preview.preview(ds, target(ColumnCheck.Range(0, 3)))
       assertEquals(ready.outcome, PreviewOutcome.Ready, PreviewRendering.text(ready))
       assertEquals(executor.migrate(ds, target(ColumnCheck.Range(0, 3))).status, MigrationStatus.Applied)
-      assertEquals(scalar(ds, "SELECT array_to_string(statements, ' | ') FROM __hibernate_ddl.schema_history WHERE revision = 2"),
-        ready.steps.map(_.sql).mkString(" | "))
+      assertEquals(
+        scalar(ds, "SELECT array_to_string(statements, ' | ') FROM __hibernate_ddl.schema_history WHERE revision = 2"),
+        ready.steps.map(_.sql).mkString(" | ")
+      )
     }
   }
 
-  test("a preview binds dropped unique keys and indexes by reading, names missing approvals as setting entries, checks duplicates") {
+  test(
+    "a preview binds dropped unique keys and indexes by reading, names missing approvals as setting entries, checks duplicates"
+  ) {
     val kid = id.copy(id = SchemaId("K_ID"))
     val mail = ColumnModel(SchemaId("K_MAIL"), SqlIdentifier("mail"), SqlType.Varchar(100))
     val team = ColumnModel(SchemaId("K_TEAM"), SqlIdentifier("team"), SqlType.BigInt)
-    def keys(unique: Vector[Vector[SchemaId]], indexes: Vector[SchemaId]) = SchemaModel(Vector(TableModel(SchemaId("K"),
-      QualifiedName(SqlIdentifier("keys"), public), Vector(kid, mail, team), Vector(kid.id),
-      uniqueKeys = unique.map(UniqueKeyModel(_)), indexes = indexes.map(column => IndexModel(Vector(IndexColumn(column)))))))
+    def keys(unique: Vector[Vector[SchemaId]], indexes: Vector[SchemaId]) = SchemaModel(Vector(TableModel(
+      SchemaId("K"),
+      QualifiedName(SqlIdentifier("keys"), public),
+      Vector(kid, mail, team),
+      Vector(kid.id),
+      uniqueKeys = unique.map(UniqueKeyModel(_)),
+      indexes = indexes.map(column => IndexModel(Vector(IndexColumn(column))))
+    )))
     val approval = Approval.dropUniqueKey(UniqueKeyRef(SchemaId("K"), Vector(mail.id)))
-    val approvedPreview = new JdbcMigrationPreview(PostgreSqlMigrationBackend, ExecutionOptions(approvals = Set(approval)))
+    val approvedPreview =
+      new JdbcMigrationPreview(PostgreSqlMigrationBackend, ExecutionOptions(approvals = Set(approval)))
     withDatabase { ds =>
       executor.migrate(ds, keys(Vector(Vector(mail.id)), Vector(team.id)))
       execute(ds, "INSERT INTO public.keys VALUES (1, 'a@x', 1), (2, 'b@x', 1), (3, NULL, 2), (4, NULL, 2)")
       val perTeam = keys(Vector(Vector(team.id, mail.id)), Vector.empty)
       val blocked = preview.preview(ds, perTeam)
       assertEquals(blocked.outcome, PreviewOutcome.Blocked)
-      assertEquals(blocked.steps.map(_.sql), Vector(
-        "ALTER TABLE \"public\".\"keys\" ADD UNIQUE (\"team\", \"mail\");",
-        "ALTER TABLE \"public\".\"keys\" DROP CONSTRAINT \"keys_mail_key\";",
-        "DROP INDEX \"public\".\"keys_team_idx\";"))
+      assertEquals(
+        blocked.steps.map(_.sql),
+        Vector(
+          "ALTER TABLE \"public\".\"keys\" ADD UNIQUE (\"team\", \"mail\");",
+          "ALTER TABLE \"public\".\"keys\" DROP CONSTRAINT \"keys_mail_key\";",
+          "DROP INDEX \"public\".\"keys_team_idx\";"
+        )
+      )
       val finding = blocked.findings.head
       assertEquals((finding.code, finding.step), (PlanProblem.ApprovalMissing, Some(2)))
       assert(finding.message.contains(s"setting entry ${Approval.entry(approval)}"), finding.message)
       assertEquals(blocked.missingApprovals, Vector(Approval.entry(approval)))
-      assertEquals(blocked.checks.filter(_.code == PreviewCheck.DropTargetFound).map(c => (c.step, c.status)),
-        Vector((Some(2), CheckStatus.Passed), (Some(3), CheckStatus.Passed)))
+      assertEquals(
+        blocked.checks.filter(_.code == PreviewCheck.DropTargetFound).map(c => (c.step, c.status)),
+        Vector((Some(2), CheckStatus.Passed), (Some(3), CheckStatus.Passed))
+      )
       assertEquals(check(blocked, PreviewCheck.NoDuplicates).status, CheckStatus.Passed)
-      assert(blocked.steps(2).description.contains("queries that used it may become slower"), blocked.steps(2).description)
+      assert(
+        blocked.steps(2).description.contains("queries that used it may become slower"),
+        blocked.steps(2).description
+      )
 
       // Unique per team alone would find team 1 twice; NULL mails never collide.
       val duplicated = approvedPreview.preview(ds, keys(Vector(Vector(team.id)), Vector.empty))
       assertEquals(check(duplicated, PreviewCheck.NoDuplicates).status, CheckStatus.Failed)
       val ready = approvedPreview.preview(ds, perTeam)
       assertEquals(ready.outcome, PreviewOutcome.Ready, PreviewRendering.text(ready))
-      assertEquals(new JdbcMigrationExecutor(PostgreSqlMigrationBackend, ExecutionOptions(approvals = Set(approval)))
-        .migrate(ds, perTeam).status, MigrationStatus.Applied)
-      assertEquals(scalar(ds, "SELECT array_to_string(statements, ' | ') FROM __hibernate_ddl.schema_history WHERE revision = 2"),
-        ready.steps.map(_.sql).mkString(" | "))
+      assertEquals(
+        new JdbcMigrationExecutor(PostgreSqlMigrationBackend, ExecutionOptions(approvals = Set(approval)))
+          .migrate(ds, perTeam).status,
+        MigrationStatus.Applied
+      )
+      assertEquals(
+        scalar(ds, "SELECT array_to_string(statements, ' | ') FROM __hibernate_ddl.schema_history WHERE revision = 2"),
+        ready.steps.map(_.sql).mkString(" | ")
+      )
     }
   }
 
   test("a dropped column shows the unique keys and indexes that go with it, without steps or approvals of their own") {
     withPeople { ds =>
-      val keyed = SchemaModel(Vector(people(first, last).copy(uniqueKeys = Vector(UniqueKeyModel(Vector(first.id, last.id))),
-        indexes = Vector(IndexModel(Vector(IndexColumn(last.id, descending = true)))))))
+      val keyed = SchemaModel(Vector(people(first, last).copy(
+        uniqueKeys = Vector(UniqueKeyModel(Vector(first.id, last.id))),
+        indexes = Vector(IndexModel(Vector(IndexColumn(last.id, descending = true))))
+      )))
       executor.migrate(ds, keyed)
       val report = preview.preview(ds, SchemaModel(Vector(people(first))))
-      assertEquals(report.steps.map(_.description), Vector("Drop column public.people.last_name and its data, which also " +
-        "removes unique key (first_name, last_name), index (last_name DESC)"))
+      assertEquals(
+        report.steps.map(_.description),
+        Vector("Drop column public.people.last_name and its data, which also " +
+          "removes unique key (first_name, last_name), index (last_name DESC)")
+      )
       assertEquals(report.missingApprovals, Vector("drop:P_LAST"))
     }
   }

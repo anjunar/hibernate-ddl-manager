@@ -8,5 +8,6 @@ enum TableRewrite:
     * indexes; it is not promised.
     */
   case Possible
+
   /** The stored format changes, so the table and its indexes are rewritten. */
   case Expected

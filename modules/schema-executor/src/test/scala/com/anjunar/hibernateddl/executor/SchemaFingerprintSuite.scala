@@ -1,16 +1,20 @@
 package com.anjunar.hibernateddl.executor
 
 import com.anjunar.hibernateddl.core.*
+import munit.FunSuite
 
-class SchemaFingerprintSuite extends munit.FunSuite:
+class SchemaFingerprintSuite extends FunSuite:
   private val column = ColumnModel(SchemaId("name"), SqlIdentifier("name"), SqlType.Varchar(100), nullable = false)
   private val table = TableModel(SchemaId("customer"), QualifiedName(SqlIdentifier("customer")), Vector(column))
   private val model = SchemaModel(Vector(table))
 
   test("fingerprints ignore table and column ordering") {
     val first = table.copy(columns = Vector(column, column.copy(id = SchemaId("age"), name = SqlIdentifier("age"))))
-    val second = table.copy(id = SchemaId("orders"), name = QualifiedName(SqlIdentifier("orders")),
-      columns = Vector(column.copy(id = SchemaId("order-name"))))
+    val second = table.copy(
+      id = SchemaId("orders"),
+      name = QualifiedName(SqlIdentifier("orders")),
+      columns = Vector(column.copy(id = SchemaId("order-name")))
+    )
     val ordered = SchemaModel(Vector(first, second))
     val reversed = SchemaModel(ordered.tables.reverse.map(t => t.copy(columns = t.columns.reverse)))
     assertEquals(SchemaFingerprint.of(ordered), SchemaFingerprint.of(reversed))
@@ -25,19 +29,32 @@ class SchemaFingerprintSuite extends munit.FunSuite:
       table.copy(columns = Vector.empty),
       table.copy(primaryKey = Vector(column.id))
     ) ++ Vector(
-      column.copy(id = SchemaId("other")), column.copy(name = SqlIdentifier("other")),
-      column.copy(nullable = true), column.copy(dataType = SqlType.Varchar(101)),
-      column.copy(dataType = SqlType.Integer), column.copy(dataType = SqlType.BigInt),
-      column.copy(dataType = SqlType.Boolean), column.copy(dataType = SqlType.Text),
-      column.copy(dataType = SqlType.Uuid), column.copy(dataType = SqlType.Timestamp(6)),
-      column.copy(dataType = SqlType.Timestamp(3)), column.copy(dataType = SqlType.TimestampWithTimeZone(6)),
-      column.copy(dataType = SqlType.Char(100)), column.copy(dataType = SqlType.Char(101)),
-      column.copy(dataType = SqlType.Numeric(38, 2)), column.copy(dataType = SqlType.Numeric(38, 3)),
-      column.copy(dataType = SqlType.Numeric(39, 2)), column.copy(dataType = SqlType.Time(0)),
-      column.copy(dataType = SqlType.Time(6)), column.copy(dataType = SqlType.SmallInt),
-      column.copy(dataType = SqlType.Real), column.copy(dataType = SqlType.DoublePrecision),
-      column.copy(dataType = SqlType.Date), column.copy(dataType = SqlType.Binary),
-      column.copy(dataType = SqlType.LargeObject), column.copy(dataType = SqlType.Json)
+      column.copy(id = SchemaId("other")),
+      column.copy(name = SqlIdentifier("other")),
+      column.copy(nullable = true),
+      column.copy(dataType = SqlType.Varchar(101)),
+      column.copy(dataType = SqlType.Integer),
+      column.copy(dataType = SqlType.BigInt),
+      column.copy(dataType = SqlType.Boolean),
+      column.copy(dataType = SqlType.Text),
+      column.copy(dataType = SqlType.Uuid),
+      column.copy(dataType = SqlType.Timestamp(6)),
+      column.copy(dataType = SqlType.Timestamp(3)),
+      column.copy(dataType = SqlType.TimestampWithTimeZone(6)),
+      column.copy(dataType = SqlType.Char(100)),
+      column.copy(dataType = SqlType.Char(101)),
+      column.copy(dataType = SqlType.Numeric(38, 2)),
+      column.copy(dataType = SqlType.Numeric(38, 3)),
+      column.copy(dataType = SqlType.Numeric(39, 2)),
+      column.copy(dataType = SqlType.Time(0)),
+      column.copy(dataType = SqlType.Time(6)),
+      column.copy(dataType = SqlType.SmallInt),
+      column.copy(dataType = SqlType.Real),
+      column.copy(dataType = SqlType.DoublePrecision),
+      column.copy(dataType = SqlType.Date),
+      column.copy(dataType = SqlType.Binary),
+      column.copy(dataType = SqlType.LargeObject),
+      column.copy(dataType = SqlType.Json)
     ).map(c => table.copy(columns = Vector(c)))
     val variants = changedTables.map(t => SchemaModel(Vector(t))) :+ SchemaModel(Vector.empty)
     val hashes = variants.map(SchemaFingerprint.of) :+ SchemaFingerprint.of(model)
@@ -47,9 +64,16 @@ class SchemaFingerprintSuite extends munit.FunSuite:
 
   private val keyed =
     val id = ColumnModel(SchemaId("t/id"), SqlIdentifier("id"), SqlType.Uuid, nullable = false)
-    SchemaModel(Vector(TableModel(SchemaId("t"), QualifiedName(SqlIdentifier("t"), Some(SqlIdentifier("public"))),
-      Vector(id, ColumnModel(SchemaId("t/at"), SqlIdentifier("at"), SqlType.Timestamp(6)),
-        ColumnModel(SchemaId("t/name"), SqlIdentifier("name"), SqlType.Varchar(80))), Vector(id.id))))
+    SchemaModel(Vector(TableModel(
+      SchemaId("t"),
+      QualifiedName(SqlIdentifier("t"), Some(SqlIdentifier("public"))),
+      Vector(
+        id,
+        ColumnModel(SchemaId("t/at"), SqlIdentifier("at"), SqlType.Timestamp(6)),
+        ColumnModel(SchemaId("t/name"), SqlIdentifier("name"), SqlType.Varchar(80))
+      ),
+      Vector(id.id)
+    )))
 
   test("models without foreign keys keep the fingerprints that earlier versions stored") {
     assertEquals(SchemaFingerprint.of(keyed), "085d2a77eff81e4854196e811715cfedfb1248fa6809e4cf86d5875f14cc990b")
@@ -58,54 +82,88 @@ class SchemaFingerprintSuite extends munit.FunSuite:
   test("models with foreign keys but without unique keys keep the fingerprints that earlier versions stored") {
     val table = keyed.tables.head
     val parent = ColumnModel(SchemaId("t/parent"), SqlIdentifier("parent"), SqlType.Uuid)
-    val model = SchemaModel(Vector(table.copy(columns = Vector(table.columns.head, parent),
-      foreignKeys = Vector(ForeignKeyModel(Vector(parent.id), table.id, table.primaryKey)))))
+    val model = SchemaModel(Vector(table.copy(
+      columns = Vector(table.columns.head, parent),
+      foreignKeys = Vector(ForeignKeyModel(Vector(parent.id), table.id, table.primaryKey))
+    )))
     assertEquals(SchemaFingerprint.of(model), "21ad02d6ea5bab3bdc4eac7924a109696d92ef1fc741f5070e04d581e5d18aa4")
-    val cascade = model.copy(tables = model.tables.map(t => t.copy(
-      foreignKeys = t.foreignKeys.map(_.copy(onDeleteCascade = true)))))
+    val cascade = model.copy(tables =
+      model.tables.map(t =>
+        t.copy(
+          foreignKeys = t.foreignKeys.map(_.copy(onDeleteCascade = true))
+        )
+      )
+    )
     assertNotEquals(SchemaFingerprint.of(cascade), SchemaFingerprint.of(model))
   }
 
   test("models with unique keys but without indexes keep the fingerprints that earlier versions stored") {
     val table = keyed.tables.head
     val parent = ColumnModel(SchemaId("t/parent"), SqlIdentifier("parent"), SqlType.Uuid)
-    val model = SchemaModel(Vector(table.copy(columns = Vector(table.columns.head, parent),
+    val model = SchemaModel(Vector(table.copy(
+      columns = Vector(table.columns.head, parent),
       foreignKeys = Vector(ForeignKeyModel(Vector(parent.id), table.id, table.primaryKey)),
-      uniqueKeys = Vector(UniqueKeyModel(Vector(parent.id))))))
+      uniqueKeys = Vector(UniqueKeyModel(Vector(parent.id)))
+    )))
     assertEquals(SchemaFingerprint.of(model), "1f76c2babda21275093a280117c171471900dd4fb6ab259d7fc1b655119b951e")
   }
 
   test("models with indexes but without column checks keep the fingerprints that earlier versions stored") {
     val table = keyed.tables.head
     val parent = ColumnModel(SchemaId("t/parent"), SqlIdentifier("parent"), SqlType.Uuid)
-    val model = SchemaModel(Vector(table.copy(columns = Vector(table.columns.head, parent),
+    val model = SchemaModel(Vector(table.copy(
+      columns = Vector(table.columns.head, parent),
       foreignKeys = Vector(ForeignKeyModel(Vector(parent.id), table.id, table.primaryKey)),
       uniqueKeys = Vector(UniqueKeyModel(Vector(parent.id))),
-      indexes = Vector(IndexModel(Vector(IndexColumn(parent.id, descending = true)))))))
+      indexes = Vector(IndexModel(Vector(IndexColumn(parent.id, descending = true))))
+    )))
     assertEquals(SchemaFingerprint.of(model), "2e078d3ab32f3cd52cb02314f213bcce5e9d22aba3700cd4ff457cb1d883afb7")
   }
 
-  test("models with column checks but without identity columns or sequences keep the fingerprints that earlier versions stored") {
+  test(
+    "models with column checks but without identity columns or sequences keep the fingerprints that earlier versions stored"
+  ) {
     val table = keyed.tables.head
-    val status = ColumnModel(SchemaId("t/status"), SqlIdentifier("status"), SqlType.Varchar(10),
-      check = Some(ColumnCheck.AllowedValues(Vector("NEW", "OLD"))))
+    val status = ColumnModel(
+      SchemaId("t/status"),
+      SqlIdentifier("status"),
+      SqlType.Varchar(10),
+      check = Some(ColumnCheck.AllowedValues(Vector("NEW", "OLD")))
+    )
     val model = SchemaModel(Vector(table.copy(columns = Vector(table.columns.head, status))))
     assertEquals(SchemaFingerprint.of(model), "4854bd7150afe372ceb85e2a9a3e9af7d81b4bbd69b2cea7daed768b11b0d520")
   }
 
   test("identity columns and sequences change the fingerprint, but sequence order does not") {
     val table = keyed.tables.head
-    val identity = SchemaModel(Vector(table.copy(columns = table.columns.map(c => if c.id == table.columns.head.id then
-      c.copy(dataType = SqlType.BigInt, identity = true) else c))))
-    val plain = SchemaModel(Vector(table.copy(columns = table.columns.map(c => if c.id == table.columns.head.id then
-      c.copy(dataType = SqlType.BigInt) else c))))
+    val identity = SchemaModel(Vector(table.copy(columns =
+      table.columns.map(c =>
+        if c.id == table.columns.head.id then
+          c.copy(dataType = SqlType.BigInt, identity = true)
+        else c
+      )
+    )))
+    val plain = SchemaModel(Vector(table.copy(columns =
+      table.columns.map(c =>
+        if c.id == table.columns.head.id then
+          c.copy(dataType = SqlType.BigInt)
+        else c
+      )
+    )))
     assertNotEquals(SchemaFingerprint.of(identity), SchemaFingerprint.of(plain))
-    val first = SequenceModel(SchemaId("a"), QualifiedName(SqlIdentifier("a_seq"), Some(SqlIdentifier("public"))), 1, 50)
-    val second = SequenceModel(SchemaId("b"), QualifiedName(SqlIdentifier("b_seq"), Some(SqlIdentifier("public"))), 1, 1)
+    val first =
+      SequenceModel(SchemaId("a"), QualifiedName(SqlIdentifier("a_seq"), Some(SqlIdentifier("public"))), 1, 50)
+    val second =
+      SequenceModel(SchemaId("b"), QualifiedName(SqlIdentifier("b_seq"), Some(SqlIdentifier("public"))), 1, 1)
     val fingerprint = SchemaFingerprint.of(keyed.copy(sequences = Vector(first, second)))
     assertEquals(SchemaFingerprint.of(keyed.copy(sequences = Vector(second, first))), fingerprint)
-    Vector(first.copy(start = 2), first.copy(increment = 1), first.copy(name = first.name.copy(name = SqlIdentifier("x"))),
-      first.copy(name = first.name.copy(schema = None)), first.copy(id = SchemaId("c"))).foreach { changed =>
+    Vector(
+      first.copy(start = 2),
+      first.copy(increment = 1),
+      first.copy(name = first.name.copy(name = SqlIdentifier("x"))),
+      first.copy(name = first.name.copy(schema = None)),
+      first.copy(id = SchemaId("c"))
+    ).foreach { changed =>
       assertNotEquals(SchemaFingerprint.of(keyed.copy(sequences = Vector(changed, second))), fingerprint, changed)
     }
     assertNotEquals(SchemaFingerprint.of(keyed), fingerprint)
@@ -114,10 +172,19 @@ class SchemaFingerprintSuite extends munit.FunSuite:
   test("column checks change the fingerprint") {
     val table = keyed.tables.head
     def withCheck(check: Option[ColumnCheck]) =
-      SchemaFingerprint.of(SchemaModel(Vector(table.copy(columns = table.columns.map(c =>
-        if c.id == SchemaId("t/name") then c.copy(check = check) else c)))))
-    val fingerprints = Vector(None, Some(ColumnCheck.AllowedValues(Vector("A"))), Some(ColumnCheck.AllowedValues(Vector("A", "B"))),
-      Some(ColumnCheck.AllowedValues(Vector("B", "A"))), Some(ColumnCheck.Range(0, 1)), Some(ColumnCheck.Range(0, 2))).map(withCheck)
+      SchemaFingerprint.of(SchemaModel(Vector(table.copy(columns =
+        table.columns.map(c =>
+          if c.id == SchemaId("t/name") then c.copy(check = check) else c
+        )
+      ))))
+    val fingerprints = Vector(
+      None,
+      Some(ColumnCheck.AllowedValues(Vector("A"))),
+      Some(ColumnCheck.AllowedValues(Vector("A", "B"))),
+      Some(ColumnCheck.AllowedValues(Vector("B", "A"))),
+      Some(ColumnCheck.Range(0, 1)),
+      Some(ColumnCheck.Range(0, 2))
+    ).map(withCheck)
     assertEquals(fingerprints.head, SchemaFingerprint.of(keyed))
     assertEquals(fingerprints.distinct.size, fingerprints.size)
   }

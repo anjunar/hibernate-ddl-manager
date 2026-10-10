@@ -29,10 +29,10 @@ object HibernateSchemaMigration:
   private val SchemaActions = Vector("hibernate.hbm2ddl.auto", "jakarta.persistence.schema-generation.database.action")
 
   def migrate(
-      metadata: Metadata,
-      dataSource: DataSource,
-      options: ExecutionOptions = ExecutionOptions(),
-      backfills: Vector[Backfill] = Vector.empty
+    metadata: Metadata,
+    dataSource: DataSource,
+    options: ExecutionOptions = ExecutionOptions(),
+    backfills: Vector[Backfill] = Vector.empty
   ): MigrationResult =
     val (executionOptions, target, all) = resolve(metadata, options, backfills)
     JdbcMigrationExecutor(PostgreSqlMigrationBackend, executionOptions).migrate(dataSource, target, all)
@@ -42,11 +42,11 @@ object HibernateSchemaMigration:
     * integrator, which checks everything again under its locks.
     */
   def preview(
-      metadata: Metadata,
-      dataSource: DataSource,
-      options: ExecutionOptions = ExecutionOptions(),
-      backfills: Vector[Backfill] = Vector.empty,
-      previewOptions: PreviewOptions = PreviewOptions()
+    metadata: Metadata,
+    dataSource: DataSource,
+    options: ExecutionOptions = ExecutionOptions(),
+    backfills: Vector[Backfill] = Vector.empty,
+    previewOptions: PreviewOptions = PreviewOptions()
   ): PreviewReport =
     val (executionOptions, target, all) = resolve(metadata, options, backfills)
     JdbcMigrationPreview(PostgreSqlMigrationBackend, executionOptions).preview(dataSource, target, all, previewOptions)
@@ -69,15 +69,16 @@ object HibernateSchemaMigration:
 
   /** Options refined by the settings, the target read from the entities, and every backfill. */
   private def resolve(
-      metadata: Metadata,
-      options: ExecutionOptions,
-      backfills: Vector[Backfill]
+    metadata: Metadata,
+    options: ExecutionOptions,
+    backfills: Vector[Backfill]
   ): (ExecutionOptions, SchemaModel, Vector[Backfill]) =
     val settings = configuration(metadata)
     val executionOptions = MigrationSettings.options(settings, options).fold(refuse, identity)
     val errors = checkSetup(metadata, settings)
     if errors.nonEmpty then refuse(errors)
-    val target = HibernateSchemaSource.read(metadata).fold(errors => refuse(errors.map("Entity mapping: " + _)), identity)
+    val target =
+      HibernateSchemaSource.read(metadata).fold(errors => refuse(errors.map("Entity mapping: " + _)), identity)
     (executionOptions, target, provided(metadata) ++ backfills)
 
   /** The backfills of every provider on the application's class path. */
@@ -103,12 +104,13 @@ object HibernateSchemaMigration:
       s"Hibernate uses the dialect ${dialect.getClass.getName}; the migration supports PostgreSQL only"
     ).toVector ++ SchemaActions.flatMap { key =>
       val action =
-        try Right(if key.startsWith("hibernate") then Action.interpretHbm2ddlSetting(settings.get(key).orNull)
+        try
+          Right(if key.startsWith("hibernate") then Action.interpretHbm2ddlSetting(settings.get(key).orNull)
           else Action.interpretJpaSetting(settings.get(key).orNull))
         catch case NonFatal(error) => Left(error.getMessage)
       action match
         case Right(Action.NONE | Action.VALIDATE) => None
-        case Right(_) =>
+        case Right(_)                             =>
           Some(s"$key is ${settings(key)}; Hibernate must not change the schema itself, use none or validate")
         case Left(message) => Some(message)
     }

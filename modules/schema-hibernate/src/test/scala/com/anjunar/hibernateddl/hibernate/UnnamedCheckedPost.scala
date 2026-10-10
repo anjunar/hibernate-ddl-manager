@@ -5,7 +5,7 @@ import com.anjunar.hibernateddl.hibernate.annotation.SchemaId
 import jakarta.persistence.{CheckConstraint, Column, Entity, Id, Table}
 import munit.FunSuite
 
-import java.util.UUID
+import java.util
 
 @Entity
 @SchemaId("f4971acd")
@@ -14,4 +14,3 @@ class UnnamedCheckedPost:
   @Id
   @SchemaId("4ac9e501")
   var id: Int = 0
-

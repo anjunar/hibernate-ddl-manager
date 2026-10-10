@@ -6,9 +6,10 @@ import org.hibernate.annotations.{JdbcTypeCode, NaturalId, OnDelete, OnDeleteAct
 import org.hibernate.`type`.SqlTypes
 
 import scala.compiletime.uninitialized
+import java.lang.{Long as JavaLong}
 
 /** Hibernate's default key generation: the sequence Generated_SEQ with increment 50. */
 @Entity
 @SchemaId("cccccccc")
 class Generated:
-  @Id @GeneratedValue @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+  @Id @GeneratedValue @SchemaId("0a1b2c3d") var id: JavaLong = uninitialized

@@ -7,13 +7,13 @@ import java.sql.Connection
   * revision whose migration recorded it. Each ID is recorded once.
   */
 final case class BackfillRecord(
-    id: String,
-    format: Int,
-    checksum: String,
-    target: SchemaId,
-    revision: Long,
-    previousFingerprint: String,
-    targetFingerprint: String,
-    result: BackfillResult,
-    updatedRows: Option[Long]
+  id: String,
+  format: Int,
+  checksum: String,
+  target: SchemaId,
+  revision: Long,
+  previousFingerprint: String,
+  targetFingerprint: String,
+  result: BackfillResult,
+  updatedRows: Option[Long]
 )

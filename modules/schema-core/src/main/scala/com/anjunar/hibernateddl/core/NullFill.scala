@@ -8,4 +8,3 @@ import java.security.MessageDigest
   * each constant takes.
   */
 final case class NullFill(backfillId: String, table: QualifiedName, column: SqlIdentifier, value: FillValue)
-

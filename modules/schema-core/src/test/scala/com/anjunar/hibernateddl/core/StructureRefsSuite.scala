@@ -1,6 +1,8 @@
 package com.anjunar.hibernateddl.core
 
-class StructureRefsSuite extends munit.FunSuite:
+import munit.FunSuite
+
+class StructureRefsSuite extends FunSuite:
   private val email = SchemaId("u/email")
   private val tenant = SchemaId("u/tenant")
 

@@ -10,4 +10,3 @@ import org.hibernate.mapping.PersistentClass
   * provider must claim each classless entity; an unclaimed entity fails schema reading.
   */
 final case class ClasslessEntitySchemaIds(tableId: SchemaId, columnIds: Map[String, SchemaId])
-

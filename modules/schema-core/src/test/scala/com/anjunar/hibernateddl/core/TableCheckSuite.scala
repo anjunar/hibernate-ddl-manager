@@ -6,8 +6,13 @@ class TableCheckSuite extends FunSuite:
   private val id = ColumnModel(SchemaId("id"), SqlIdentifier("id"), SqlType.Uuid, nullable = false)
   private val state = ColumnModel(SchemaId("status"), SqlIdentifier("status"), SqlType.Varchar(24))
   private val check = TableCheck(SqlIdentifier("ck_status"), "status IN ('DRAFT', 'PUBLISHED')")
-  private val table = TableModel(SchemaId("post"), QualifiedName(SqlIdentifier("post")), Vector(id, state),
-    primaryKey = Vector(id.id), checks = Vector(check))
+  private val table = TableModel(
+    SchemaId("post"),
+    QualifiedName(SqlIdentifier("post")),
+    Vector(id, state),
+    primaryKey = Vector(id.id),
+    checks = Vector(check)
+  )
   private def model(value: TableModel) = SchemaModel(Vector(value))
 
   test("checks survive table creation and permit unrelated additions and widenings") {

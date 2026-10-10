@@ -7,7 +7,9 @@ import java.sql.Connection
 enum BackfillResult:
   /** The backfill filled the column's NULLs while it became required. */
   case Executed
+
   /** The column was created required with a new table, so there was nothing to fill. */
   case NotRequiredOnCreation
+
   /** The column was found required when the database was adopted or migrated by hand. */
   case Adopted

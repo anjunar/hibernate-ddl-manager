@@ -8,9 +8,9 @@ object SchemaOperation:
     val risk: RiskLevel = RiskLevel.Safe
 
   final case class RenameSequence(
-      sequenceId: SchemaId,
-      from: QualifiedName,
-      to: QualifiedName
+    sequenceId: SchemaId,
+    from: QualifiedName,
+    to: QualifiedName
   ) extends SchemaOperation:
     val risk: RiskLevel = RiskLevel.Locking
 
@@ -18,23 +18,23 @@ object SchemaOperation:
     val risk: RiskLevel = RiskLevel.Locking
 
   final case class AddColumn(
-      tableId: SchemaId,
-      table: QualifiedName,
-      column: ColumnModel
+    tableId: SchemaId,
+    table: QualifiedName,
+    column: ColumnModel
   ) extends SchemaOperation:
     val risk: RiskLevel = RiskLevel.Locking
 
   final case class RenameTable(
-      tableId: SchemaId,
-      from: QualifiedName,
-      to: QualifiedName
+    tableId: SchemaId,
+    from: QualifiedName,
+    to: QualifiedName
   ) extends SchemaOperation:
     val risk: RiskLevel = RiskLevel.Locking
 
   final case class AddUniqueKey(
-      tableId: SchemaId,
-      table: QualifiedName,
-      columns: Vector[SqlIdentifier]
+    tableId: SchemaId,
+    table: QualifiedName,
+    columns: Vector[SqlIdentifier]
   ) extends SchemaOperation:
     val risk: RiskLevel = RiskLevel.Locking
 
@@ -42,12 +42,12 @@ object SchemaOperation:
     * validates the existing rows.
     */
   final case class ChangeCheck(
-      tableId: SchemaId,
-      table: QualifiedName,
-      columnId: SchemaId,
-      column: SqlIdentifier,
-      from: Option[ColumnCheck],
-      to: Option[ColumnCheck]
+    tableId: SchemaId,
+    table: QualifiedName,
+    columnId: SchemaId,
+    column: SqlIdentifier,
+    from: Option[ColumnCheck],
+    to: Option[ColumnCheck]
   ) extends SchemaOperation:
     val risk: RiskLevel = RiskLevel.Locking
 
@@ -57,21 +57,21 @@ object SchemaOperation:
     * type.
     */
   final case class ChangeColumnType(
-      tableId: SchemaId,
-      table: QualifiedName,
-      columnId: SchemaId,
-      column: SqlIdentifier,
-      from: SqlType,
-      to: SqlType
+    tableId: SchemaId,
+    table: QualifiedName,
+    columnId: SchemaId,
+    column: SqlIdentifier,
+    from: SqlType,
+    to: SqlType
   ) extends SchemaOperation:
     val risk: RiskLevel = RiskLevel.Locking
 
   final case class IndexedColumn(name: SqlIdentifier, descending: Boolean)
 
   final case class CreateIndex(
-      tableId: SchemaId,
-      table: QualifiedName,
-      columns: Vector[IndexedColumn]
+    tableId: SchemaId,
+    table: QualifiedName,
+    columns: Vector[IndexedColumn]
   ) extends SchemaOperation:
     val risk: RiskLevel = RiskLevel.Locking
 
@@ -80,9 +80,9 @@ object SchemaOperation:
     * definition. `table` and `columns` are the names when the step runs.
     */
   final case class DropIndex(
-      ref: IndexRef,
-      table: QualifiedName,
-      columns: Vector[IndexedColumn]
+    ref: IndexRef,
+    table: QualifiedName,
+    columns: Vector[IndexedColumn]
   ) extends SchemaOperation:
     val risk: RiskLevel = RiskLevel.Locking
 
@@ -90,9 +90,9 @@ object SchemaOperation:
     * may hold duplicates. Bound at execution like [[DropIndex]].
     */
   final case class DropUniqueKey(
-      ref: UniqueKeyRef,
-      table: QualifiedName,
-      columns: Vector[SqlIdentifier]
+    ref: UniqueKeyRef,
+    table: QualifiedName,
+    columns: Vector[SqlIdentifier]
   ) extends SchemaOperation:
     val risk: RiskLevel = RiskLevel.Locking
 
@@ -101,25 +101,25 @@ object SchemaOperation:
     */
   def boundAtExecution(operation: SchemaOperation): Boolean = operation match
     case _: DropIndex | _: DropUniqueKey => true
-    case _ => false
+    case _                               => false
 
   /** Runs after every table exists, so new tables may reference each other or themselves. */
   final case class AddForeignKey(
-      tableId: SchemaId,
-      table: QualifiedName,
-      columns: Vector[SqlIdentifier],
-      referencedTable: QualifiedName,
-      referencedColumns: Vector[SqlIdentifier],
-      onDeleteCascade: Boolean = false
+    tableId: SchemaId,
+    table: QualifiedName,
+    columns: Vector[SqlIdentifier],
+    referencedTable: QualifiedName,
+    referencedColumns: Vector[SqlIdentifier],
+    onDeleteCascade: Boolean = false
   ) extends SchemaOperation:
     val risk: RiskLevel = RiskLevel.Locking
 
   final case class RenameColumn(
-      tableId: SchemaId,
-      table: QualifiedName,
-      columnId: SchemaId,
-      from: SqlIdentifier,
-      to: SqlIdentifier
+    tableId: SchemaId,
+    table: QualifiedName,
+    columnId: SchemaId,
+    from: SqlIdentifier,
+    to: SqlIdentifier
   ) extends SchemaOperation:
     val risk: RiskLevel = RiskLevel.Locking
 
@@ -128,18 +128,18 @@ object SchemaOperation:
     * column instead of a constraint.
     */
   final case class SetNotNull(
-      tableId: SchemaId,
-      table: QualifiedName,
-      columnId: SchemaId,
-      column: SqlIdentifier
+    tableId: SchemaId,
+    table: QualifiedName,
+    columnId: SchemaId,
+    column: SqlIdentifier
   ) extends SchemaOperation:
     val risk: RiskLevel = RiskLevel.Locking
 
   final case class DropNotNull(
-      tableId: SchemaId,
-      table: QualifiedName,
-      columnId: SchemaId,
-      column: SqlIdentifier
+    tableId: SchemaId,
+    table: QualifiedName,
+    columnId: SchemaId,
+    column: SqlIdentifier
   ) extends SchemaOperation:
     val risk: RiskLevel = RiskLevel.Locking
 
@@ -147,10 +147,10 @@ object SchemaOperation:
     * keys and foreign keys with it.
     */
   final case class DropColumn(
-      tableId: SchemaId,
-      table: QualifiedName,
-      columnId: SchemaId,
-      column: SqlIdentifier
+    tableId: SchemaId,
+    table: QualifiedName,
+    columnId: SchemaId,
+    column: SqlIdentifier
   ) extends SchemaOperation:
     val risk: RiskLevel = RiskLevel.Destructive
 

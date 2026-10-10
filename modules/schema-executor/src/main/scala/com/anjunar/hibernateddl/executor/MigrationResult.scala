@@ -8,9 +8,9 @@ import java.sql.Connection
   * not recorded yet and did not apply, because none of their columns became required.
   */
 final case class MigrationResult(
-    revision: Long,
-    status: MigrationStatus,
-    statementCount: Int,
-    backfills: Vector[BackfillOutcome] = Vector.empty,
-    pendingBackfills: Vector[String] = Vector.empty
+  revision: Long,
+  status: MigrationStatus,
+  statementCount: Int,
+  backfills: Vector[BackfillOutcome] = Vector.empty,
+  pendingBackfills: Vector[String] = Vector.empty
 )

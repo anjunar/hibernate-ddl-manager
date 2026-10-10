@@ -12,10 +12,10 @@ import java.sql.Connection
   * for a change the executor cannot plan; that target is verified and recorded without DDL.
   */
 final case class ExecutionOptions(
-    lockTimeoutMillis: Int = 5000,
-    statementTimeoutMillis: Int = 30000,
-    allowedRisks: Set[RiskLevel] = Set(RiskLevel.Safe, RiskLevel.Locking, RiskLevel.Destructive),
-    adoptExistingSchema: Boolean = false,
-    approvals: Set[Approval] = Set.empty,
-    acceptManualMigration: Option[String] = None
+  lockTimeoutMillis: Int = 5000,
+  statementTimeoutMillis: Int = 30000,
+  allowedRisks: Set[RiskLevel] = Set(RiskLevel.Safe, RiskLevel.Locking, RiskLevel.Destructive),
+  adoptExistingSchema: Boolean = false,
+  approvals: Set[Approval] = Set.empty,
+  acceptManualMigration: Option[String] = None
 )

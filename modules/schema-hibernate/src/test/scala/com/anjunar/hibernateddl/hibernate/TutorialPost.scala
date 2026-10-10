@@ -5,21 +5,26 @@ import jakarta.persistence.{Access, AccessType, CheckConstraint, Column, Entity,
 
 import java.lang
 import java.time.Instant
-import java.util.UUID
+import java.util
 
 @Entity
 @SchemaId("d4f39c20")
 @Access(AccessType.FIELD)
-@Table(name = "blog_post", schema = "public",
+@Table(
+  name = "blog_post",
+  schema = "public",
   uniqueConstraints = Array(new UniqueConstraint(name = "uq_blog_post_slug", columnNames = Array("slug"))),
-  check = Array(new CheckConstraint(name = "ck_blog_post_publication",
-    constraint = "(status = 'DRAFT' AND published_at IS NULL) OR (status = 'PUBLISHED' AND published_at IS NOT NULL)")))
+  check = Array(new CheckConstraint(
+    name = "ck_blog_post_publication",
+    constraint = "(status = 'DRAFT' AND published_at IS NULL) OR (status = 'PUBLISHED' AND published_at IS NOT NULL)"
+  ))
+)
 class TutorialPost:
   @Id
   @GeneratedValue(strategy = GenerationType.UUID)
   @SchemaId("a2473e8b")
   @Column(nullable = false, updatable = false)
-  var id: UUID = null
+  var id: util.UUID = null
 
   @Version
   @SchemaId("dcb0681e")

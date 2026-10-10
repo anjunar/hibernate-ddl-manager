@@ -6,6 +6,8 @@ import com.anjunar.hibernateddl.executor.*
 import java.sql.{Connection, PreparedStatement, ResultSet, SQLException}
 import javax.sql.DataSource
 import scala.util.Using
+import java.sql.Types
+import scala.collection.mutable.{Set as MutableSet}
 
 /** Transactional migration for PostgreSQL 14 and newer.
   *
@@ -31,18 +33,31 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
   private val AdvisoryLockKey = 0x4844444c4d475231L
   private val HistoryColumns = Vector("revision", "previous_fingerprint", "target_fingerprint", "model", "statements")
   private val BackfillTable = "\"__hibernate_ddl\".\"backfill_history\""
-  private val BackfillColumns = Vector("backfill_id", "definition_format", "definition_checksum", "target_column", "revision",
-    "previous_fingerprint", "target_fingerprint", "result", "updated_rows")
-  private val BackfillResults = Map(BackfillResult.Executed -> "executed",
-    BackfillResult.NotRequiredOnCreation -> "not required on creation", BackfillResult.Adopted -> "adopted")
+  private val BackfillColumns = Vector(
+    "backfill_id",
+    "definition_format",
+    "definition_checksum",
+    "target_column",
+    "revision",
+    "previous_fingerprint",
+    "target_fingerprint",
+    "result",
+    "updated_rows"
+  )
+  private val BackfillResults = Map(
+    BackfillResult.Executed -> "executed",
+    BackfillResult.NotRequiredOnCreation -> "not required on creation",
+    BackfillResult.Adopted -> "adopted"
+  )
 
   override def render(
-      operations: Vector[SchemaOperation]
+    operations: Vector[SchemaOperation]
   ): Either[Vector[String], Vector[String]] = PostgreSqlDialect.render(operations)
 
   override def validate(model: SchemaModel): Vector[String] = validateModel(model)
 
-  override def nullCount(table: QualifiedName, column: SqlIdentifier): String = PostgreSqlDialect.nullCount(table, column)
+  override def nullCount(table: QualifiedName, column: SqlIdentifier): String =
+    PostgreSqlDialect.nullCount(table, column)
 
   override def renderFill(fill: NullFill): Either[Vector[String], BoundStatement] =
     PostgreSqlDialect.renderFill(fill).map(BoundStatement(_, _))
@@ -67,7 +82,8 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
     checkServer(connection, options)
     execute(connection, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
     configure(connection, options)
-    val settings = query(connection,
+    val settings = query(
+      connection,
       "SELECT pg_catalog.current_setting('transaction_read_only'), pg_catalog.current_setting('transaction_isolation')"
     )(_ => ())(row => row.getString(1) -> row.getString(2)).head
     if settings != ("on" -> "repeatable read") then
@@ -94,8 +110,9 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
     else
       val undecided = Vector.newBuilder[String]
       val tables = expected.tables.sortBy(table => qualified(table.name))
-      val differences = tables.flatMap(table => inspectTable(connection, table, expected, CheckMode.Structural(undecided))) ++
-        expected.sequences.flatMap(inspectSequence(connection, _))
+      val differences =
+        tables.flatMap(table => inspectTable(connection, table, expected, CheckMode.Structural(undecided))) ++
+          expected.sequences.flatMap(inspectSequence(connection, _))
       Inspection(differences.distinct.sorted, undecided.result().distinct.sorted)
 
   /** Read-only plan for giving Hibernate-created checks the stable names required by adoption.
@@ -106,29 +123,35 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
   def planHibernateCheckRenames(dataSource: DataSource, expected: SchemaModel): Either[Vector[String], Vector[String]] =
     val invalid = validateModel(expected)
     if invalid.nonEmpty then Left(invalid)
-    else Using.resource(dataSource.getConnection) { connection =>
-      if !connection.getAutoCommit then Left(Vector("Check-rename planning requires a non-JTA auto-commit connection."))
-      else
-        connection.setAutoCommit(false)
-        try
-          checkServer(connection, ExecutionOptions())
-          if readHistoryIfPresent(connection).isDefined then
-            Left(Vector("Check names cannot be prepared after schema history has been created."))
-          else
-            final case class Actual(name: String, validated: Boolean, definition: String, columns: Vector[String])
-            val errors = Vector.newBuilder[String]
-            val statements = Vector.newBuilder[String]
-            expected.tables.sortBy(table => qualified(table.name)).foreach { table =>
-              val display = qualified(table.name)
-              relationOid(connection, table.name) match
-                case None => errors += s"Table $display does not exist."
-                case Some(oid) =>
-                  val wanted = table.columns.flatMap(column => column.check.map { check =>
-                    (PostgreSqlDialect.checkName(column.id, check).value, Some(Vector(column.name.value)))
-                  }) ++ table.checks.map(check => (check.name.value, None))
-                  val expectedDefinitions = if wanted.nonEmpty then checkDefinitions(connection, table) else Map.empty[String, String]
-                  val actual = query(connection,
-                    """SELECT k.conname, k.convalidated, pg_catalog.pg_get_constraintdef(k.oid) AS definition,
+    else
+      Using.resource(dataSource.getConnection) { connection =>
+        if !connection.getAutoCommit then
+          Left(Vector("Check-rename planning requires a non-JTA auto-commit connection."))
+        else
+          connection.setAutoCommit(false)
+          try
+            checkServer(connection, ExecutionOptions())
+            if readHistoryIfPresent(connection).isDefined then
+              Left(Vector("Check names cannot be prepared after schema history has been created."))
+            else
+              final case class Actual(name: String, validated: Boolean, definition: String, columns: Vector[String])
+              val errors = Vector.newBuilder[String]
+              val statements = Vector.newBuilder[String]
+              expected.tables.sortBy(table => qualified(table.name)).foreach { table =>
+                val display = qualified(table.name)
+                relationOid(connection, table.name) match
+                  case None      => errors += s"Table $display does not exist."
+                  case Some(oid) =>
+                    val wanted = table.columns.flatMap(column =>
+                      column.check.map { check =>
+                        (PostgreSqlDialect.checkName(column.id, check).value, Some(Vector(column.name.value)))
+                      }
+                    ) ++ table.checks.map(check => (check.name.value, None))
+                    val expectedDefinitions =
+                      if wanted.nonEmpty then checkDefinitions(connection, table) else Map.empty[String, String]
+                    val actual = query(
+                      connection,
+                      """SELECT k.conname, k.convalidated, pg_catalog.pg_get_constraintdef(k.oid) AS definition,
                       |       ARRAY(SELECT CAST(a.attname AS pg_catalog.text)
                       |             FROM pg_catalog.unnest(k.conkey) AS u(attnum)
                       |             JOIN pg_catalog.pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = u.attnum
@@ -136,38 +159,48 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
                       |FROM pg_catalog.pg_constraint k
                       |WHERE k.conrelid = CAST(? AS pg_catalog.oid) AND k.contype = 'c'
                       |ORDER BY k.conname""".stripMargin
-                  )(_.setLong(1, oid)) { row =>
-                    Actual(row.getString("conname"), row.getBoolean("convalidated"),
-                      row.getString("definition"), strings(row, "columns"))
-                  }
-                  val claimed = scala.collection.mutable.Set.empty[String]
-                  wanted.foreach { (name, columns) =>
-                    val definition = expectedDefinitions.get(name)
-                    if definition.isEmpty then errors += s"No PostgreSQL definition for check ${quoted(name)} of $display."
-                    else
-                      val sameName = actual.find(_.name == name)
-                      val candidates = sameName.toVector ++ actual.filter(check =>
-                        check.name != name && !claimed(check.name) && check.validated &&
-                          check.definition == definition.get && columns.forall(_ == check.columns))
-                      candidates match
-                        case Vector(check) if check.validated && check.definition == definition.get &&
-                            columns.forall(_ == check.columns) =>
-                          claimed += check.name
-                          if check.name != name then
-                            statements += s"ALTER TABLE $display RENAME CONSTRAINT ${quoted(check.name)} TO ${quoted(name)}"
-                        case Vector() => errors += s"No equivalent check for ${quoted(name)} of $display."
-                        case Vector(check) => errors += s"Check ${quoted(check.name)} of $display differs or is not validated."
-                        case _ => errors += s"More than one check matches ${quoted(name)} of $display."
-                  }
-                  actual.filterNot(check => claimed(check.name)).foreach(check =>
-                    errors += s"Unexpected check ${quoted(check.name)} of $display.")
-            }
-            val found = errors.result().distinct.sorted
-            if found.nonEmpty then Left(found) else Right(statements.result())
-        finally
-          connection.rollback()
-          connection.setAutoCommit(true)
-    }
+                    )(_.setLong(1, oid)) { row =>
+                      Actual(
+                        row.getString("conname"),
+                        row.getBoolean("convalidated"),
+                        row.getString("definition"),
+                        strings(row, "columns")
+                      )
+                    }
+                    val claimed = MutableSet.empty[String]
+                    wanted.foreach { (name, columns) =>
+                      val definition = expectedDefinitions.get(name)
+                      if definition.isEmpty then
+                        errors += s"No PostgreSQL definition for check ${quoted(name)} of $display."
+                      else
+                        val sameName = actual.find(_.name == name)
+                        val candidates = sameName.toVector ++ actual.filter(check =>
+                          check.name != name && !claimed(check.name) && check.validated &&
+                            check.definition == definition.get && columns.forall(_ == check.columns)
+                        )
+                        candidates match
+                          case Vector(check)
+                              if check.validated && check.definition == definition.get &&
+                                columns.forall(_ == check.columns) =>
+                            claimed += check.name
+                            if check.name != name then
+                              statements +=
+                                s"ALTER TABLE $display RENAME CONSTRAINT ${quoted(check.name)} TO ${quoted(name)}"
+                          case Vector()      => errors += s"No equivalent check for ${quoted(name)} of $display."
+                          case Vector(check) => errors +=
+                              s"Check ${quoted(check.name)} of $display differs or is not validated."
+                          case _ => errors += s"More than one check matches ${quoted(name)} of $display."
+                    }
+                    actual.filterNot(check => claimed(check.name)).foreach(check =>
+                      errors += s"Unexpected check ${quoted(check.name)} of $display."
+                    )
+              }
+              val found = errors.result().distinct.sorted
+              if found.nonEmpty then Left(found) else Right(statements.result())
+          finally
+            connection.rollback()
+            connection.setAutoCommit(true)
+      }
 
   override def dataCheck(connection: Connection, query: DataQuery, count: Boolean): Long =
     val (sql, parameters) = PostgreSqlDialect.renderDataCheck(query, count)
@@ -181,7 +214,8 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
 
   /** PostgreSQL's estimate from the last VACUUM or ANALYZE; -1 means never estimated. */
   override def estimateRows(connection: Connection, table: QualifiedName): Option[Long] =
-    query(connection,
+    query(
+      connection,
       """SELECT CAST(c.reltuples AS pg_catalog.int8) FROM pg_catalog.pg_class c
         |JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ? AND c.relname = ?""".stripMargin
     ) { statement =>
@@ -191,7 +225,8 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
 
   /** The size of the table with its indexes and TOAST data, from the catalog. */
   override def tableSize(connection: Connection, table: QualifiedName): Option[Long] =
-    query(connection,
+    query(
+      connection,
       """SELECT pg_catalog.pg_total_relation_size(c.oid) FROM pg_catalog.pg_class c
         |JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ? AND c.relname = ?""".stripMargin
     ) { statement =>
@@ -206,7 +241,8 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
     * server's message language.
     */
   override def typeChangeBlockers(connection: Connection, table: QualifiedName, column: SqlIdentifier): Vector[String] =
-    query(connection,
+    query(
+      connection,
       """SELECT DISTINCT CASE d.classid
         |  WHEN CAST('pg_catalog.pg_rewrite' AS pg_catalog.regclass) THEN
         |    (SELECT CASE WHEN r.rulename <> '_RETURN' THEN 'rule ' || pg_catalog.quote_ident(r.rulename) || ' on '
@@ -248,43 +284,65 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
     * statement uses the name the catalog shows, which later renames do not change.
     */
   override def bindDrop(
-      connection: Connection,
-      operation: SchemaOperation,
-      table: QualifiedName,
-      columns: Vector[SqlIdentifier]
+    connection: Connection,
+    operation: SchemaOperation,
+    table: QualifiedName,
+    columns: Vector[SqlIdentifier]
   ): Either[Vector[String], String] =
     val display = qualified(table)
-    def bindOne[A](kind: String, shown: String, found: Vector[A], name: A => String, index: A => Long,
-        features: A => Vector[String])(sql: A => String): Either[Vector[String], String] =
+    def bindOne[A](
+      kind: String,
+      shown: String,
+      found: Vector[A],
+      name: A => String,
+      index: A => Long,
+      features: A => Vector[String]
+    )(sql: A => String): Either[Vector[String], String] =
       found match
-        case Vector() => Left(Vector(s"Database drift: $kind $shown of $display, which the target drops, does not exist."))
+        case Vector() =>
+          Left(Vector(s"Database drift: $kind $shown of $display, which the target drops, does not exist."))
         case Vector(one) if features(one).nonEmpty =>
           Left(Vector(s"${kind.capitalize} ${quoted(name(one))} of $display has unsupported " +
             s"${features(one).mkString(", ")}; it is not dropped."))
         case Vector(one) =>
           val dependents = referencingKeys(connection, index(one))
-          if dependents.nonEmpty then Left(Vector(s"${kind.capitalize} ${quoted(name(one))} of $display cannot be dropped " +
-            s"while ${dependents.mkString(", ")} depend${if dependents.size == 1 then "s" else ""} on it; the migration " +
-            "never uses CASCADE."))
+          if dependents.nonEmpty then
+            Left(Vector(s"${kind.capitalize} ${quoted(name(one))} of $display cannot be dropped " +
+              s"while ${dependents.mkString(", ")} depend${
+                  if dependents.size == 1 then "s" else ""
+                } on it; the migration " +
+              "never uses CASCADE."))
           else Right(sql(one))
         case several => Left(Vector(s"${kind.capitalize} $shown of $display matches ${several.size} objects " +
-          s"(${several.map(one => quoted(name(one))).mkString(", ")}); refusing to choose one."))
+            s"(${several.map(one => quoted(name(one))).mkString(", ")}); refusing to choose one."))
     relationOid(connection, table) match
-      case None => Left(Vector(s"Database drift: table $display does not exist."))
+      case None      => Left(Vector(s"Database drift: table $display does not exist."))
       case Some(oid) => operation match
-        case SchemaOperation.DropIndex(ref, _, _) =>
-          val wanted = columns.map(_.value).zip(ref.columns.map(_.descending))
-          bindOne("index", showIndex(wanted), plainIndexes(connection, oid).filter(_.columns == wanted),
-            _.name, _.oid, _.features)(index => PostgreSqlDialect.renderDropIndex(table.schema.get, SqlIdentifier(index.name)))
-        case SchemaOperation.DropUniqueKey(_, target, _) =>
-          val wanted = columns.map(_.value)
-          bindOne("unique key", wanted.map(quoted).mkString("(", ", ", ")"),
-            uniqueConstraints(connection, oid).filter(_.columns == wanted), _.name, _.index, _.features
-          )(key => PostgreSqlDialect.renderDropConstraint(target, SqlIdentifier(key.name)))
-        case other => Left(Vector(s"$other names no database object to bind."))
+          case SchemaOperation.DropIndex(ref, _, _) =>
+            val wanted = columns.map(_.value).zip(ref.columns.map(_.descending))
+            bindOne(
+              "index",
+              showIndex(wanted),
+              plainIndexes(connection, oid).filter(_.columns == wanted),
+              _.name,
+              _.oid,
+              _.features
+            )(index => PostgreSqlDialect.renderDropIndex(table.schema.get, SqlIdentifier(index.name)))
+          case SchemaOperation.DropUniqueKey(_, target, _) =>
+            val wanted = columns.map(_.value)
+            bindOne(
+              "unique key",
+              wanted.map(quoted).mkString("(", ", ", ")"),
+              uniqueConstraints(connection, oid).filter(_.columns == wanted),
+              _.name,
+              _.index,
+              _.features
+            )(key => PostgreSqlDialect.renderDropConstraint(target, SqlIdentifier(key.name)))
+          case other => Left(Vector(s"$other names no database object to bind."))
 
   private def relationOid(connection: Connection, table: QualifiedName): Option[Long] =
-    query(connection,
+    query(
+      connection,
       """SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
         |WHERE n.nspname = ? AND c.relname = ?""".stripMargin
     ) { statement =>
@@ -294,7 +352,8 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
 
   /** The foreign keys, of any table, that reference through the given index. */
   private def referencingKeys(connection: Connection, index: Long): Vector[String] =
-    query(connection,
+    query(
+      connection,
       """SELECT k.conname, n.nspname, c.relname FROM pg_catalog.pg_constraint k
         |JOIN pg_catalog.pg_class c ON c.oid = k.conrelid JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
         |WHERE k.contype = 'f' AND k.conindid = CAST(? AS pg_catalog.oid)
@@ -307,7 +366,8 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
     * mistaken for its absence.
     */
   private def relationExists(connection: Connection, schema: String, name: String): Boolean =
-    query(connection,
+    query(
+      connection,
       """SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
         |WHERE n.nspname = ? AND c.relname = ?""".stripMargin
     ) { statement =>
@@ -320,16 +380,17 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
     if metadata.getDatabaseProductName != "PostgreSQL" || metadata.getDatabaseMajorVersion < 14 then
       throw new SQLException("This migration backend requires PostgreSQL 14 or newer.")
     if !metadata.supportsTransactions() ||
-        !metadata.supportsDataDefinitionAndDataManipulationTransactions() ||
-        metadata.dataDefinitionCausesTransactionCommit() ||
-        metadata.dataDefinitionIgnoredInTransactions()
+      !metadata.supportsDataDefinitionAndDataManipulationTransactions() ||
+      metadata.dataDefinitionCausesTransactionCommit() ||
+      metadata.dataDefinitionIgnoredInTransactions()
     then throw new SQLException("The connection does not support transactional PostgreSQL DDL.")
     if options.lockTimeoutMillis <= 0 || options.statementTimeoutMillis <= 0 then
       throw new SQLException("Migration lock and statement timeouts must be positive.")
 
   /** Timeouts, search path and string syntax for this transaction only. */
   private def configure(connection: Connection, options: ExecutionOptions): Unit =
-    query(connection,
+    query(
+      connection,
       "SELECT pg_catalog.set_config('lock_timeout', ?, true), " +
         "pg_catalog.set_config('statement_timeout', ?, true), " +
         "pg_catalog.set_config('search_path', 'pg_catalog', true), " +
@@ -339,7 +400,8 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
       statement.setString(1, s"${options.lockTimeoutMillis}ms")
       statement.setString(2, s"${options.statementTimeoutMillis}ms")
     }(_ => ())
-    val identifierLimit = query(connection,
+    val identifierLimit = query(
+      connection,
       "SELECT pg_catalog.current_setting('max_identifier_length')"
     )(_ => ())(_.getInt(1)).head
     if identifierLimit != 63 then
@@ -347,7 +409,8 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
 
   override def initializeHistory(connection: Connection): Unit =
     execute(connection, "CREATE SCHEMA IF NOT EXISTS \"__hibernate_ddl\"")
-    execute(connection,
+    execute(
+      connection,
       s"""CREATE TABLE IF NOT EXISTS $HistoryTable (
          |  revision BIGINT PRIMARY KEY CHECK (revision > 0),
          |  previous_fingerprint CHAR(64) NOT NULL,
@@ -359,7 +422,8 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
     )
     checkLayout(connection, HistoryTable, HistoryColumns :+ "applied_at")
     // Each backfill is recorded once, by the migration of one schema revision.
-    execute(connection,
+    execute(
+      connection,
       s"""CREATE TABLE IF NOT EXISTS $BackfillTable (
          |  backfill_id TEXT PRIMARY KEY,
          |  definition_format INTEGER NOT NULL,
@@ -380,7 +444,8 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
     */
   private def checkLayout(connection: Connection, table: String, expected: Vector[String]): Unit =
     val name = table.split("\\.").last.drop(1).dropRight(1)
-    val columns = query(connection,
+    val columns = query(
+      connection,
       """SELECT a.attname
         |FROM pg_catalog.pg_attribute a
         |JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
@@ -396,17 +461,24 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
         s"expected ${expected.mkString(", ")}. It was created by another version of Hibernate DDL Manager.")
 
   override def readHistory(connection: Connection): Vector[HistoryEntry] =
-    query(connection,
+    query(
+      connection,
       s"SELECT revision, previous_fingerprint, target_fingerprint, CAST(model AS pg_catalog.text) AS model, statements " +
         s"FROM $HistoryTable ORDER BY revision"
     )(_ => ()) { row =>
-      HistoryEntry(row.getLong("revision"), row.getString("previous_fingerprint"),
-        row.getString("target_fingerprint"), row.getString("model"), strings(row, "statements"))
+      HistoryEntry(
+        row.getLong("revision"),
+        row.getString("previous_fingerprint"),
+        row.getString("target_fingerprint"),
+        row.getString("model"),
+        strings(row, "statements")
+      )
     }
 
   override def existingRelations(connection: Connection, model: SchemaModel): Vector[QualifiedName] =
     (model.tables.map(_.name) ++ model.sequences.map(_.name)).filter { name =>
-      query(connection,
+      query(
+        connection,
         """SELECT 1
           |FROM pg_catalog.pg_class c
           |JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -418,15 +490,24 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
     }
 
   override def readBackfills(connection: Connection): Vector[BackfillRecord] =
-    query(connection, s"SELECT ${BackfillColumns.mkString(", ")} FROM $BackfillTable ORDER BY revision, backfill_id")(_ => ()) {
+    query(connection, s"SELECT ${BackfillColumns.mkString(", ")} FROM $BackfillTable ORDER BY revision, backfill_id")(
+      _ => ()
+    ) {
       row =>
         val result = row.getString("result")
-        BackfillRecord(row.getString("backfill_id"), row.getInt("definition_format"), row.getString("definition_checksum"),
-          SchemaId(row.getString("target_column")), row.getLong("revision"), row.getString("previous_fingerprint"),
+        BackfillRecord(
+          row.getString("backfill_id"),
+          row.getInt("definition_format"),
+          row.getString("definition_checksum"),
+          SchemaId(row.getString("target_column")),
+          row.getLong("revision"),
+          row.getString("previous_fingerprint"),
           row.getString("target_fingerprint"),
           BackfillResults.collectFirst { case (value, name) if name == result => value }.getOrElse(
-            throw new SQLException(s"Backfill history has the unknown result '$result'.")),
-          Option(row.getObject("updated_rows")).map(_ => row.getLong("updated_rows")))
+            throw new SQLException(s"Backfill history has the unknown result '$result'.")
+          ),
+          Option(row.getObject("updated_rows")).map(_ => row.getLong("updated_rows"))
+        )
     }
 
   override def recordBackfill(connection: Connection, record: BackfillRecord): Unit =
@@ -443,7 +524,7 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
       statement.setString(8, BackfillResults(record.result))
       record.updatedRows match
         case Some(rows) => statement.setLong(9, rows)
-        case None => statement.setNull(9, java.sql.Types.BIGINT)
+        case None       => statement.setNull(9, Types.BIGINT)
       if statement.executeUpdate() != 1 then
         throw new SQLException("Recording the backfill did not insert exactly one history entry.")
     }
@@ -474,7 +555,7 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
       // conflicts only with ACCESS EXCLUSIVE, which most DDL takes.
       val mode = lock match
         case TableLock.Exclusive => "ACCESS EXCLUSIVE"
-        case TableLock.Shared => "ACCESS SHARE"
+        case TableLock.Shared    => "ACCESS SHARE"
       tables.foreach { table =>
         execute(connection, s"LOCK TABLE ONLY ${qualified(table.name)} IN $mode MODE")
       }
@@ -488,12 +569,15 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
     }
     // The history stores models as jsonb, which cannot hold NUL.
     val idErrors = (model.tables.flatMap(table => table.id +: table.columns.map(_.id)) ++ model.sequences.map(_.id))
-      .filter(_.value.contains('\u0000')).map(id => s"Stable ID '${id.value.replace('\u0000', '?')}' must not contain NUL.")
+      .filter(_.value.contains('\u0000')).map(id =>
+        s"Stable ID '${id.value.replace('\u0000', '?')}' must not contain NUL."
+      )
     val sequenceErrors = model.sequences.flatMap { sequence =>
       PostgreSqlDialect.render(Vector(SchemaOperation.CreateSequence(sequence))).left.toOption.toVector.flatten
         .map(message => s"Sequence '${sequence.id.value}': $message")
     }
-    val relations = model.tables.map(t => ("Table", t.id, t.name)) ++ model.sequences.map(s => ("Sequence", s.id, s.name))
+    val relations = model.tables.map(t => ("Table", t.id, t.name)) ++
+      model.sequences.map(s => ("Sequence", s.id, s.name))
     val namespaceErrors = relations.flatMap { (kind, id, name) =>
       Vector(
         Option.when(name.schema.isEmpty)(s"$kind '${id.value}' must have an explicit schema for execution."),
@@ -509,7 +593,8 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
     */
   private def inspectSequence(connection: Connection, expected: SequenceModel): Vector[String] =
     val display = qualified(expected.name)
-    query(connection,
+    query(
+      connection,
       """SELECT c.relkind, CAST(CAST(s.seqtypid AS pg_catalog.regtype) AS pg_catalog.text) AS type_name,
         |       s.seqstart, s.seqincrement, s.seqmin, s.seqmax, s.seqcache, s.seqcycle,
         |       EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
@@ -546,9 +631,15 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
     case Probe
     case Structural(undecided: collection.mutable.Growable[String])
 
-  private def inspectTable(connection: Connection, expected: TableModel, model: SchemaModel, mode: CheckMode): Vector[String] =
+  private def inspectTable(
+    connection: Connection,
+    expected: TableModel,
+    model: SchemaModel,
+    mode: CheckMode
+  ): Vector[String] =
     val display = qualified(expected.name)
-    val relations = query(connection,
+    val relations = query(
+      connection,
       """SELECT c.oid, c.relkind, c.relispartition, c.relpersistence, c.reloftype,
         |       c.relrowsecurity, c.relforcerowsecurity,
         |       EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i
@@ -587,7 +678,7 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
       (row.getLong("oid"), features)
     }
     relations.headOption match
-      case None => Vector(s"Database drift: table $display does not exist.")
+      case None                  => Vector(s"Database drift: table $display does not exist.")
       case Some((oid, features)) =>
         val errors = Vector.newBuilder[String]
         features.foreach(feature => errors += s"Table $display has unsupported $feature.")
@@ -605,11 +696,14 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
           actualByName.get(column.name.value).foreach { databaseColumn =>
             val columnDisplay = s"$display.${quoted(column.name.value)}"
             if !databaseColumn.dataType.contains(column.dataType) then
-              errors += s"Database drift: column $columnDisplay type is ${databaseColumn.typeDescription}; expected ${column.dataType}."
+              errors +=
+                s"Database drift: column $columnDisplay type is ${databaseColumn.typeDescription}; expected ${column.dataType}."
             if databaseColumn.nullable != column.nullable then
-              errors += s"Database drift: column $columnDisplay nullable=${databaseColumn.nullable}; expected ${column.nullable}."
+              errors +=
+                s"Database drift: column $columnDisplay nullable=${databaseColumn.nullable}; expected ${column.nullable}."
             if (databaseColumn.identity == "d") != column.identity then
-              errors += s"Database drift: column $columnDisplay identity=${databaseColumn.identity == "d"}; expected ${column.identity}."
+              errors +=
+                s"Database drift: column $columnDisplay identity=${databaseColumn.identity == "d"}; expected ${column.identity}."
             databaseColumn.features.foreach { feature =>
               errors += s"Column $columnDisplay has unsupported $feature."
             }
@@ -632,16 +726,18 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
     * increment 1, minimum 1, the type's maximum, cache 1 and no cycling.
     */
   private def compareIdentitySequences(
-      connection: Connection,
-      oid: Long,
-      display: String,
-      expected: TableModel,
-      actual: Map[String, DatabaseColumn]
+    connection: Connection,
+    oid: Long,
+    display: String,
+    expected: TableModel,
+    actual: Map[String, DatabaseColumn]
   ): Vector[String] =
-    val identities = expected.columns.filter(column => column.identity && actual.get(column.name.value).exists(_.identity == "d"))
+    val identities =
+      expected.columns.filter(column => column.identity && actual.get(column.name.value).exists(_.identity == "d"))
     if identities.isEmpty then Vector.empty
     else
-      val sequences = query(connection,
+      val sequences = query(
+        connection,
         """SELECT a.attname, CAST(CAST(s.seqtypid AS pg_catalog.regtype) AS pg_catalog.text) AS type_name,
           |       s.seqstart, s.seqincrement, s.seqmin, s.seqmax, s.seqcache, s.seqcycle
           |FROM pg_catalog.pg_depend d
@@ -652,34 +748,53 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
           |  AND d.refobjid = CAST(? AS pg_catalog.oid) AND d.deptype = 'i'""".stripMargin
       )(_.setLong(1, oid)) { row =>
         row.getString("attname") -> Vector(
-          "type" -> row.getString("type_name"), "start" -> row.getLong("seqstart"),
-          "increment" -> row.getLong("seqincrement"), "minimum" -> row.getLong("seqmin"),
-          "maximum" -> row.getLong("seqmax"), "cache" -> row.getLong("seqcache"), "cycling" -> row.getBoolean("seqcycle"))
+          "type" -> row.getString("type_name"),
+          "start" -> row.getLong("seqstart"),
+          "increment" -> row.getLong("seqincrement"),
+          "minimum" -> row.getLong("seqmin"),
+          "maximum" -> row.getLong("seqmax"),
+          "cache" -> row.getLong("seqcache"),
+          "cycling" -> row.getBoolean("seqcycle")
+        )
       }.toMap
       identities.flatMap { column =>
         val columnDisplay = s"$display.${quoted(column.name.value)}"
         val (typeName, maximum) = column.dataType match
           case SqlType.SmallInt => ("smallint", Short.MaxValue.toLong)
-          case SqlType.Integer => ("integer", Int.MaxValue.toLong)
-          case _ => ("bigint", Long.MaxValue)
-        val wanted = Vector("type" -> typeName, "start" -> 1L, "increment" -> 1L, "minimum" -> 1L,
-          "maximum" -> maximum, "cache" -> 1L, "cycling" -> false)
+          case SqlType.Integer  => ("integer", Int.MaxValue.toLong)
+          case _                => ("bigint", Long.MaxValue)
+        val wanted = Vector(
+          "type" -> typeName,
+          "start" -> 1L,
+          "increment" -> 1L,
+          "minimum" -> 1L,
+          "maximum" -> maximum,
+          "cache" -> 1L,
+          "cycling" -> false
+        )
         sequences.get(column.name.value) match
-          case None => Vector(s"Database drift: identity column $columnDisplay has no identity sequence.")
+          case None               => Vector(s"Database drift: identity column $columnDisplay has no identity sequence.")
           case Some(actualValues) =>
-            wanted.zip(actualValues).collect { case ((attribute, value), (_, found)) if value != found =>
-              s"Database drift: identity column $columnDisplay generates with $attribute $found; expected $value."
+            wanted.zip(actualValues).collect {
+              case ((attribute, value), (_, found)) if value != found =>
+                s"Database drift: identity column $columnDisplay generates with $attribute $found; expected $value."
             }
       }
 
   /** A unique constraint as the catalog shows it; `index` is the oid of the index it owns. */
-  private final case class DatabaseUniqueKey(name: String, index: Long, columns: Vector[String], features: Vector[String])
+  private final case class DatabaseUniqueKey(
+    name: String,
+    index: Long,
+    columns: Vector[String],
+    features: Vector[String]
+  )
 
   private def uniqueConstraints(connection: Connection, oid: Long): Vector[DatabaseUniqueKey] =
     // PostgreSQL 15 added NULLS NOT DISTINCT; before, NULLs were always distinct.
     val nullsNotDistinct =
       if connection.getMetaData.getDatabaseMajorVersion >= 15 then "i.indnullsnotdistinct" else "false"
-    query(connection,
+    query(
+      connection,
       s"""SELECT k.conname, k.conindid, k.condeferrable, i.indnatts <> i.indnkeyatts AS has_include,
          |       $nullsNotDistinct AS nulls_not_distinct,
          |       ARRAY(SELECT CAST(a.attname AS pg_catalog.text)
@@ -700,7 +815,12 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
     }
 
   /** Unique constraints match by their ordered columns, never by constraint name. */
-  private def compareUniqueKeys(connection: Connection, oid: Long, display: String, expected: TableModel): Vector[String] =
+  private def compareUniqueKeys(
+    connection: Connection,
+    oid: Long,
+    display: String,
+    expected: TableModel
+  ): Vector[String] =
     def show(columns: Vector[String]) = columns.map(quoted).mkString("(", ", ", ")")
     val expectedKeys = expected.uniqueKeys.map(_.columns.map(id => expected.columns.find(_.id == id).get.name.value))
     val actualKeys = uniqueConstraints(connection, oid)
@@ -720,11 +840,11 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
     * structurally instead.
     */
   private def compareChecks(
-      connection: Connection,
-      oid: Long,
-      display: String,
-      expected: TableModel,
-      mode: CheckMode
+    connection: Connection,
+    oid: Long,
+    display: String,
+    expected: TableModel,
+    mode: CheckMode
   ): Vector[String] =
     val checked = expected.columns.filter(_.check.nonEmpty)
     val byName = checked.map(column => PostgreSqlDialect.checkName(column.id, column.check.get).value -> column).toMap
@@ -732,8 +852,9 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
     val tableChecks = expected.checks.map(check => check.name.value -> check).toMap
     val expectedDefinitions = mode match
       case CheckMode.Probe if checked.nonEmpty || tableChecks.nonEmpty => checkDefinitions(connection, expected)
-      case _ => Map.empty[String, String]
-    val actualChecks = query(connection,
+      case _                                                           => Map.empty[String, String]
+    val actualChecks = query(
+      connection,
       """SELECT k.conname, k.convalidated, pg_catalog.pg_get_constraintdef(k.oid) AS definition,
         |       ARRAY(SELECT CAST(a.attname AS pg_catalog.text)
         |             FROM pg_catalog.unnest(k.conkey) AS u(attnum)
@@ -747,40 +868,44 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
     }
     val actualNames = actualChecks.map(_._1).toSet
     actualChecks.flatMap { (name, validated, definition, columns) =>
-      Option.when(!validated)(s"Check constraint ${quoted(name)} of $display has unsupported NOT VALID state.").toVector ++
+      Option.when(!validated)(
+        s"Check constraint ${quoted(name)} of $display has unsupported NOT VALID state."
+      ).toVector ++
         (tableChecks.get(name) match
           case Some(_) if !validated => Vector.empty
-          case Some(_) => mode match
-            case CheckMode.Probe if !expectedDefinitions.get(name).contains(definition) =>
-              Vector(s"Database drift: check constraint ${quoted(name)} of $display is $definition; " +
-                s"expected ${expectedDefinitions.getOrElse(name, "a definition PostgreSQL did not produce")}.")
-            case CheckMode.Probe => Vector.empty
-            case CheckMode.Structural(undecided) =>
-              undecided += s"Named table check ${quoted(name)} of $display needs PostgreSQL normalization on a probe table; " +
-                "the read-only preview cannot verify its SQL predicate."
-              Vector.empty
+          case Some(_)               => mode match
+              case CheckMode.Probe if !expectedDefinitions.get(name).contains(definition) =>
+                Vector(s"Database drift: check constraint ${quoted(name)} of $display is $definition; " +
+                  s"expected ${expectedDefinitions.getOrElse(name, "a definition PostgreSQL did not produce")}.")
+              case CheckMode.Probe                 => Vector.empty
+              case CheckMode.Structural(undecided) =>
+                undecided +=
+                  s"Named table check ${quoted(name)} of $display needs PostgreSQL normalization on a probe table; " +
+                    "the read-only preview cannot verify its SQL predicate."
+                Vector.empty
           case None => expectedChecks.get(name) match
-          case None => Vector(s"Database drift: unexpected check constraint ${quoted(name)} in $display.")
-          case Some(column) if columns != Vector(column) =>
-            Vector(s"Database drift: check constraint ${quoted(name)} of $display covers " +
-              s"${columns.map(quoted).mkString("(", ", ", ")")}; expected (${quoted(column)}).")
-          case Some(_) if !validated => Vector.empty
-          case Some(_) => mode match
-            case CheckMode.Probe if !expectedDefinitions.get(name).contains(definition) =>
-              Vector(s"Database drift: check constraint ${quoted(name)} of $display is $definition; " +
-                s"expected ${expectedDefinitions.getOrElse(name, "a definition PostgreSQL did not produce")}.")
-            case CheckMode.Probe => Vector.empty
-            case CheckMode.Structural(undecided) =>
-              val column = byName(name)
-              PostgreSqlCheckDefinitions.compare(definition, column, column.check.get) match
-                case PostgreSqlCheckDefinitions.Comparison.Equal => Vector.empty
-                case PostgreSqlCheckDefinitions.Comparison.Different(_) =>
-                  Vector(s"Database drift: check constraint ${quoted(name)} of $display is $definition; " +
-                    s"expected ${column.check.get}.")
-                case PostgreSqlCheckDefinitions.Comparison.Undecidable =>
-                  undecided += s"Check constraint ${quoted(name)} of $display is $definition, which cannot be compared " +
-                    s"with ${column.check.get} without a probe table."
-                  Vector.empty)
+              case None => Vector(s"Database drift: unexpected check constraint ${quoted(name)} in $display.")
+              case Some(column) if columns != Vector(column) =>
+                Vector(s"Database drift: check constraint ${quoted(name)} of $display covers " +
+                  s"${columns.map(quoted).mkString("(", ", ", ")")}; expected (${quoted(column)}).")
+              case Some(_) if !validated => Vector.empty
+              case Some(_)               => mode match
+                  case CheckMode.Probe if !expectedDefinitions.get(name).contains(definition) =>
+                    Vector(s"Database drift: check constraint ${quoted(name)} of $display is $definition; " +
+                      s"expected ${expectedDefinitions.getOrElse(name, "a definition PostgreSQL did not produce")}.")
+                  case CheckMode.Probe                 => Vector.empty
+                  case CheckMode.Structural(undecided) =>
+                    val column = byName(name)
+                    PostgreSqlCheckDefinitions.compare(definition, column, column.check.get) match
+                      case PostgreSqlCheckDefinitions.Comparison.Equal        => Vector.empty
+                      case PostgreSqlCheckDefinitions.Comparison.Different(_) =>
+                        Vector(s"Database drift: check constraint ${quoted(name)} of $display is $definition; " +
+                          s"expected ${column.check.get}.")
+                      case PostgreSqlCheckDefinitions.Comparison.Undecidable =>
+                        undecided +=
+                          s"Check constraint ${quoted(name)} of $display is $definition, which cannot be compared " +
+                            s"with ${column.check.get} without a probe table."
+                        Vector.empty)
     } ++ expectedChecks.toVector.sorted.filterNot((name, _) => actualNames.contains(name)).map { (name, column) =>
       s"Database drift: check constraint ${quoted(name)} on column ${quoted(column)} is missing from $display."
     } ++ tableChecks.keys.toVector.sorted.filterNot(actualNames.contains).map { name =>
@@ -794,7 +919,8 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
     val probe = SqlIdentifier("hibernate_ddl_check_probe")
     execute(connection, PostgreSqlDialect.checkProbe(probe, model))
     try
-      query(connection,
+      query(
+        connection,
         """SELECT k.conname, pg_catalog.pg_get_constraintdef(k.oid) AS definition
           |FROM pg_catalog.pg_constraint k
           |WHERE k.conrelid = pg_catalog.to_regclass('pg_temp.hibernate_ddl_check_probe') AND k.contype = 'c'""".stripMargin
@@ -805,10 +931,16 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
     * primary key nor to a unique constraint, with each column's direction and what the model
     * cannot represent.
     */
-  private final case class DatabaseIndex(name: String, oid: Long, columns: Vector[(String, Boolean)], features: Vector[String])
+  private final case class DatabaseIndex(
+    name: String,
+    oid: Long,
+    columns: Vector[(String, Boolean)],
+    features: Vector[String]
+  )
 
   private def plainIndexes(connection: Connection, oid: Long): Vector[DatabaseIndex] =
-    query(connection,
+    query(
+      connection,
       """SELECT ic.relname AS index_name, i.indexrelid, i.indisunique, i.indisvalid AND i.indisready AS usable,
         |       i.indpred IS NOT NULL AS partial, i.indexprs IS NOT NULL AS expressions,
         |       i.indnatts <> i.indnkeyatts AS has_include, am.amname,
@@ -852,8 +984,12 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
         Option.when(row.getBoolean("custom_collation"))("collation"),
         Option.when(options.exists(option => option != 0 && option != 3))("NULLS ordering")
       ).flatten
-      DatabaseIndex(row.getString("index_name"), row.getLong("indexrelid"),
-        strings(row, "columns").zip(options.map(option => (option & 1) == 1)), features)
+      DatabaseIndex(
+        row.getString("index_name"),
+        row.getLong("indexrelid"),
+        strings(row, "columns").zip(options.map(option => (option & 1) == 1)),
+        features
+      )
     }
 
   private def showIndex(columns: Vector[(String, Boolean)]): String =
@@ -881,17 +1017,21 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
     * referencing this table must come from modeled tables, whose own check covers them.
     */
   private def compareForeignKeys(
-      connection: Connection,
-      oid: Long,
-      display: String,
-      expected: TableModel,
-      model: SchemaModel
+    connection: Connection,
+    oid: Long,
+    display: String,
+    expected: TableModel,
+    model: SchemaModel
   ): Vector[String] =
     def names(table: TableModel, ids: Vector[SchemaId]) = ids.map(id => table.columns.find(_.id == id).get.name.value)
     val expectedKeys = expected.foreignKeys.map { key =>
       val referenced = model.tables.find(_.id == key.referencedTable).get
-      ForeignKeyShape(names(expected, key.columns), qualified(referenced.name),
-        names(referenced, key.referencedColumns), key.onDeleteCascade)
+      ForeignKeyShape(
+        names(expected, key.columns),
+        qualified(referenced.name),
+        names(referenced, key.referencedColumns),
+        key.onDeleteCascade
+      )
     }
     val actualKeys = inspectForeignKeys(connection, oid)
     val modeledTables = model.tables.map(table => qualified(table.name)).toSet
@@ -905,8 +1045,12 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
       s"Table $display is referenced by a foreign key of unmodeled table $referencing."
     }
 
-  private final case class ForeignKeyShape(columns: Vector[String], referencedTable: String,
-      referencedColumns: Vector[String], onDeleteCascade: Boolean):
+  private final case class ForeignKeyShape(
+    columns: Vector[String],
+    referencedTable: String,
+    referencedColumns: Vector[String],
+    onDeleteCascade: Boolean
+  ):
     def show: String =
       s"${columns.map(quoted).mkString("(", ", ", ")")} REFERENCES $referencedTable " +
         referencedColumns.map(quoted).mkString("(", ", ", ")") +
@@ -915,7 +1059,8 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
   private final case class DatabaseForeignKey(name: String, shape: ForeignKeyShape, features: Vector[String])
 
   private def inspectForeignKeys(connection: Connection, oid: Long): Vector[DatabaseForeignKey] =
-    query(connection,
+    query(
+      connection,
       """SELECT k.conname, k.confupdtype, k.confdeltype, k.confmatchtype, k.condeferrable, k.convalidated,
         |       n.nspname AS referenced_schema, r.relname AS referenced_table,
         |       ARRAY(SELECT CAST(a.attname AS pg_catalog.text)
@@ -940,13 +1085,21 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
         Option.when(!row.getBoolean("convalidated"))("NOT VALID state")
       ).flatten
       val referenced = quoted(row.getString("referenced_schema")) + "." + quoted(row.getString("referenced_table"))
-      DatabaseForeignKey(row.getString("conname"),
-        ForeignKeyShape(strings(row, "columns"), referenced, strings(row, "referenced_columns"),
-          row.getString("confdeltype") == "c"), features)
+      DatabaseForeignKey(
+        row.getString("conname"),
+        ForeignKeyShape(
+          strings(row, "columns"),
+          referenced,
+          strings(row, "referenced_columns"),
+          row.getString("confdeltype") == "c"
+        ),
+        features
+      )
     }
 
   private def inspectReferencingTables(connection: Connection, oid: Long): Vector[String] =
-    query(connection,
+    query(
+      connection,
       """SELECT DISTINCT n.nspname, c.relname
         |FROM pg_catalog.pg_constraint k
         |JOIN pg_catalog.pg_class c ON c.oid = k.conrelid
@@ -960,16 +1113,17 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
     finally array.free()
 
   private final case class DatabaseColumn(
-      name: String,
-      dataType: Option[SqlType],
-      typeDescription: String,
-      nullable: Boolean,
-      identity: String,
-      features: Vector[String]
+    name: String,
+    dataType: Option[SqlType],
+    typeDescription: String,
+    nullable: Boolean,
+    identity: String,
+    features: Vector[String]
   )
 
   private def inspectColumns(connection: Connection, oid: Long): Vector[DatabaseColumn] =
-    query(connection,
+    query(
+      connection,
       """SELECT a.attname, a.attnotnull, a.atttypmod, a.attndims, a.atthasdef,
         |       a.attidentity, a.attgenerated, a.attcollation, t.typcollation,
         |       t.typname, t.typtype, n.nspname AS type_schema
@@ -984,42 +1138,51 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
       val typmod = row.getInt("atttypmod")
       val nativeType = typeSchema == "pg_catalog" && row.getString("typtype") == "b" &&
         row.getInt("attndims") == 0
-      val dataType = if !nativeType then None else typeName match
-        case "int4" if typmod == -1 => Some(SqlType.Integer)
-        case "int8" if typmod == -1 => Some(SqlType.BigInt)
-        case "bool" if typmod == -1 => Some(SqlType.Boolean)
-        case "text" if typmod == -1 => Some(SqlType.Text)
-        case "uuid" if typmod == -1 => Some(SqlType.Uuid)
-        case "varchar" if typmod > 4 => Some(SqlType.Varchar(typmod - 4))
-        // Without an explicit precision typmod is -1, which the model never creates.
-        case "timestamp" if typmod >= 0 => Some(SqlType.Timestamp(typmod))
-        case "timestamptz" if typmod >= 0 => Some(SqlType.TimestampWithTimeZone(typmod))
-        case "time" if typmod >= 0 => Some(SqlType.Time(typmod))
-        case "int2" if typmod == -1 => Some(SqlType.SmallInt)
-        case "float4" if typmod == -1 => Some(SqlType.Real)
-        case "float8" if typmod == -1 => Some(SqlType.DoublePrecision)
-        case "date" if typmod == -1 => Some(SqlType.Date)
-        case "bytea" if typmod == -1 => Some(SqlType.Binary)
-        case "oid" if typmod == -1 => Some(SqlType.LargeObject)
-        case "jsonb" if typmod == -1 => Some(SqlType.Json)
-        case "bpchar" if typmod > 4 => Some(SqlType.Char(typmod - 4))
-        // typmod - 4 holds the precision in the upper 16 bits and an 11-bit signed scale.
-        case "numeric" if typmod >= 4 && ((typmod - 4) & 0x400) == 0 =>
-          Some(SqlType.Numeric(((typmod - 4) >> 16) & 0xffff, (typmod - 4) & 0x7ff))
-        case _ => None
+      val dataType = if !nativeType then None
+      else
+        typeName match
+          case "int4" if typmod == -1  => Some(SqlType.Integer)
+          case "int8" if typmod == -1  => Some(SqlType.BigInt)
+          case "bool" if typmod == -1  => Some(SqlType.Boolean)
+          case "text" if typmod == -1  => Some(SqlType.Text)
+          case "uuid" if typmod == -1  => Some(SqlType.Uuid)
+          case "varchar" if typmod > 4 => Some(SqlType.Varchar(typmod - 4))
+          // Without an explicit precision typmod is -1, which the model never creates.
+          case "timestamp" if typmod >= 0   => Some(SqlType.Timestamp(typmod))
+          case "timestamptz" if typmod >= 0 => Some(SqlType.TimestampWithTimeZone(typmod))
+          case "time" if typmod >= 0        => Some(SqlType.Time(typmod))
+          case "int2" if typmod == -1       => Some(SqlType.SmallInt)
+          case "float4" if typmod == -1     => Some(SqlType.Real)
+          case "float8" if typmod == -1     => Some(SqlType.DoublePrecision)
+          case "date" if typmod == -1       => Some(SqlType.Date)
+          case "bytea" if typmod == -1      => Some(SqlType.Binary)
+          case "oid" if typmod == -1        => Some(SqlType.LargeObject)
+          case "jsonb" if typmod == -1      => Some(SqlType.Json)
+          case "bpchar" if typmod > 4       => Some(SqlType.Char(typmod - 4))
+          // typmod - 4 holds the precision in the upper 16 bits and an 11-bit signed scale.
+          case "numeric" if typmod >= 4 && ((typmod - 4) & 0x400) == 0 =>
+            Some(SqlType.Numeric(((typmod - 4) >> 16) & 0xffff, (typmod - 4) & 0x7ff))
+          case _ => None
       val features = Vector(
         Option.when(row.getBoolean("atthasdef"))("default or generation expression"),
         Option.when(row.getString("attidentity") == "a")("GENERATED ALWAYS identity"),
         Option.when(row.getString("attgenerated").nonEmpty)("generated expression"),
         Option.when(row.getLong("attcollation") != row.getLong("typcollation"))("custom collation")
       ).flatten
-      DatabaseColumn(row.getString("attname"), dataType,
-        s"$typeSchema.$typeName (typmod=$typmod)", !row.getBoolean("attnotnull"), row.getString("attidentity"), features)
+      DatabaseColumn(
+        row.getString("attname"),
+        dataType,
+        s"$typeSchema.$typeName (typmod=$typmod)",
+        !row.getBoolean("attnotnull"),
+        row.getString("attidentity"),
+        features
+      )
     }
 
   /** Primary key columns in key order; INCLUDE columns are listed too and therefore never match. */
   private def inspectPrimaryKey(connection: Connection, oid: Long): Vector[String] =
-    query(connection,
+    query(
+      connection,
       """SELECT a.attname
         |FROM pg_catalog.pg_index i
         |CROSS JOIN LATERAL pg_catalog.unnest(CAST(i.indkey AS pg_catalog.int2[])) WITH ORDINALITY AS k(attnum, position)
@@ -1029,7 +1192,7 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
     )(_.setLong(1, oid))(_.getString("attname"))
 
   private def query[A](connection: Connection, sql: String)(bind: PreparedStatement => Unit)(
-      read: ResultSet => A
+    read: ResultSet => A
   ): Vector[A] =
     Using.resource(connection.prepareStatement(sql)) { statement =>
       bind(statement)
@@ -1046,7 +1209,8 @@ object PostgreSqlMigrationBackend extends TransactionalMigrationBackend with Pre
       ()
     }
 
-  private def qualified(name: QualifiedName): String =
-    (name.schema.toVector :+ name.name).map(identifier => quoted(identifier.value)).mkString(".")
+  private def qualified(name: QualifiedName): String = (name.schema.toVector :+ name.name).map(identifier =>
+    quoted(identifier.value)
+  ).mkString(".")
 
   private def quoted(identifier: String): String = "\"" + identifier.replace("\"", "\"\"") + "\""

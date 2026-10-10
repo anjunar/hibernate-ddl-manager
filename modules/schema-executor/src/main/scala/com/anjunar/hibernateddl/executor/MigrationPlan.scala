@@ -11,22 +11,23 @@ import com.anjunar.hibernateddl.core.*
   * backfills recorded without running, and `pending` those left pending.
   */
 final case class MigrationPlan(
-    mode: PlanMode,
-    history: Vector[AppliedRevision],
-    records: Vector[BackfillRecord],
-    target: SchemaModel,
-    targetFingerprint: String,
-    steps: Vector[PlanStep],
-    complete: Boolean,
-    problems: Vector[PlanProblem],
-    notes: Vector[String] = Vector.empty,
-    absent: Vector[QualifiedName] = Vector.empty,
-    adopted: Vector[Backfill] = Vector.empty,
-    created: Vector[Backfill] = Vector.empty,
-    pending: Vector[String] = Vector.empty
+  mode: PlanMode,
+  history: Vector[AppliedRevision],
+  records: Vector[BackfillRecord],
+  target: SchemaModel,
+  targetFingerprint: String,
+  steps: Vector[PlanStep],
+  complete: Boolean,
+  problems: Vector[PlanProblem],
+  notes: Vector[String] = Vector.empty,
+  absent: Vector[QualifiedName] = Vector.empty,
+  adopted: Vector[Backfill] = Vector.empty,
+  created: Vector[Backfill] = Vector.empty,
+  pending: Vector[String] = Vector.empty
 ):
   def revision: Long = history.lastOption.fold(0L)(_.entry.revision)
   def previous: SchemaModel = history.lastOption.fold(MigrationPlanner.EmptyModel)(_.model)
-  def previousFingerprint: String = history.lastOption.fold(MigrationPlanner.EmptyFingerprint)(_.entry.targetFingerprint)
+  def previousFingerprint: String =
+    history.lastOption.fold(MigrationPlanner.EmptyFingerprint)(_.entry.targetFingerprint)
   def executable: Boolean = complete && problems.isEmpty
   def operations: Vector[SchemaOperation] = steps.collect { case step: PlanStep.Statement => step.operation }

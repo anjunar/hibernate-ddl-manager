@@ -28,21 +28,28 @@ private[postgresql] object PostgreSqlCheckDefinitions:
 
   def compare(definition: String, column: ColumnModel, check: ColumnCheck): Comparison =
     val parsed: Option[(String, ColumnCheck)] = (column.dataType, definition) match
-      case (SqlType.SmallInt | SqlType.Integer | SqlType.BigInt, Range(name, min, other, max)) if unquote(name) == unquote(other) =>
+      case (SqlType.SmallInt | SqlType.Integer | SqlType.BigInt, Range(name, min, other, max))
+          if unquote(name) == unquote(other) =>
         for low <- whole(min); high <- whole(max) yield unquote(name) -> ColumnCheck.Range(low, high)
       case (SqlType.SmallInt | SqlType.Integer | SqlType.BigInt, Single(name, _)) =>
         Some(unquote(name) -> ColumnCheck.Range(Long.MinValue, Long.MinValue))
-      case (SqlType.Varchar(_), VarcharAny(name, items)) => literals(items, "character varying").map(unquote(name) -> ColumnCheck.AllowedValues(_))
-      case (SqlType.Varchar(_), VarcharOne(name, value)) => Some(unquote(name) -> ColumnCheck.AllowedValues(Vector(unescape(value))))
-      case (SqlType.Text, PlainAny(name, items)) => literals(items, "text").map(unquote(name) -> ColumnCheck.AllowedValues(_))
-      case (SqlType.Text, PlainOne(name, value, "text")) => Some(unquote(name) -> ColumnCheck.AllowedValues(Vector(unescape(value))))
-      case (SqlType.Char(_), PlainAny(name, items)) => literals(items, "bpchar").map(unquote(name) -> ColumnCheck.AllowedValues(_))
-      case (SqlType.Char(_), PlainOne(name, value, "bpchar")) => Some(unquote(name) -> ColumnCheck.AllowedValues(Vector(unescape(value))))
+      case (SqlType.Varchar(_), VarcharAny(name, items)) =>
+        literals(items, "character varying").map(unquote(name) -> ColumnCheck.AllowedValues(_))
+      case (SqlType.Varchar(_), VarcharOne(name, value)) =>
+        Some(unquote(name) -> ColumnCheck.AllowedValues(Vector(unescape(value))))
+      case (SqlType.Text, PlainAny(name, items)) =>
+        literals(items, "text").map(unquote(name) -> ColumnCheck.AllowedValues(_))
+      case (SqlType.Text, PlainOne(name, value, "text")) =>
+        Some(unquote(name) -> ColumnCheck.AllowedValues(Vector(unescape(value))))
+      case (SqlType.Char(_), PlainAny(name, items)) =>
+        literals(items, "bpchar").map(unquote(name) -> ColumnCheck.AllowedValues(_))
+      case (SqlType.Char(_), PlainOne(name, value, "bpchar")) =>
+        Some(unquote(name) -> ColumnCheck.AllowedValues(Vector(unescape(value))))
       case _ => None
     parsed match
-      case None => Comparison.Undecidable
+      case None                                                                 => Comparison.Undecidable
       case Some((name, actual)) if name == column.name.value && actual == check => Comparison.Equal
-      case Some(_) => Comparison.Different(definition)
+      case Some(_)                                                              => Comparison.Different(definition)
 
   private def unquote(name: String): String =
     if name.startsWith("\"") then name.drop(1).dropRight(1).replace("\"\"", "\"") else name

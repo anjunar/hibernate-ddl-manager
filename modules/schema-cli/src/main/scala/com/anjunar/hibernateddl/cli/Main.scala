@@ -24,19 +24,22 @@ object Main:
         if outcome.stderr.nonEmpty then Console.err.println(outcome.stderr)
         sys.exit(outcome.exitCode)
       case other => run(other) match
-        case Right(output) => println(output)
-        case Left(error) =>
-          Console.err.println(error)
-          sys.exit(2)
+          case Right(output) => println(output)
+          case Left(error)   =>
+            Console.err.println(error)
+            sys.exit(2)
 
   def run(args: Vector[String]): Either[String, String] = args match
     case Vector() | Vector("--help") | Vector("-h") => Right(usage)
-    case Vector("demo") => demo()
-    case _ => Left(s"Unknown command: ${args.mkString(" ")}\n$usage")
+    case Vector("demo")                             => demo()
+    case _                                          => Left(s"Unknown command: ${args.mkString(" ")}\n$usage")
 
   private def demo(): Either[String, String] =
     val login = ColumnModel(
-      SchemaId("7f3a9c21/f34e45b6"), SqlIdentifier("username"), SqlType.Varchar(255), nullable = false
+      SchemaId("7f3a9c21/f34e45b6"),
+      SqlIdentifier("username"),
+      SqlType.Varchar(255),
+      nullable = false
     )
     val users = TableModel(
       SchemaId("7f3a9c21"),

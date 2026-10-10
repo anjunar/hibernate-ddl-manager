@@ -12,13 +12,14 @@ trait CatalogLookups:
     * from changing; each described for a message. Neither a migration nor a preview removes them.
     */
   def typeChangeBlockers(connection: Connection, table: QualifiedName, column: SqlIdentifier): Vector[String]
+
   /** The SQL of an operation that [[com.anjunar.hibernateddl.core.SchemaOperation.boundAtExecution]], naming the one database
     * object that matches its definition, or why there is none: no match, several, or an object
     * that depends on it, such as a foreign key.
     */
   def bindDrop(
-      connection: Connection,
-      operation: SchemaOperation,
-      table: QualifiedName,
-      columns: Vector[SqlIdentifier]
+    connection: Connection,
+    operation: SchemaOperation,
+    table: QualifiedName,
+    columns: Vector[SqlIdentifier]
   ): Either[Vector[String], String]

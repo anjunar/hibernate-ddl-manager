@@ -6,10 +6,11 @@ import org.hibernate.annotations.{JdbcTypeCode, NaturalId, OnDelete, OnDeleteAct
 import org.hibernate.`type`.SqlTypes
 
 import scala.compiletime.uninitialized
+import java.lang.{Long as JavaLong}
 
 @Entity
 @SchemaId("f6071829")
 class Voucher:
   @Id @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "voucher_gen")
   @SequenceGenerator(name = "voucher_gen", sequenceName = "voucher_numbers", allocationSize = 10, initialValue = 100)
-  @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+  @SchemaId("0a1b2c3d") var id: JavaLong = uninitialized

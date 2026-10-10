@@ -2,14 +2,14 @@ package com.anjunar.hibernateddl.executor
 
 import com.anjunar.hibernateddl.core.*
 final case class PreviewCheck(
-    code: String,
-    description: String,
-    status: CheckStatus,
-    required: Boolean,
-    step: Option[Int] = None,
-    subject: Option[String] = None,
-    details: Vector[String] = Vector.empty,
-    rows: RowCount = RowCount.Unknown
+  code: String,
+  description: String,
+  status: CheckStatus,
+  required: Boolean,
+  step: Option[Int] = None,
+  subject: Option[String] = None,
+  details: Vector[String] = Vector.empty,
+  rows: RowCount = RowCount.Unknown
 )
 
 object PreviewCheck:

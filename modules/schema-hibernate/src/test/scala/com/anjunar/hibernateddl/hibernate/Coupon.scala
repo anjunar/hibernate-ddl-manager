@@ -6,6 +6,7 @@ import org.hibernate.annotations.{JdbcTypeCode, NaturalId, OnDelete, OnDeleteAct
 import org.hibernate.`type`.SqlTypes
 
 import scala.compiletime.uninitialized
+import java.lang.{Long as JavaLong}
 
 /** Draws its keys from Voucher's sequence, which one sequence per entity key does not allow. */
 @Entity
@@ -13,4 +14,4 @@ import scala.compiletime.uninitialized
 class Coupon:
   @Id @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "coupon_gen")
   @SequenceGenerator(name = "coupon_gen", sequenceName = "voucher_numbers", allocationSize = 10, initialValue = 100)
-  @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+  @SchemaId("0a1b2c3d") var id: JavaLong = uninitialized

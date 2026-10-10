@@ -6,8 +6,9 @@ import org.hibernate.annotations.{JdbcTypeCode, NaturalId, OnDelete, OnDeleteAct
 import org.hibernate.`type`.SqlTypes
 
 import scala.compiletime.uninitialized
+import java.lang.{Integer as JavaInteger}
 
 @Embeddable
 class Price:
-  @SchemaId("8c9d0e1f") var amount: java.lang.Integer = uninitialized
+  @SchemaId("8c9d0e1f") var amount: JavaInteger = uninitialized
   @SchemaId("9d0e1f20") var currency: String = uninitialized

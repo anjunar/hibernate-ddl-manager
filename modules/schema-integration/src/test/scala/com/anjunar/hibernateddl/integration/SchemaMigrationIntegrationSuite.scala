@@ -9,9 +9,17 @@ import org.hibernate.boot.{Metadata, MetadataSources}
 import org.hibernate.boot.registry.StandardServiceRegistryBuilder
 import java.sql.Connection
 import javax.sql.DataSource
+import java.lang.reflect.InvocationTargetException
+import java.lang.reflect.Method
+import java.lang.reflect.Proxy
+import java.util
 
 class SchemaMigrationIntegrationSuite extends TestPostgres:
-  private def withMetadata[A](ds: DataSource, classes: Seq[Class[?]], settings: (String, String)*)(body: Metadata => A): A =
+  private def withMetadata[A](
+    ds: DataSource,
+    classes: Seq[Class[?]],
+    settings: (String, String)*
+  )(body: Metadata => A): A =
     val builder = new StandardServiceRegistryBuilder()
       .applySetting("hibernate.connection.datasource", ds)
       .applySetting("hibernate.default_schema", "public")
@@ -25,7 +33,7 @@ class SchemaMigrationIntegrationSuite extends TestPostgres:
     finally StandardServiceRegistryBuilder.destroy(registry)
 
   private def withSessionFactory[A](ds: DataSource, classes: Seq[Class[?]], settings: (String, String)*)(
-      body: SessionFactory => A
+    body: SessionFactory => A
   ): A =
     withMetadata(ds, classes, settings*) { metadata =>
       val factory = metadata.buildSessionFactory()
@@ -34,7 +42,10 @@ class SchemaMigrationIntegrationSuite extends TestPostgres:
     }
 
   private def revisions(ds: DataSource): String =
-    scalar(ds, "SELECT coalesce(string_agg(revision::text, ',' ORDER BY revision), '') FROM __hibernate_ddl.schema_history")
+    scalar(
+      ds,
+      "SELECT coalesce(string_agg(revision::text, ',' ORDER BY revision), '') FROM __hibernate_ddl.schema_history"
+    )
 
   /** A pool that hands out connections without auto-commit, as Hibernate's own pool does by
     * default, and with SERIALIZABLE isolation. It records the auto-commit mode and isolation of
@@ -47,23 +58,30 @@ class SchemaMigrationIntegrationSuite extends TestPostgres:
         connection.setAutoCommit(false)
         connection.setTransactionIsolation(Connection.TRANSACTION_SERIALIZABLE)
         var migrating = false
-        proxy(classOf[Connection], connection)(identity, (method, args) => method.getName match
-          case "setTransactionIsolation" if args(0) == Int.box(Connection.TRANSACTION_READ_COMMITTED) => migrating = true
-          case "close" if migrating => returned += (connection.getAutoCommit -> connection.getTransactionIsolation)
-          case _ => ()
+        proxy(classOf[Connection], connection)(
+          identity,
+          (method, args) =>
+            method.getName match
+              case "setTransactionIsolation" if args(0) == Int.box(Connection.TRANSACTION_READ_COMMITTED) =>
+                migrating = true
+              case "close" if migrating => returned += (connection.getAutoCommit -> connection.getTransactionIsolation)
+              case _                    => ()
         )
       case other => other
     }
 
     private def proxy[A](kind: Class[A], target: A)(
-        result: AnyRef => AnyRef,
-        before: (java.lang.reflect.Method, Array[AnyRef]) => Unit = (_, _) => ()
+      result: AnyRef => AnyRef,
+      before: (Method, Array[AnyRef]) => Unit = (_, _) => ()
     ): A =
-      java.lang.reflect.Proxy.newProxyInstance(kind.getClassLoader, Array(kind), (_, method, args) =>
-        val values = Option(args).getOrElse(Array.empty[AnyRef])
-        before(method, values)
-        try result(method.invoke(target, values*))
-        catch case error: java.lang.reflect.InvocationTargetException => throw error.getCause
+      Proxy.newProxyInstance(
+        kind.getClassLoader,
+        Array(kind),
+        (_, method, args) =>
+          val values = Option(args).getOrElse(Array.empty[AnyRef])
+          before(method, values)
+          try result(method.invoke(target, values*))
+          catch case error: InvocationTargetException => throw error.getCause
       ).asInstanceOf[A]
 
   private val enabled = MigrationSettings.Enabled -> "true"
@@ -73,7 +91,10 @@ class SchemaMigrationIntegrationSuite extends TestPostgres:
   test("the integrator does nothing unless enabled") {
     withDatabase { ds =>
       withSessionFactory(ds, entities)(_ => ())
-      assertEquals(scalar(ds, "SELECT to_regnamespace('__hibernate_ddl') IS NULL AND to_regclass('public.purchase') IS NULL"), "t")
+      assertEquals(
+        scalar(ds, "SELECT to_regnamespace('__hibernate_ddl') IS NULL AND to_regclass('public.purchase') IS NULL"),
+        "t"
+      )
     }
   }
 
@@ -123,8 +144,8 @@ class SchemaMigrationIntegrationSuite extends TestPostgres:
         factory.inTransaction { session =>
           val settings = new Settings
           settings.id = 1L
-          settings.values = java.util.Map.of("size", Integer.valueOf(3))
-          settings.tags = java.util.List.of("a", "b")
+          settings.values = util.Map.of("size", Integer.valueOf(3))
+          settings.tags = util.List.of("a", "b")
           settings.raw = "{\"free\": true}"
           settings.preferences = new Preferences
           settings.preferences.theme = "dark"
@@ -133,12 +154,14 @@ class SchemaMigrationIntegrationSuite extends TestPostgres:
         factory.inTransaction { session =>
           val settings = session.find(classOf[Settings], 1L)
           assertEquals(settings.values.get("size"), Integer.valueOf(3))
-          assertEquals(settings.tags, java.util.List.of("a", "b"))
+          assertEquals(settings.tags, util.List.of("a", "b"))
           assertEquals(settings.preferences.theme, "dark")
         }
       }
-      assertEquals(scalar(ds, "SELECT concat_ws(' ', tags ->> 1, raw ->> 'free', pg_typeof(preferences)) FROM public.settings"),
-        "b true jsonb")
+      assertEquals(
+        scalar(ds, "SELECT concat_ws(' ', tags ->> 1, raw ->> 'free', pg_typeof(preferences)) FROM public.settings"),
+        "b true jsonb"
+      )
     }
   }
 
@@ -148,18 +171,26 @@ class SchemaMigrationIntegrationSuite extends TestPostgres:
       execute(ds, "INSERT INTO public.member VALUES (1, 'ada'), (2, NULL)")
       withSessionFactory(ds, Seq(classOf[RequiredMember]), enabled, validate)(_ => ())
       assertEquals(scalar(ds, "SELECT string_agg(nick, '|' ORDER BY id) FROM public.member"), "ada|anonymous")
-      assertEquals(scalar(ds, "SELECT concat_ws(' ', backfill_id, result, updated_rows) FROM __hibernate_ddl.backfill_history"),
-        "member-nick-v1 executed 1")
+      assertEquals(
+        scalar(ds, "SELECT concat_ws(' ', backfill_id, result, updated_rows) FROM __hibernate_ddl.backfill_history"),
+        "member-nick-v1 executed 1"
+      )
     }
     withDatabase { ds =>
       withMetadata(ds, Seq(classOf[Member]))(metadata => HibernateSchemaMigration.migrate(metadata, ds))
       execute(ds, "INSERT INTO public.member VALUES (1, NULL)")
       withMetadata(ds, Seq(classOf[RequiredMember])) { metadata =>
-        val twice = intercept[MigrationException](HibernateSchemaMigration.migrate(metadata, ds, backfills = Vector(TestBackfills.nick)))
+        val twice = intercept[MigrationException](HibernateSchemaMigration.migrate(
+          metadata,
+          ds,
+          backfills = Vector(TestBackfills.nick)
+        ))
         assertEquals(twice.state, FailureState.NotStarted)
         assert(twice.getMessage.contains("Backfill ID 'member-nick-v1' is registered 2 times"), twice.getMessage)
-        assertEquals(HibernateSchemaMigration.migrate(metadata, ds).backfills,
-          Vector(BackfillOutcome("member-nick-v1", BackfillResult.Executed, Some(1L))))
+        assertEquals(
+          HibernateSchemaMigration.migrate(metadata, ds).backfills,
+          Vector(BackfillOutcome("member-nick-v1", BackfillResult.Executed, Some(1L)))
+        )
       }
     }
   }
@@ -174,8 +205,15 @@ class SchemaMigrationIntegrationSuite extends TestPostgres:
         assertEquals(report.steps.map(_.kind), Vector("fill", "null check", "ddl"))
         val target = HibernateSchemaSource.read(metadata).toOption.get
         assertEquals(SchemaModelJson.decode(HibernateSchemaMigration.exportTarget(metadata)), Right(target))
-        assertEquals(BackfillJson.decode(HibernateSchemaMigration.exportBackfills(metadata)), Right(Vector(TestBackfills.nick)))
-        assert(intercept[MigrationException](HibernateSchemaMigration.preview(metadata, ds, backfills = Vector(TestBackfills.nick)))
+        assertEquals(
+          BackfillJson.decode(HibernateSchemaMigration.exportBackfills(metadata)),
+          Right(Vector(TestBackfills.nick))
+        )
+        assert(intercept[MigrationException](HibernateSchemaMigration.preview(
+          metadata,
+          ds,
+          backfills = Vector(TestBackfills.nick)
+        ))
           .getMessage.contains("registered 2 times"))
       }
       assertEquals(scalar(ds, "SELECT count(*) FROM public.member WHERE nick IS NULL"), "1")
@@ -190,10 +228,18 @@ class SchemaMigrationIntegrationSuite extends TestPostgres:
       assertEquals(refused.state, FailureState.RolledBack)
       assert(refused.getMessage.contains("Approval.Drop(\"cccccccc\")"), refused.getMessage)
       assert(refused.getMessage.contains("Approval.Drop(\"cccccccc/0a1b2c3d/sequence\")"), refused.getMessage)
-      withSessionFactory(ds, remaining, enabled, validate,
-        MigrationSettings.Approvals -> "drop:cccccccc, drop:cccccccc/0a1b2c3d/sequence")(_ => ())
+      withSessionFactory(
+        ds,
+        remaining,
+        enabled,
+        validate,
+        MigrationSettings.Approvals -> "drop:cccccccc, drop:cccccccc/0a1b2c3d/sequence"
+      )(_ => ())
       assertEquals(revisions(ds), "1,2")
-      assertEquals(scalar(ds, "SELECT to_regclass('public.generated') IS NULL AND to_regclass('public.generated_seq') IS NULL"), "t")
+      assertEquals(
+        scalar(ds, "SELECT to_regclass('public.generated') IS NULL AND to_regclass('public.generated_seq') IS NULL"),
+        "t"
+      )
     }
   }
 
@@ -206,10 +252,19 @@ class SchemaMigrationIntegrationSuite extends TestPostgres:
       assert(failure(entities, "hibernate.hbm2ddl.auto" -> "update").contains("hibernate.hbm2ddl.auto is update"))
       assert(failure(entities, "jakarta.persistence.schema-generation.database.action" -> "create")
         .contains("jakarta.persistence.schema-generation.database.action is create"))
-      assert(failure(entities, MigrationSettings.Approvals -> "remove:cccccccc").contains("the entry 'remove:cccccccc'"))
-      assert(failure(entities, "hibernate.ddl_manager.adopt" -> "true").contains("Unknown setting hibernate.ddl_manager.adopt"))
-      assert(failure(entities, "hibernate.dialect" -> "org.hibernate.dialect.H2Dialect",
-        "hibernate.boot.allow_jdbc_metadata_access" -> "false").contains("PostgreSQL only"))
+      assert(failure(
+        entities,
+        MigrationSettings.Approvals -> "remove:cccccccc"
+      ).contains("the entry 'remove:cccccccc'"))
+      assert(failure(
+        entities,
+        "hibernate.ddl_manager.adopt" -> "true"
+      ).contains("Unknown setting hibernate.ddl_manager.adopt"))
+      assert(failure(
+        entities,
+        "hibernate.dialect" -> "org.hibernate.dialect.H2Dialect",
+        "hibernate.boot.allow_jdbc_metadata_access" -> "false"
+      ).contains("PostgreSQL only"))
       assert(failure(Seq(classOf[Unidentified])).contains("Entity mapping: "))
       assertEquals(scalar(ds, "SELECT to_regclass('public.purchase') IS NULL"), "t")
     }
@@ -227,7 +282,10 @@ class SchemaMigrationIntegrationSuite extends TestPostgres:
       val result = withMetadata(ds, entities, validate) { metadata =>
         val adopted = HibernateSchemaMigration.migrate(metadata, ds, ExecutionOptions(adoptExistingSchema = true))
         // The test provider's backfill targets another table and stays pending.
-        assertEquals(adopted, MigrationResult(1, MigrationStatus.Adopted, 0, pendingBackfills = Vector("member-nick-v1")))
+        assertEquals(
+          adopted,
+          MigrationResult(1, MigrationStatus.Adopted, 0, pendingBackfills = Vector("member-nick-v1"))
+        )
         metadata.buildSessionFactory().close()
         adopted
       }
@@ -236,18 +294,37 @@ class SchemaMigrationIntegrationSuite extends TestPostgres:
   }
 
   test("settings parse into executor options") {
-    assertEquals(MigrationSettings.options(Map(
-      MigrationSettings.LockTimeoutMillis -> "100", MigrationSettings.StatementTimeoutMillis -> 200,
-      MigrationSettings.AdoptExistingSchema -> "TRUE", MigrationSettings.AcceptManualMigration -> " abc ",
-      MigrationSettings.Approvals -> "drop:a/b,rename-back:c, revert:3,"
-    )), Right(ExecutionOptions(100, 200, adoptExistingSchema = true, acceptManualMigration = Some("abc"),
-      approvals = Set(Approval.Drop(SchemaId("a/b")), Approval.RenameBack(SchemaId("c")), Approval.Revert(3)))))
-    assertEquals(MigrationSettings.options(Map(MigrationSettings.LockTimeoutMillis -> "soon")).left.map(_.size), Left(1))
+    assertEquals(
+      MigrationSettings.options(Map(
+        MigrationSettings.LockTimeoutMillis -> "100",
+        MigrationSettings.StatementTimeoutMillis -> 200,
+        MigrationSettings.AdoptExistingSchema -> "TRUE",
+        MigrationSettings.AcceptManualMigration -> " abc ",
+        MigrationSettings.Approvals -> "drop:a/b,rename-back:c, revert:3,"
+      )),
+      Right(ExecutionOptions(
+        100,
+        200,
+        adoptExistingSchema = true,
+        acceptManualMigration = Some("abc"),
+        approvals = Set(Approval.Drop(SchemaId("a/b")), Approval.RenameBack(SchemaId("c")), Approval.Revert(3))
+      ))
+    )
+    assertEquals(
+      MigrationSettings.options(Map(MigrationSettings.LockTimeoutMillis -> "soon")).left.map(_.size),
+      Left(1)
+    )
     assertEquals(MigrationSettings.options(Map(MigrationSettings.Approvals -> "revert:0")).left.map(_.size), Left(1))
     // The same entry the API writes and a plan's message names; a signature holds no comma.
     val unique = Approval.dropUniqueKey(UniqueKeyRef(SchemaId("t"), Vector(SchemaId("t/a"), SchemaId("t/b"))))
-    assertEquals(MigrationSettings.options(Map(MigrationSettings.Approvals -> s"drop:x, ${Approval.entry(unique)}"))
-      .map(_.approvals), Right(Set(Approval.Drop(SchemaId("x")), unique)))
-    assertEquals(MigrationSettings.options(Map(MigrationSettings.Approvals -> "drop-unique:email")).left.map(_.size), Left(1))
+    assertEquals(
+      MigrationSettings.options(Map(MigrationSettings.Approvals -> s"drop:x, ${Approval.entry(unique)}"))
+        .map(_.approvals),
+      Right(Set(Approval.Drop(SchemaId("x")), unique))
+    )
+    assertEquals(
+      MigrationSettings.options(Map(MigrationSettings.Approvals -> "drop-unique:email")).left.map(_.size),
+      Left(1)
+    )
     assertEquals(MigrationSettings.enabled(Map(MigrationSettings.Enabled -> "yes")).left.map(_.size), Left(1))
   }

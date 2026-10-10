@@ -13,4 +13,3 @@ final case class Backfill(id: String, target: SchemaId, when: BackfillTrigger, v
 object Backfill:
   def fillNulls(id: String, target: SchemaId, when: BackfillTrigger, value: BackfillValue): Backfill =
     Backfill(id, target, when, value)
-

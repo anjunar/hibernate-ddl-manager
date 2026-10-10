@@ -8,9 +8,9 @@ import java.sql.Connection
   * [[SchemaModelJson]] form, which the next server start diffs against.
   */
 final case class HistoryEntry(
-    revision: Long,
-    previousFingerprint: String,
-    targetFingerprint: String,
-    model: String,
-    statements: Vector[String]
+  revision: Long,
+  previousFingerprint: String,
+  targetFingerprint: String,
+  model: String,
+  statements: Vector[String]
 )

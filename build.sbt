@@ -91,11 +91,15 @@ lazy val schemaExecutor = (project in file("modules/schema-executor"))
   )
 
 lazy val schemaIntegration = (project in file("modules/schema-integration"))
-  .dependsOn(schemaHibernate % "compile->compile;test->test", schemaExecutor,
-    schemaPostgresql % "compile->compile;test->test")
+  .dependsOn(
+    schemaHibernate % "compile->compile;test->test",
+    schemaExecutor,
+    schemaPostgresql % "compile->compile;test->test"
+  )
   .settings(
     name := "schema-integration",
-    description := "Runs the migration when Hibernate builds its SessionFactory, configured by hibernate.ddl_manager.* settings.",
+    description :=
+      "Runs the migration when Hibernate builds its SessionFactory, configured by hibernate.ddl_manager.* settings.",
     // Hibernate reads and writes JSON columns through Jackson.
     libraryDependencies += "com.fasterxml.jackson.core" % "jackson-databind" % "2.22.3" % Test,
     Test / fork := true,

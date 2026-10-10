@@ -11,5 +11,9 @@ final class TestBackfills extends BackfillProvider:
   def backfills: Seq[Backfill] = Seq(TestBackfills.nick)
 
 object TestBackfills:
-  val nick: Backfill = Backfill.fillNulls("member-nick-v1", SchemaId("c1d2e3f4/1b2c3d4e"), BackfillTrigger.BecomesRequired,
-    BackfillValue.literal("anonymous"))
+  val nick: Backfill = Backfill.fillNulls(
+    "member-nick-v1",
+    SchemaId("c1d2e3f4/1b2c3d4e"),
+    BackfillTrigger.BecomesRequired,
+    BackfillValue.literal("anonymous")
+  )

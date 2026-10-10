@@ -9,4 +9,3 @@ import java.sql.Connection
   */
 enum FailureState:
   case NotStarted, RolledBack, OutcomeUnknown, Committed
-

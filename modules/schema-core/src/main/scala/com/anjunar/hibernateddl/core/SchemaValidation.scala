@@ -14,8 +14,9 @@ object SchemaValidation:
     }
     model.sequences.foreach { sequence =>
       if sequence.increment <= 0 || sequence.start < 1 then
-        errors += s"Sequence '${sequence.id.value}' starts at ${sequence.start} with increment ${sequence.increment}; " +
-          "expected an ascending sequence starting at 1 or later"
+        errors +=
+          s"Sequence '${sequence.id.value}' starts at ${sequence.start} with increment ${sequence.increment}; " +
+            "expected an ascending sequence starting at 1 or later"
     }
     model.tables.foreach { table =>
       table.checks.groupBy(_.name).foreach { (name, checks) =>
@@ -25,7 +26,8 @@ object SchemaValidation:
         if check.expression == null || check.expression.trim.isEmpty then
           errors += s"Check '${check.name.value}' of table '${table.id.value}' has no expression"
         else if Vector("\u0000", ";", "--", "/*", "*/").exists(check.expression.contains) then
-          errors += s"Check '${check.name.value}' of table '${table.id.value}' contains a statement separator, comment or NUL; unsupported"
+          errors +=
+            s"Check '${check.name.value}' of table '${table.id.value}' contains a statement separator, comment or NUL; unsupported"
       }
       table.columns.groupBy(_.name).foreach { (name, columns) =>
         if columns.size > 1 then
@@ -49,7 +51,8 @@ object SchemaValidation:
           case SqlType.Char(length) if length <= 0 =>
             errors += s"Column '${column.id.value}' has invalid CHAR length $length; expected a positive length"
           case SqlType.Numeric(precision, scale) if precision <= 0 || scale < 0 || scale > precision =>
-            errors += s"Column '${column.id.value}' has invalid NUMERIC($precision, $scale); expected 0 <= scale <= precision and precision > 0"
+            errors +=
+              s"Column '${column.id.value}' has invalid NUMERIC($precision, $scale); expected 0 <= scale <= precision and precision > 0"
           case _ => ()
       }
       val columns = table.columns.map(c => c.id -> c).toMap
@@ -73,15 +76,19 @@ object SchemaValidation:
           errors += s"Table '${table.id.value}' has more than one unique key on ${keys.head.display}"
       }
       table.uniqueKeys.foreach { key =>
-        errors ++= validateColumnList(s"Unique key ${key.display} of table '${table.id.value}'", key.columns, columns.keySet)
+        errors ++=
+          validateColumnList(s"Unique key ${key.display} of table '${table.id.value}'", key.columns, columns.keySet)
       }
       table.indexes.groupBy(_.columns).foreach { (_, indexes) =>
         if indexes.size > 1 then
           errors += s"Table '${table.id.value}' has more than one index on ${indexes.head.display}"
       }
       table.indexes.foreach { index =>
-        errors ++= validateColumnList(s"Index ${index.display} of table '${table.id.value}'", index.columns.map(_.column),
-          columns.keySet)
+        errors ++= validateColumnList(
+          s"Index ${index.display} of table '${table.id.value}'",
+          index.columns.map(_.column),
+          columns.keySet
+        )
       }
     }
     errors.result().distinct.sorted
@@ -92,25 +99,32 @@ object SchemaValidation:
       case ColumnCheck.AllowedValues(values) =>
         val maximum = column.dataType match
           case SqlType.Varchar(length) => Some(Some(length))
-          case SqlType.Char(length) => Some(Some(length))
-          case SqlType.Text => Some(None)
-          case _ => None
-        Option.when(maximum.isEmpty)(s"$label allows values, but the column type ${column.dataType} is not a string type").toVector ++
+          case SqlType.Char(length)    => Some(Some(length))
+          case SqlType.Text            => Some(None)
+          case _                       => None
+        Option.when(maximum.isEmpty)(
+          s"$label allows values, but the column type ${column.dataType} is not a string type"
+        ).toVector ++
           Option.when(values.isEmpty)(s"$label allows no value") ++
           Option.when(values.distinct.size != values.size)(s"$label lists a value more than once") ++
           maximum.flatten.toVector.flatMap { length =>
-            values.filter(_.length > length).map(value => s"$label allows '$value', which is longer than $length characters")
+            values.filter(_.length > length).map(value =>
+              s"$label allows '$value', which is longer than $length characters"
+            )
           }
       case ColumnCheck.Range(min, max) =>
         val bounds = column.dataType match
           case SqlType.SmallInt => Some((Short.MinValue.toLong, Short.MaxValue.toLong))
-          case SqlType.Integer => Some((Int.MinValue.toLong, Int.MaxValue.toLong))
-          case SqlType.BigInt => Some((Long.MinValue, Long.MaxValue))
-          case _ => None
-        Option.when(bounds.isEmpty)(s"$label is a range, but the column type ${column.dataType} is not an integer type").toVector ++
+          case SqlType.Integer  => Some((Int.MinValue.toLong, Int.MaxValue.toLong))
+          case SqlType.BigInt   => Some((Long.MinValue, Long.MaxValue))
+          case _                => None
+        Option.when(bounds.isEmpty)(
+          s"$label is a range, but the column type ${column.dataType} is not an integer type"
+        ).toVector ++
           Option.when(min > max)(s"$label has the empty range $min to $max") ++
           bounds.filter((low, high) => min < low || max > high).map((low, high) =>
-            s"$label range $min to $max exceeds the column type's range $low to $high")
+            s"$label range $min to $max exceeds the column type's range $low to $high"
+          )
 
   private def validateColumnList(label: String, ids: Vector[SchemaId], known: Set[SchemaId]): Vector[String] =
     Option.when(ids.isEmpty)(s"$label has no columns").toVector ++
@@ -127,7 +141,8 @@ object SchemaValidation:
       referenced.flatMap { target =>
         Option.when(key.referencedColumns != target.primaryKey &&
           !target.uniqueKeys.exists(_.columns == key.referencedColumns))(
-          s"$label must reference the primary key or a unique key of table '${target.id.value}'")
+          s"$label must reference the primary key or a unique key of table '${target.id.value}'"
+        )
       }
     ).flatten ++ key.columns.filterNot(id => table.columns.exists(_.id == id)).map { id =>
       s"$label references unknown column '${id.value}'"
@@ -139,7 +154,8 @@ object SchemaValidation:
         val column = table.columns.find(_.id == columnId).get
         val referencedColumn = target.columns.find(_.id == referencedId).get
         Option.when(column.dataType != referencedColumn.dataType)(
-          s"$label column '${columnId.value}' has type ${column.dataType} but references type ${referencedColumn.dataType}")
+          s"$label column '${columnId.value}' has type ${column.dataType} but references type ${referencedColumn.dataType}"
+        )
       }
 
   private[core] def displayName(name: QualifiedName): String =

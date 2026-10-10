@@ -6,8 +6,9 @@ import org.hibernate.annotations.{JdbcTypeCode, NaturalId, OnDelete, OnDeleteAct
 import org.hibernate.`type`.SqlTypes
 
 import scala.compiletime.uninitialized
+import java.lang.{Long as JavaLong}
 
 @Entity
 @SchemaId("aaaaaaaa")
 class DuplicateB:
-  @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+  @Id @SchemaId("0a1b2c3d") var id: JavaLong = uninitialized

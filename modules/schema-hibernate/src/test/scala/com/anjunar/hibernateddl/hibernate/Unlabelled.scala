@@ -6,6 +6,7 @@ import org.hibernate.annotations.{JdbcTypeCode, NaturalId, OnDelete, OnDeleteAct
 import org.hibernate.`type`.SqlTypes
 
 import scala.compiletime.uninitialized
+import java.lang.{Long as JavaLong}
 
 /** A secondary table without @SecondaryTableId, and one that names no secondary table. */
 @Entity
@@ -13,5 +14,5 @@ import scala.compiletime.uninitialized
 @SecondaryTable(name = "unlabelled_details")
 @SecondaryTableId(table = "elsewhere", value = "5c6d7e8f")
 class Unlabelled:
-  @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+  @Id @SchemaId("0a1b2c3d") var id: JavaLong = uninitialized
   @SchemaId("1b2c3d4e") @Column(table = "unlabelled_details") var extra: String = uninitialized

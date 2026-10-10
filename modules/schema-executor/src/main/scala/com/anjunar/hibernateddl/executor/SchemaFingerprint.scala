@@ -38,11 +38,11 @@ object SchemaFingerprint:
           case SqlType.TimestampWithTimeZone(precision) =>
             string(out, "timestamptz")
             out.writeInt(precision)
-          case SqlType.Integer => string(out, "integer")
-          case SqlType.BigInt => string(out, "bigint")
-          case SqlType.Boolean => string(out, "boolean")
-          case SqlType.Text => string(out, "text")
-          case SqlType.Uuid => string(out, "uuid")
+          case SqlType.Integer      => string(out, "integer")
+          case SqlType.BigInt       => string(out, "bigint")
+          case SqlType.Boolean      => string(out, "boolean")
+          case SqlType.Text         => string(out, "text")
+          case SqlType.Uuid         => string(out, "uuid")
           case SqlType.Char(length) =>
             string(out, "char")
             out.writeInt(length)
@@ -53,13 +53,13 @@ object SchemaFingerprint:
           case SqlType.Time(precision) =>
             string(out, "time")
             out.writeInt(precision)
-          case SqlType.SmallInt => string(out, "smallint")
-          case SqlType.Real => string(out, "real")
+          case SqlType.SmallInt        => string(out, "smallint")
+          case SqlType.Real            => string(out, "real")
           case SqlType.DoublePrecision => string(out, "double precision")
-          case SqlType.Date => string(out, "date")
-          case SqlType.Binary => string(out, "binary")
-          case SqlType.LargeObject => string(out, "large object")
-          case SqlType.Json => string(out, "json")
+          case SqlType.Date            => string(out, "date")
+          case SqlType.Binary          => string(out, "binary")
+          case SqlType.LargeObject     => string(out, "large object")
+          case SqlType.Json            => string(out, "json")
         out.writeBoolean(column.nullable)
       }
       ids(out, table.primaryKey)
@@ -93,7 +93,9 @@ object SchemaFingerprint:
       }
     val byColumnsAndDirection = Ordering.Implicits.seqOrdering[Vector, (String, Boolean)]
     val indexes = tables.flatMap { table =>
-      table.indexes.sortBy(_.columns.map(c => c.column.value -> c.descending))(using byColumnsAndDirection).map(table.id -> _)
+      table.indexes.sortBy(
+        _.columns.map(c => c.column.value -> c.descending)
+      )(using byColumnsAndDirection).map(table.id -> _)
     }
     if indexes.nonEmpty then
       string(out, "indexes")
@@ -106,7 +108,8 @@ object SchemaFingerprint:
           out.writeBoolean(column.descending)
         }
       }
-    val checks = tables.flatMap(table => table.columns.sortBy(_.id.value).flatMap(c => c.check.map((table.id, c.id, _))))
+    val checks =
+      tables.flatMap(table => table.columns.sortBy(_.id.value).flatMap(c => c.check.map((table.id, c.id, _))))
     if checks.nonEmpty then
       string(out, "checks")
       out.writeInt(checks.size)
@@ -123,7 +126,8 @@ object SchemaFingerprint:
             out.writeLong(min)
             out.writeLong(max)
       }
-    val identities = tables.flatMap(table => table.columns.filter(_.identity).map(_.id).sortBy(_.value).map(table.id -> _))
+    val identities =
+      tables.flatMap(table => table.columns.filter(_.identity).map(_.id).sortBy(_.value).map(table.id -> _))
     if identities.nonEmpty then
       string(out, "identity-columns")
       out.writeInt(identities.size)

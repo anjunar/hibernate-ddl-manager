@@ -6,10 +6,11 @@ import org.hibernate.annotations.{JdbcTypeCode, NaturalId, OnDelete, OnDeleteAct
 import org.hibernate.`type`.SqlTypes
 
 import scala.compiletime.uninitialized
+import java.lang.{Long as JavaLong}
 
 @Entity
 @Table(name = "client")
 @SchemaId("7f3a9c21")
 class Client:
-  @Id @SchemaId("0a1b2c3d") var id: java.lang.Long = uninitialized
+  @Id @SchemaId("0a1b2c3d") var id: JavaLong = uninitialized
   @SchemaId("f34e45b6") @Column(name = "alias", length = 80) var alias: String = uninitialized
